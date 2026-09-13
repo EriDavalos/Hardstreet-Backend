@@ -1,11 +1,10 @@
 // ==================================================================
-// HARD STREET BACKEND - Auth (JWT en cookie httpOnly)
+// HARD STREET BACKEND - Auth (JWT via header Authorization)
 // ==================================================================
 import type { NextApiRequest, NextApiResponse } from "next";
 import { SignJWT, jwtVerify } from "jose";
-import { serialize, parse } from "cookie";
 
-export const COOKIE_NAME = "hs_session";
+
 const MAX_AGE = 60 * 60 * 24 * 7; // 7 dias
 
 function secret(): Uint8Array {
@@ -44,40 +43,11 @@ export async function verifySessionToken(token: string): Promise<SessionPayload 
   }
 }
 
-export function setSessionCookie(res: NextApiResponse, token: string) {
-  res.setHeader(
-    "Set-Cookie",
-    serialize(COOKIE_NAME, token, {
-      httpOnly: true,
-      sameSite: "lax", // en produccion entre dominios usa "none; secure"
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: MAX_AGE,
-    })
-  );
-}
-
-export function clearSessionCookie(res: NextApiResponse) {
-  res.setHeader(
-    "Set-Cookie",
-    serialize(COOKIE_NAME, "", {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/",
-      maxAge: 0,
-    })
-  );
-}
-
-/** Lee la sesion desde la cookie (o header Authorization: Bearer para debug). */
+/** Lee la sesion desde el header Authorization: Bearer <token>. */
 export async function getSession(req: NextApiRequest): Promise<SessionPayload | null> {
-  const cookies = parse(req.headers.cookie || "");
-  let token = cookies[COOKIE_NAME] || "";
-  if (!token) {
-    const h = req.headers.authorization || "";
-    if (h.startsWith("Bearer ")) token = h.slice(7);
-  }
+  const h = req.headers.authorization || "";
+  if (!h.startsWith("Bearer ")) return null;
+  const token = h.slice(7).trim();
   if (!token) return null;
   return verifySessionToken(token);
 }

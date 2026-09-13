@@ -1,8 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
-import { clearSessionCookie } from "../../../lib/auth";
 
+// El JWT viaja en el header Authorization, asi que no hay sesion que
+// invalidar en el servidor: el cliente simplemente descarta su token.
 export default withCors(async (_req: NextApiRequest, res: NextApiResponse) => {
-  clearSessionCookie(res);
   res.status(200).json({ ok: true });
 });

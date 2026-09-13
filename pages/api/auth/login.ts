@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import bcrypt from "bcryptjs";
 import { withCors } from "../../../lib/cors";
-import { createSessionToken, setSessionCookie } from "../../../lib/auth";
+import { createSessionToken } from "../../../lib/auth";
 import { getUserByEmailWithRole } from "../../../lib/auth-store";
 import { mapUser } from "../../../lib/mappers";
 
@@ -35,7 +35,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     name: [user.name, user.lastname].filter(Boolean).join(" "),
     role: user.role_name || "",
   });
-  setSessionCookie(res, token);
+  // Sin cookies: el token viaja al cliente y este lo manda en el header Authorization
 
-  res.status(200).json({ user: mapUser(user, { id: user.id_role || 0, name: user.role_name }) });
+  res.status(200).json({ token, user: mapUser(user, { id: user.id_role || 0, name: user.role_name }) });
 });
