@@ -1,7 +1,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
-import { requireAdmin } from "../../../lib/admin-auth";
 import { q, exec, transaccion } from "../../../lib/db";
+import { requirePermission } from "../../../lib/permissions";
 
 // ==================================================================
 // CRUD de roles + asignacion de permisos (solo rol Admin)
@@ -76,7 +76,20 @@ async function validateRole(
 }
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!(await requireAdmin(req, res))) return;
+  // Permiso por acción sobre el módulo "roles" (Admin pasa siempre).
+  const ACTIONS: Record<string, "read" | "create" | "update" | "delete"> = {
+    GET: "read",
+    POST: "create",
+    PUT: "update",
+    PATCH: "update",
+    DELETE: "delete",
+  };
+  const action = ACTIONS[req.method || ""];
+  if (!action) {
+    res.status(405).json({ error: "Metodo no permitido" });
+    return;
+  }
+  if (!(await requirePermission(req, res, "roles", action))) return;
 
   try {
     switch (req.method) {

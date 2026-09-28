@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
-import { requireAdmin } from "../../../lib/admin-auth";
+import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 
 // ==================================================================
@@ -19,7 +19,10 @@ const ACTION_LABELS: Record<string, string> = {
 };
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!(await requireAdmin(req, res))) return;
+  // Cualquier usuario autenticado puede consultar el catálogo de módulos
+  // (lo usan el panel y los modales de permisos). Los datos sensibles
+  // (lista de usuarios, clientes, roles) sí exigen su permiso específico.
+  if (!(await requireUser(req, res))) return;
 
   try {
     if (req.method !== "GET") {

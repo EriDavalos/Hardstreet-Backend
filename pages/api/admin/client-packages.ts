@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
-import { requireAdmin } from "../../../lib/admin-auth";
+import { requirePermission } from "../../../lib/permissions";
 import { q, exec, transaccion } from "../../../lib/db";
 
 // ==================================================================
@@ -12,7 +12,15 @@ import { q, exec, transaccion } from "../../../lib/db";
 // ==================================================================
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!(await requireAdmin(req, res))) return;
+  // Permiso sobre "clientes": ver para GET; editar para asignar/quitar.
+  if (req.method === "GET") {
+    if (!(await requirePermission(req, res, "clientes", "read"))) return;
+  } else if (req.method === "POST") {
+    if (!(await requirePermission(req, res, "clientes", "update"))) return;
+  } else {
+    res.status(405).json({ error: "Metodo no permitido" });
+    return;
+  }
 
   try {
     if (req.method === "GET") {

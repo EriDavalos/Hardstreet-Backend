@@ -1,8 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import bcrypt from "bcryptjs";
 import { withCors } from "../../../lib/cors";
-import { requireAdmin } from "../../../lib/admin-auth";
 import { q, exec } from "../../../lib/db";
+import { requirePermission } from "../../../lib/permissions";
 import { mapUser, UserRow } from "../../../lib/mappers";
 
 // ==================================================================
@@ -16,7 +16,22 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!(await requireAdmin(req, res))) return;
+  // Permiso por acción: ver / crear / editar / eliminar el módulo "usuarios".
+  // (El rol Admin pasa siempre; el resto depende de permissions_roles.)
+  const ACTIONS: Record<string, "read" | "create" | "update" | "delete"> = {
+    GET: "read",
+    POST: "create",
+    PUT: "update",
+    PATCH: "update",
+    DELETE: "delete",
+  };
+  const action = ACTIONS[req.method || ""];
+  if (!action) {
+    res.status(405).json({ error: "Metodo no permitido" });
+    return;
+  }
+  const me = await requirePermission(req, res, "usuarios", action);
+  if (!me) return;
 
   try {
     switch (req.method) {
@@ -133,7 +148,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           res.status(400).json({ error: "Falta el id del usuario" });
           return;
         }
-        if (id === (await requireAdmin(req, res))?.sub) {
+        if (id === me.sub) {
           res.status(400).json({ error: "No puedes eliminar tu propia cuenta" });
           return;
         }

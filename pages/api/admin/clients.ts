@@ -1,7 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import bcrypt from "bcryptjs";
 import { withCors } from "../../../lib/cors";
-import { requireAdmin, CLIENT_ROLE } from "../../../lib/admin-auth";
+import { CLIENT_ROLE } from "../../../lib/admin-auth";
+import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
 import { mapUser, UserRow } from "../../../lib/mappers";
 
@@ -27,7 +28,20 @@ async function clientRoleId(): Promise<number | null> {
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
-  if (!(await requireAdmin(req, res))) return;
+  // Permiso por acción sobre el módulo "clientes" (Admin pasa siempre).
+  const ACTIONS: Record<string, "read" | "create" | "update" | "delete"> = {
+    GET: "read",
+    POST: "create",
+    PUT: "update",
+    PATCH: "update",
+    DELETE: "delete",
+  };
+  const action = ACTIONS[req.method || ""];
+  if (!action) {
+    res.status(405).json({ error: "Metodo no permitido" });
+    return;
+  }
+  if (!(await requirePermission(req, res, "clientes", action))) return;
 
   const roleId = await clientRoleId();
   if (!roleId) {
