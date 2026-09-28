@@ -1,15 +1,22 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requireAdmin } from "../../../lib/admin-auth";
-import { q, exec, transaccion } from "../../../lib/db";
-import { ADMIN_MODULES, ACTION_LABELS } from "../../../lib/admin-modules";
+import { q } from "../../../lib/db";
 
 // ==================================================================
 // Metadatos del panel (solo rol Admin)  ->  /api/admin/meta
-//   GET  árbol de grupos/módulos/acciones para el modal de permisos.
-//   Sincroniza los módulos admin en la tabla `modules` (upsert por url)
-//   y resuelve los IDs reales de `modules` y `permissions`.
+//   GET  módulos de la tabla `modules` + acciones de `permissions`.
+//   Sin grupos ni submódulos: la BD es la única fuente de verdad.
+//   Cada módulo se puede proteger con cualquiera de las 5 acciones.
 // ==================================================================
+
+const ACTION_LABELS: Record<string, string> = {
+  read: "Ver",
+  create: "Crear",
+  update: "Editar",
+  delete: "Eliminar",
+  download: "Descargar",
+};
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   if (!(await requireAdmin(req, res))) return;
@@ -20,71 +27,36 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
-    // 1. Upsert de módulos admin (por url, case-insensitive)
-    for (const group of ADMIN_MODULES) {
-      for (const mod of group.modules) {
-        const existing = await q<{ id: number }>(
-          `SELECT id FROM modules WHERE LOWER(url) = ? LIMIT 1`,
-          [mod.url.toLowerCase()]
-        );
-        if (!existing.length) {
-          const maxOrder = await q<{ mx: number | null }>(
-            `SELECT MAX(\`order\`) AS mx FROM modules`
-          );
-          const nextOrder = Number(maxOrder[0]?.mx || 0) + 1;
-          await exec(`INSERT INTO modules (name, url, \`order\`) VALUES (?, ?, ?)`, [
-            mod.name,
-            mod.url,
-            nextOrder,
-          ]);
-        }
-      }
-    }
-
-    // 2. Arbol con IDs resueltos
+    const modules = await q<{
+      id: number;
+      name: string | null;
+      url: string | null;
+      order: number | null;
+    }>(
+      `SELECT id, name, url, \`order\`
+         FROM modules
+        WHERE active = 1
+        ORDER BY \`order\` ASC, id ASC`
+    );
     const permissions = await q<{ id: number; key: string | null }>(
       `SELECT id, \`key\` FROM permissions WHERE active = 1 ORDER BY id ASC`
     );
-    const permByKey = new Map(
-      permissions.map((p) => [String(p.key || "").toLowerCase(), Number(p.id)])
-    );
-
-    const dbModules = await q<{ id: number; name: string | null; url: string | null }>(
-      `SELECT id, name, url FROM modules WHERE active = 1`
-    );
-
-    const tree = ADMIN_MODULES.map((group) => ({
-      id: group.id,
-      name: group.name,
-      modules: group.modules
-        .map((mod) => {
-          const dbm = dbModules.find(
-            (m) => String(m.url || "").toLowerCase() === mod.url.toLowerCase()
-          );
-          return {
-            id: dbm?.id ?? null,
-            name: mod.name,
-            url: mod.url,
-            actions: mod.actions
-              .map((a) => {
-                const pid = permByKey.get(a.toLowerCase());
-                return pid
-                  ? { id: pid, key: a, label: ACTION_LABELS[a] || a }
-                  : null;
-              })
-              .filter(Boolean),
-          };
-        })
-        .filter((m) => m.id !== null),
-    })).filter((g) => g.modules.length > 0);
 
     res.status(200).json({
-      tree,
-      permissions: permissions.map((p) => ({
-        id: p.id,
-        key: p.key,
-        label: ACTION_LABELS[String(p.key || "").toLowerCase()] || p.key,
+      modules: modules.map((m) => ({
+        id: m.id,
+        name: m.name,
+        url: m.url,
+        order: m.order,
+        actions: permissions.map((p) => {
+          const key = String(p.key || "").toLowerCase();
+          return { id: p.id, key: p.key, label: ACTION_LABELS[key] || p.key };
+        }),
       })),
+      permissions: permissions.map((p) => {
+        const key = String(p.key || "").toLowerCase();
+        return { id: p.id, key: p.key, label: ACTION_LABELS[key] || p.key };
+      }),
     });
   } catch (e) {
     console.error("[admin/meta]", e);
