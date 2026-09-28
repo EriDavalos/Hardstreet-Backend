@@ -12,7 +12,7 @@ export async function getUserByEmailWithRole(email: string): Promise<(LoginUserR
             r.name AS role_name
        FROM users u
        LEFT JOIN roles r ON r.id = u.id_role
-      WHERE u.active = 1 AND LOWER(u.email) = LOWER($1)
+      WHERE u.active = 1 AND LOWER(u.email) = LOWER(?)
       LIMIT 1`,
     [email]
   );

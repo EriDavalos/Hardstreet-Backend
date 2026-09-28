@@ -21,7 +21,7 @@ export async function getCategories(): Promise<PackageCategory[]> {
 
 // ---------- Catalogo: tiers ----------
 export async function getTiers(): Promise<Tier[]> {
-  const rows = await q<TierRow>(`SELECT id, name, tier FROM tiers WHERE active = 1 ORDER BY "tier" ASC`);
+  const rows = await q<TierRow>(`SELECT id, name, tier FROM tiers WHERE active = 1 ORDER BY tier ASC`);
   return rows.map(mapTier);
 }
 
@@ -48,7 +48,7 @@ export async function getPackages(opts: { extern?: boolean; category?: string } 
        LEFT JOIN tiers t ON t.id = p.id_tier
        LEFT JOIN packages_categories pc ON pc.id = p.id_package_category
       WHERE ${where.join(" AND ")}
-      ORDER BY t.tier ASC NULLS LAST, p.id ASC`,
+      ORDER BY t.tier IS NULL ASC, t.tier ASC, p.id ASC`,
     params
   );
 
@@ -59,7 +59,7 @@ export async function getPackages(opts: { extern?: boolean; category?: string } 
     `SELECT ps.id_package, s.id, s.name, s.description, s.icon
        FROM packages_services ps
        JOIN services s ON s.id = ps.id_service AND s.active = 1
-      WHERE ps.active = 1 AND ps.id_package = ANY($1::int[])
+      WHERE ps.active = 1 AND ps.id_package IN (?)
       ORDER BY ps.id ASC`,
     [ids]
   );
@@ -103,7 +103,7 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
        FROM purchased_packages_services pps
        LEFT JOIN services s ON s.id = pps.id_service
        LEFT JOIN status st ON st.id = pps.id_status
-      WHERE pps.active = 1 AND pps.id_purchased_package = ANY($1::int[])
+      WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
       ORDER BY pps.id ASC`,
     [ppIds]
   );
@@ -120,8 +120,7 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
                 pc.name AS cat_name, pc.icon AS cat_icon
            FROM packages p
            LEFT JOIN tiers t ON t.id = p.id_tier
-           LEFT JOIN packages_categories pc ON pc.id = p.id_package_category
-          WHERE p.id = ANY($1::int[])`,
+           LEFT JOIN packages_categories pc ON pc.id = p.id_package_category           WHERE p.id IN (?)`,
         [pkgIds]
       )
     : [];
@@ -131,14 +130,14 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
         `SELECT ps.id_package, s.id, s.name, s.description, s.icon
            FROM packages_services ps
            JOIN services s ON s.id = ps.id_service AND s.active = 1
-          WHERE ps.active = 1 AND ps.id_package = ANY($1::int[])
+          WHERE ps.active = 1 AND ps.id_package IN (?)
           ORDER BY ps.id ASC`,
         [pkgIds]
       )
     : [];
 
   const stRows = stIds.length
-    ? await q<StatusRow>(`SELECT id, name FROM status WHERE id = ANY($1::int[])`, [stIds])
+    ? await q<StatusRow>(`SELECT id, name FROM status WHERE id IN (?)`, [stIds])
     : [];
 
   return ppRows.map((r) => {

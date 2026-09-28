@@ -6,32 +6,27 @@ import { q } from "../../lib/db";
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const session = await getSession(req);
 
-  let rows: any[] = [];
+  // Rol del usuario (0 = sin sesion: catálogo completo de módulos)
+  let roleId = 0;
   if (session) {
-    // Modulos permitidos para el rol del usuario
-    rows = await q(
-      `SELECT DISTINCT m.id, m.name, m.url, m."order",
-              ARRAY_AGG(DISTINCT p.key) AS permissions
-         FROM modules m
-         JOIN permissions_roles pr ON pr.id_modules = m.id AND pr.active = 1
-         JOIN roles r ON r.id = pr.id_role
-         LEFT JOIN permissions p ON p.id = pr.id_permission
-        WHERE m.active = 1 AND r.id = $1
-        GROUP BY m.id, m.name, m.url, m."order"
-        ORDER BY m."order" ASC`,
-      [session.sub ? (await q(`SELECT id_role FROM users WHERE id = $1`, [session.sub]))[0]?.id_role : 0]
-    );
-  } else {
-    rows = await q(
-      `SELECT m.id, m.name, m.url, m."order", ARRAY_AGG(DISTINCT p.key) AS permissions
-         FROM modules m
-         JOIN permissions_roles pr ON pr.id_modules = m.id AND pr.active = 1
-         LEFT JOIN permissions p ON p.id = pr.id_permission
-        WHERE m.active = 1
-        GROUP BY m.id, m.name, m.url, m."order"
-        ORDER BY m."order" ASC`
-    );
+    const u = await q<{ id_role: number | null }>(`SELECT id_role FROM users WHERE id = ?`, [
+      session.sub,
+    ]);
+    roleId = Number(u[0]?.id_role || 0);
   }
+
+  // Permisos por módulo en una sola pasada (GROUP_CONCAT en vez de ARRAY_AGG)
+  const rows = await q<{ id: number; name: string; url: string; order: number; perms: string | null }>(
+    `SELECT m.id, m.name, m.url, m.\`order\`,
+            GROUP_CONCAT(DISTINCT p.key ORDER BY p.key SEPARATOR ',') AS perms
+       FROM modules m
+       LEFT JOIN permissions_roles pr ON pr.id_modules = m.id AND pr.active = 1
+       LEFT JOIN permissions p ON p.id = pr.id_permission ${roleId ? "AND pr.id_role = ?" : ""}
+      WHERE m.active = 1
+      GROUP BY m.id, m.name, m.url, m.\`order\`
+      ORDER BY m.\`order\` ASC`,
+    roleId ? [roleId] : []
+  );
 
   res.status(200).json({
     modules: rows.map((m) => ({
@@ -39,7 +34,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       name: m.name,
       url: m.url,
       order: m.order,
-      permissions: (m.permissions || []).filter(Boolean),
+      permissions: (m.perms || "").split(",").filter(Boolean),
     })),
   });
 });
