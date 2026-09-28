@@ -20,7 +20,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
        FROM users u
        LEFT JOIN roles r ON r.id = u.id_role
-      WHERE u.active = 1 AND u.id = $1
+      WHERE u.active = 1 AND u.id = ?
       LIMIT 1`,
     [session.sub]
   );

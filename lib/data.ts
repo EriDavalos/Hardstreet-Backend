@@ -32,11 +32,11 @@ export async function getPackages(opts: { extern?: boolean; category?: string } 
 
   if (opts.extern !== undefined) {
     params.push(opts.extern ? 1 : 0);
-    where.push(`p.is_extern = $${params.length}`);
+    where.push(`p.is_extern = ?`);
   }
   if (opts.category) {
     params.push(opts.category);
-    where.push(`LOWER(pc.name) = LOWER($${params.length})`);
+    where.push(`LOWER(pc.name) = LOWER(?)`);
   }
 
   const rows = await q<PackageRow & { tier_name: string | null; tier_num: number | null; cat_name: string | null; cat_icon: string | null }>(
@@ -87,7 +87,7 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
             pp.id_status, pp.id_package, pp.id_package_category, pp.id_tier
        FROM users_packages up
        JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
-      WHERE up.id_user = $1 AND up.active = 1
+      WHERE up.id_user = ? AND up.active = 1
       ORDER BY pp.id DESC`,
     [userId]
   );
@@ -176,7 +176,7 @@ export async function getGalleriesByUser(userId: number) {
        FROM galleries g
        LEFT JOIN galleries_types gt ON gt.id = g.id_gallery_type
        LEFT JOIN packages_categories pc ON pc.id = g.id_package_category
-      WHERE g.active = 1 AND g.id_user = $1
+      WHERE g.active = 1 AND g.id_user = ?
       ORDER BY g.id DESC`,
     [userId]
   );
