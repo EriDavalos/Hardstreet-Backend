@@ -4,10 +4,11 @@ import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 
 // ==================================================================
-// Metadatos del panel (solo rol Admin)  ->  /api/admin/meta
+// Metadatos del panel  ->  /api/admin/meta
 //   GET  módulos de la tabla `modules` + acciones de `permissions`.
 //   Sin grupos ni submódulos: la BD es la única fuente de verdad.
 //   Cada módulo se puede proteger con cualquiera de las 5 acciones.
+//   Cada módulo lleva `key` = modules.module (clave) y `name`.
 // ==================================================================
 
 const ACTION_LABELS: Record<string, string> = {
@@ -32,11 +33,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
     const modules = await q<{
       id: number;
+      module: string | null;
       name: string | null;
       url: string | null;
       order: number | null;
     }>(
-      `SELECT id, name, url, \`order\`
+      `SELECT id, \`module\`, name, url, \`order\`
          FROM modules
         WHERE active = 1
         ORDER BY \`order\` ASC, id ASC`
@@ -48,6 +50,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     res.status(200).json({
       modules: modules.map((m) => ({
         id: m.id,
+        key: String(m.module || "").toLowerCase().trim(),
         name: m.name,
         url: m.url,
         order: m.order,

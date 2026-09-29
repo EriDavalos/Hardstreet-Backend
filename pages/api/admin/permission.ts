@@ -6,12 +6,18 @@ import { userRoleId, userIsAdmin } from "../../../lib/permissions";
 
 // ==================================================================
 // Permisos del usuario autenticado  ->  /api/admin/permission
-//   GET  { isAdmin, modules: [{ name, actions: ["read","create",...] }] }
+//   GET  {
+//     isAdmin,
+//     modules: [{ key: "drive", name: "Archivos", actions: ["read",...] }]
+//   }
 //
-// Devuelve los MÓDULOS y ACCIONES reales del rol del usuario según
-// permissions_roles. Para el rol Admin devuelve isAdmin=true y además la
-// lista completa de módulos con todas sus acciones (el panel la usa para
-// el menú; el backend SIEMPRE le autoriza todo vía requirePermission).
+// `key`  = columna modules.module (la CLAVE: home, drive, users, rols...)
+// `name` = columna modules.name    (el nombre visible: Inicio, Archivos...)
+// El panel registra AMBAS para identificar el módulo sin importar cuál use.
+//
+// Los permisos se leen de permissions_roles (activos) del rol del usuario,
+// ADMIN INCLUIDO: si a su rol no le dieron "Ver" en un módulo, el panel lo
+// oculta (el backend en sí sigue autorizando las acciones que sí tenga).
 // ==================================================================
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
@@ -30,10 +36,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
-    // Filas de permissions_roles del rol, con nombre de módulo y acción.
-    // Sirve para el usuario normal Y (solo lectura de módulos) para Admin.
-    const rows = await q<{ name: string | null; key: string | null }>(
-      `SELECT m.name, p.key
+    const rows = await q<{
+      module: string | null;
+      name: string | null;
+      key: string | null;
+    }>(
+      `SELECT m.\`module\` AS module, m.name, p.\`key\` AS key
          FROM permissions_roles pr
          JOIN modules m     ON m.id = pr.id_modules  AND m.active = 1
          JOIN permissions p ON p.id = pr.id_permission AND p.active = 1
@@ -41,34 +49,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       [roleId]
     );
 
-    // Agrupa por módulo: { name: Set<acciones> }
-    const byModule = new Map<string, Set<string>>();
+    // Agrupa por CLAVE (modules.module) en minúsculas para que la misma
+    // dupla con varias filas no duplique módulos: { clave: { name, acciones } }
+    const byModule = new Map<string, { name: string; actions: Set<string> }>();
     for (const r of rows) {
+      const clave = String(r.module || "").toLowerCase().trim();
       const name = String(r.name || "").trim();
-      const key = String(r.key || "").toLowerCase().trim();
-      if (!name || !key) continue;
-      if (!byModule.has(name)) byModule.set(name, new Set());
-      byModule.get(name)!.add(key);
+      const action = String(r.key || "").toLowerCase().trim();
+      if (!clave || !name || !action) continue;
+      if (!byModule.has(clave)) byModule.set(clave, { name, actions: new Set() });
+      byModule.get(clave)!.actions.add(action);
     }
 
-    if (await userIsAdmin(roleId)) {
-      res.status(200).json({
-        isAdmin: true,
-        modules: [...byModule.entries()].map(([name, actions]) => ({
-          name,
-          actions: [...actions],
-        })),
-      });
-      return;
-    }
+    const modules = [...byModule.entries()].map(([clave, v]) => ({
+      key: clave,
+      name: v.name,
+      actions: [...v.actions],
+    }));
 
-    res.status(200).json({
-      isAdmin: false,
-      modules: [...byModule.entries()].map(([name, actions]) => ({
-        name,
-        actions: [...actions],
-      })),
-    });
+    const isAdmin = await userIsAdmin(roleId);
+    res.status(200).json({ isAdmin, modules });
   } catch (e) {
     console.error("[admin/permission]", e);
     res.status(500).json({ error: "Error interno del servidor" });

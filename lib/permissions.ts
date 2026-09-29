@@ -37,10 +37,10 @@ export async function roleCan(
        JOIN roles r       ON r.id = pr.id_role     AND r.active = 1
       WHERE pr.active = 1
         AND pr.id_role = ?
-        AND LOWER(m.name) = LOWER(?)
-        AND LOWER(p.key) = LOWER(?)
+        AND (LOWER(m.\`module\`) = LOWER(?) OR LOWER(m.name) = LOWER(?))
+        AND LOWER(p.\`key\`) = LOWER(?)
       LIMIT 1`,
-    [roleId, module, action]
+    [roleId, module, module, action]
   );
   return rows.length > 0;
 }
@@ -143,9 +143,10 @@ export async function requireAnyPermission(
     `SELECT 1 AS ok
        FROM permissions_roles pr
        JOIN modules m ON m.id = pr.id_modules AND m.active = 1
-      WHERE pr.active = 1 AND pr.id_role = ? AND LOWER(m.name) = LOWER(?)
+      WHERE pr.active = 1 AND pr.id_role = ?
+        AND (LOWER(m.\`module\`) = LOWER(?) OR LOWER(m.name) = LOWER(?))
       LIMIT 1`,
-    [roleId, module]
+    [roleId, module, module]
   );
   if (!rows.length) {
     res.status(403).json({ error: "No tienes acceso a este módulo", module });
