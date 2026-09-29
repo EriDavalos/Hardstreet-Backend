@@ -39,9 +39,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const rows = await q<{
       module: string | null;
       name: string | null;
-      key: string | null;
+      pkey: string | null;
     }>(
-      `SELECT m.\`module\` AS module, m.name, p.\`key\` AS key
+      // OJO: `key` es palabra reservada de MySQL -> el alias DEBE ser otro
+      // (pkey) o el driver muere con "Error interno del servidor".
+      `SELECT m.\`module\` AS module, m.name, p.\`key\` AS pkey
          FROM permissions_roles pr
          JOIN modules m     ON m.id = pr.id_modules  AND m.active = 1
          JOIN permissions p ON p.id = pr.id_permission AND p.active = 1
@@ -55,7 +57,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     for (const r of rows) {
       const clave = String(r.module || "").toLowerCase().trim();
       const name = String(r.name || "").trim();
-      const action = String(r.key || "").toLowerCase().trim();
+      const action = String(r.pkey || "").toLowerCase().trim();
       if (!clave || !name || !action) continue;
       if (!byModule.has(clave)) byModule.set(clave, { name, actions: new Set() });
       byModule.get(clave)!.actions.add(action);
