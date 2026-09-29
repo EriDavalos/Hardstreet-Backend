@@ -5,11 +5,13 @@ import { q } from "../../../lib/db";
 import { userRoleId, userIsAdmin } from "../../../lib/permissions";
 
 // ==================================================================
-// Mis permisos (usuario autenticado)  ->  /api/admin/my-permissions
+// Permisos del usuario autenticado  ->  /api/admin/permission
 //   GET  { isAdmin, modules: [{ name, actions: ["read","create",...] }] }
 //
-// El panel lo usa para mostrar SOLO los módulos donde el usuario tiene
-// permiso de "Ver". Para el rol Admin devuelve isAdmin=true (acceso total).
+// Devuelve los MÓDULOS y ACCIONES reales del rol del usuario según
+// permissions_roles. Para el rol Admin devuelve isAdmin=true y además la
+// lista completa de módulos con todas sus acciones (el panel la usa para
+// el menú; el backend SIEMPRE le autoriza todo vía requirePermission).
 // ==================================================================
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
@@ -28,11 +30,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
-    if (await userIsAdmin(roleId)) {
-      res.status(200).json({ isAdmin: true, modules: [] });
-      return;
-    }
-
+    // Filas de permissions_roles del rol, con nombre de módulo y acción.
+    // Sirve para el usuario normal Y (solo lectura de módulos) para Admin.
     const rows = await q<{ name: string | null; key: string | null }>(
       `SELECT m.name, p.key
          FROM permissions_roles pr
@@ -52,6 +51,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       byModule.get(name)!.add(key);
     }
 
+    if (await userIsAdmin(roleId)) {
+      res.status(200).json({
+        isAdmin: true,
+        modules: [...byModule.entries()].map(([name, actions]) => ({
+          name,
+          actions: [...actions],
+        })),
+      });
+      return;
+    }
+
     res.status(200).json({
       isAdmin: false,
       modules: [...byModule.entries()].map(([name, actions]) => ({
@@ -60,7 +70,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       })),
     });
   } catch (e) {
-    console.error("[admin/my-permissions]", e);
+    console.error("[admin/permission]", e);
     res.status(500).json({ error: "Error interno del servidor" });
   }
 });
