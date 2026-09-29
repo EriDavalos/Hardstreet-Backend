@@ -36,11 +36,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     switch (req.method) {
       case "GET": {
+        // EXCLUYE clientes: los usuarios con rol "Cliente"/"Client" viven en
+        // el módulo Clientes (/api/admin/clients), no aquí.
         const rows = await q<UserRow & { role_name: string | null }>(
           `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
              FROM users u
              LEFT JOIN roles r ON r.id = u.id_role
             WHERE u.active = 1
+              AND u.id NOT IN (
+                SELECT u2.id FROM users u2
+                JOIN roles r2 ON r2.id = u2.id_role AND r2.active = 1
+                 WHERE LOWER(r2.name) IN ('cliente', 'client')
+              )
             ORDER BY u.id ASC`
         );
         res.status(200).json({

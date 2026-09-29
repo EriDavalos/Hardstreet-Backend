@@ -9,7 +9,7 @@ import { q } from "./db";
 export const ADMIN_ROLE = "Admin";
 
 /** Rol fijo para el módulo de clientes (no se asigna: siempre "cliente"). */
-export const CLIENT_ROLE = "Client";
+export const CLIENT_ROLE = "Cliente";
 
 /**
  * Valida sesión (header Bearer) + rol Admin en la BD.

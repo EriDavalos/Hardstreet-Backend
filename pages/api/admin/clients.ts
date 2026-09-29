@@ -8,7 +8,7 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 
 // ==================================================================
 // Clientes (solo rol Admin)  ->  /api/admin/clients
-// Usuarios con rol fijo "Client" (no se asigna: siempre es cliente).
+// Usuarios con rol fijo "Cliente" (no se asigna: siempre es cliente).
 //   GET            lista clientes (con conteo de paquetes)
 //   POST           crea cliente { name, lastname, number, email, password }
 //   PUT/PATCH      actualiza { id, name?, lastname?, number?, email?, password? }
@@ -17,10 +17,11 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 //          body { userId, packageId } asigna o quita un purchased_package
 // ==================================================================
 
+/** Id del rol Cliente (tolera 'Cliente' y el viejo 'Client'). */
 async function clientRoleId(): Promise<number | null> {
   const rows = await q<{ id: number }>(
-    `SELECT id FROM roles WHERE LOWER(name) = ? AND active = 1 LIMIT 1`,
-    [CLIENT_ROLE.toLowerCase()]
+    `SELECT id FROM roles WHERE LOWER(name) IN ('cliente', 'client') AND active = 1
+      ORDER BY id ASC LIMIT 1`,
   );
   return rows[0]?.id ?? null;
 }
@@ -45,7 +46,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   const roleId = await clientRoleId();
   if (!roleId) {
-    res.status(500).json({ error: "No existe el rol 'Client' en la base de datos" });
+    res.status(500).json({ error: "No existe el rol 'Cliente' en la base de datos" });
     return;
   }
 
