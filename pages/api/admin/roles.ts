@@ -21,8 +21,17 @@ async function savePermissions(
   permissions: PermInput[]
 ) {
   await conn.query(`UPDATE permissions_roles SET active = 0 WHERE id_role = ?`, [roleId]);
+  // Id del permiso "Ver" (read): es la PUERTA del modulo. Regla de negocio:
+  // si un modulo no recibe "Ver", no se concede NINGUNA otra accion de ese
+  // modulo (create/update/delete/download). El front aplica lo mismo; aqui
+  // se revalida para que la BD nunca quede inconsistente.
+  const readRows = await q<{ id: number }>(
+    `SELECT id FROM permissions WHERE LOWER(\`key\`) = 'read' AND active = 1 LIMIT 1`
+  );
+  const readId = readRows.length ? Number(readRows[0].id) : null;
   for (const p of permissions) {
     if (!p.permissionIds?.length) continue;
+    if (readId !== null && !p.permissionIds.includes(readId)) continue;
     for (const pid of p.permissionIds) {
       // Reutiliza la fila existente (misma dupla modulo/permiso/rol) si hay una
       // inactiva, para no crecer la tabla sin fin con cada reasignacion.
