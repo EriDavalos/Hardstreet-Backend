@@ -7,16 +7,25 @@ import { withCors } from "../../lib/cors";
 //   - current < minVersion → ventana OBLIGATORIA de actualización.
 //   - current < version    → banner de "actualización disponible".
 // Se controla con variables de entorno (sin redeploy del código):
-//   APP_VERSION, APP_MIN_VERSION, APP_NOTES, DOWNLOAD_WIN, DOWNLOAD_APK
+//   APP_VERSION, APP_MIN_VERSION, APP_NOTES, DOWNLOAD_WIN, DOWNLOAD_APK,
+//   DRIVE_BASE
 // ==================================================================
+
+// El APK de actualización vive en Hardstreet-Backend-Drive/downloads
+// (ese proyecto se sube al servidor y lo publica en /downloads/<archivo>).
+// Por defecto se apunta ahí; DOWNLOAD_APK permite sobreescribirlo.
+const DRIVE_BASE = (
+  process.env.DRIVE_BASE || "http://oriongo.ddns.net:4000"
+).replace(/\/+$/, "");
 
 const APP_RELEASE = {
   version: process.env.APP_VERSION || "1.0.1",
   minVersion: process.env.APP_MIN_VERSION || "1.0.1",
   notes: process.env.APP_NOTES || "",
   downloads: {
-    windows: process.env.DOWNLOAD_WIN || "",
-    android: process.env.DOWNLOAD_APK || "",
+    // Sin .exe publicado todavía: vacío → el diálogo muestra "aún sin enlace".
+    windows: process.env.DOWNLOAD_WIN || `${DRIVE_BASE}/downloads/desktop/app-release.exe`,
+    android: process.env.DOWNLOAD_APK || `${DRIVE_BASE}/downloads/android/app-release.apk`,
   },
 };
 
