@@ -11,7 +11,8 @@ import { q, exec } from "../../../lib/db";
 //   PUT     { id, serviceId?, eventDate?, description? }
 //   DELETE  ?id=N  baja lógica (active = 0)
 //
-// Permiso por acción sobre el módulo "agendas" (Admin pasa siempre).
+// Tabla `schedules` (migración 2026-10-11: antes `agendas`).
+// Permiso por acción sobre el módulo "schedules" (Admin pasa siempre).
 // Las agendas se crean desde el paquete comprado del cliente y se pueden
 // crear VARIAS por servicio.
 // ==================================================================
@@ -53,7 +54,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     res.status(405).json({ error: "Metodo no permitido" });
     return;
   }
-  if (!(await requirePermission(req, res, "agendas", action))) return;
+  if (!(await requirePermission(req, res, "schedules", action))) return;
 
   try {
     switch (req.method) {
@@ -112,7 +113,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                     WHERE up2.id_purchased_package = a.id_purchased_package
                       AND up2.active = 1 AND u2.active = 1
                     ORDER BY up2.id LIMIT 1) AS client_name
-             FROM agendas a
+             FROM schedules a
              LEFT JOIN purchased_packages pp ON pp.id = a.id_purchased_package
              LEFT JOIN services s ON s.id = a.id_service
             WHERE ${where.join(" AND ")}
@@ -164,7 +165,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         const description = norm(b.description);
         const r = await exec(
-          `INSERT INTO agendas (id_purchased_package, id_service, event_date, description)
+          `INSERT INTO schedules (id_purchased_package, id_service, event_date, description)
            VALUES (?, ?, ?, ?)`,
           [purchasedPackageId, serviceId, eventDate, description || null]
         );
@@ -181,7 +182,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const exists = await q(
-          `SELECT id FROM agendas WHERE id = ? AND active = 1`,
+          `SELECT id FROM schedules WHERE id = ? AND active = 1`,
           [id]
         );
         if (!exists.length) {
@@ -221,7 +222,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
 
         await exec(
-          `UPDATE agendas SET ${fields.join(", ")} WHERE id = ?`,
+          `UPDATE schedules SET ${fields.join(", ")} WHERE id = ?`,
           [...params, id]
         );
         res.status(200).json({ ok: true });
@@ -234,7 +235,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           res.status(400).json({ error: "Falta el id de la agenda" });
           return;
         }
-        const r = await exec(`UPDATE agendas SET active = 0 WHERE id = ?`, [id]);
+        const r = await exec(`UPDATE schedules SET active = 0 WHERE id = ?`, [id]);
         if (!r.affectedRows) {
           res.status(404).json({ error: "Agenda no encontrada" });
           return;

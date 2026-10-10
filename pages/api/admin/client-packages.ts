@@ -33,7 +33,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         `SELECT up.id AS users_package_id, pp.id, pp.name, pp.subtitle, pp.description,
                 pp.price, pp.currency, pp.paid, pp.id_status, st.name AS status_name,
                 pp.id_package, p.name AS package_name,
-                (SELECT COUNT(*) FROM agendas ag
+                (SELECT COUNT(*) FROM schedules ag
                   WHERE ag.id_purchased_package = pp.id AND ag.active = 1) AS agendas_count
            FROM users_packages up
            JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
