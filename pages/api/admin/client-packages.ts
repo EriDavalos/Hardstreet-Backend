@@ -32,7 +32,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const purchased = await q(
         `SELECT up.id AS users_package_id, pp.id, pp.name, pp.subtitle, pp.description,
                 pp.price, pp.currency, pp.paid, pp.id_status, st.name AS status_name,
-                pp.id_package, p.name AS package_name
+                pp.id_package, p.name AS package_name,
+                (SELECT COUNT(*) FROM agendas ag
+                  WHERE ag.id_purchased_package = pp.id AND ag.active = 1) AS agendas_count
            FROM users_packages up
            JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
            LEFT JOIN status st ON st.id = pp.id_status
@@ -41,6 +43,22 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           ORDER BY up.id DESC`,
         [userId]
       );
+      // Servicios de cada compra (el panel los usa para el combo de agendas).
+      const purchasedIds = purchased
+        .map((r: any) => Number(r.id))
+        .filter((v: number) => !!v);
+      const pkgServices = purchasedIds.length
+        ? await q(
+            `SELECT pps.id, pps.id_purchased_package, pps.id_service, pps.description,
+                    s.name AS service_name, st.name AS status_name
+               FROM purchased_packages_services pps
+               LEFT JOIN services s ON s.id = pps.id_service
+               LEFT JOIN status st ON st.id = pps.id_status
+              WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
+              ORDER BY pps.id ASC`,
+            [purchasedIds]
+          )
+        : [];
       const catalog = await q(
         `SELECT id, name, subtitle, price, currency FROM packages
           WHERE active = 1 AND (is_extern = 0 OR is_extern IS NULL)
@@ -59,6 +77,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           status: r.status_name || "Pendiente",
           packageId: r.id_package,
           packageName: r.package_name,
+          agendaCount: Number(r.agendas_count || 0),
+          services: pkgServices
+            .filter((s: any) => Number(s.id_purchased_package) === Number(r.id))
+            .map((s: any) => ({
+              id: Number(s.id),
+              serviceId: Number(s.id_service || 0),
+              name: s.service_name || "",
+              description: s.description || "",
+              status: s.status_name || "Pendiente",
+            })),
         })),
         catalog: catalog.map((r: any) => ({
           id: r.id,

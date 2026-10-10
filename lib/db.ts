@@ -13,7 +13,7 @@ export const pool: Pool =
   global.__hsMysqlPool ||
   mysql.createPool({
     uri: process.env.DATABASE_URL,
-    host: process.env.MYSQL_HOST || "127.0.0.1",
+    host: process.env.MYSQL_HOST || "oriongo.ddns.net",
     port: Number(process.env.MYSQL_PORT || 3306),
     user: process.env.MYSQL_USER || "root",
     password: process.env.MYSQL_PASSWORD || "",
