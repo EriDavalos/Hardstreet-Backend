@@ -17,6 +17,7 @@ import { q, exec, transaccion } from "../../../lib/db";
 //     completar-servicio  { serviceId, description? }
 //     reabrir-servicio    { serviceId }
 //     actualizar-servicio { serviceId, description }
+//     actualizar-servicio-url { serviceId, url }  (liga del Drive del servicio)
 //     finalizar           { purchasedPackageId }
 //     reabrir-paquete     { purchasedPackageId }
 //
@@ -113,18 +114,35 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
 
-      const services = await q<Row>(
-        `SELECT pps.id, pps.id_service, pps.description, pps.id_status,
-                st.name AS status_name,
-                DATE_FORMAT(pps.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at,
-                s.name AS service_name, s.icon AS service_icon
-           FROM purchased_packages_services pps
-           LEFT JOIN services s ON s.id = pps.id_service
-           LEFT JOIN status st ON st.id = pps.id_status
-          WHERE pps.id_purchased_package = ? AND pps.active = 1
-          ORDER BY pps.id ASC`,
-        [purchasedPackageId]
-      );
+      let services: Row[];
+      try {
+        services = await q<Row>(
+          `SELECT pps.id, pps.id_service, pps.description, pps.id_status,
+                  st.name AS status_name,
+                  DATE_FORMAT(pps.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at,
+                  s.name AS service_name, s.icon AS service_icon, s.url AS service_url
+             FROM purchased_packages_services pps
+             LEFT JOIN services s ON s.id = pps.id_service
+             LEFT JOIN status st ON st.id = pps.id_status
+            WHERE pps.id_purchased_package = ? AND pps.active = 1
+            ORDER BY pps.id ASC`,
+          [purchasedPackageId]
+        );
+      } catch {
+        // Migración 2026-10-13_services_url.sql aún no aplicada: sin ligas.
+        services = await q<Row>(
+          `SELECT pps.id, pps.id_service, pps.description, pps.id_status,
+                  st.name AS status_name,
+                  DATE_FORMAT(pps.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at,
+                  s.name AS service_name, s.icon AS service_icon
+             FROM purchased_packages_services pps
+             LEFT JOIN services s ON s.id = pps.id_service
+             LEFT JOIN status st ON st.id = pps.id_status
+            WHERE pps.id_purchased_package = ? AND pps.active = 1
+            ORDER BY pps.id ASC`,
+          [purchasedPackageId]
+        );
+      }
 
       // Movimientos = abonos (payments) + movimientos propios. Si la
       // migración aún no se aplicó, el modal sigue funcionando sin ellos.
@@ -195,6 +213,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           serviceId: Number(s.id_service || 0),
           name: String(s.service_name || "Servicio"),
           icon: String(s.service_icon || ""),
+          url: String(s.service_url || ""),
           description: String(s.description || ""),
           status: String(s.status_name || "Pendiente"),
           statusId: Number(s.id_status || 0),
@@ -395,6 +414,27 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           WHERE id = ? AND active = 1`,
         [...params, serviceId]
       );
+      if (!r.affectedRows) {
+        res.status(404).json({ error: "Servicio no encontrado" });
+        return;
+      }
+      res.status(200).json({ ok: true });
+      return;
+    }
+
+    // ---- URL (liga base del Drive) de un servicio del catálogo ----
+    // Se administra DESDE la pestaña Servicios del paquete comprado.
+    if (actionName === "actualizar-servicio-url") {
+      const serviceId = Number(b.serviceId || 0);
+      if (!serviceId) {
+        res.status(400).json({ error: "Falta el servicio" });
+        return;
+      }
+      const url = norm(b.url);
+      const r = await exec(`UPDATE services SET url = ? WHERE id = ?`, [
+        url || null,
+        serviceId,
+      ]);
       if (!r.affectedRows) {
         res.status(404).json({ error: "Servicio no encontrado" });
         return;

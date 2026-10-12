@@ -50,8 +50,22 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const purchasedIds = purchased
         .map((r: any) => Number(r.id))
         .filter((v: number) => !!v);
-      const pkgServices = purchasedIds.length
-        ? await q(
+      let pkgServices: any[] = [];
+      if (purchasedIds.length) {
+        try {
+          pkgServices = await q(
+            `SELECT pps.id, pps.id_purchased_package, pps.id_service, pps.description,
+                    s.name AS service_name, s.url AS service_url, st.name AS status_name
+               FROM purchased_packages_services pps
+               LEFT JOIN services s ON s.id = pps.id_service
+               LEFT JOIN status st ON st.id = pps.id_status
+              WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
+              ORDER BY pps.id ASC`,
+            [purchasedIds]
+          );
+        } catch {
+          // Migración 2026-10-13_services_url.sql aún no aplicada: sin ligas.
+          pkgServices = await q(
             `SELECT pps.id, pps.id_purchased_package, pps.id_service, pps.description,
                     s.name AS service_name, st.name AS status_name
                FROM purchased_packages_services pps
@@ -60,8 +74,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
               ORDER BY pps.id ASC`,
             [purchasedIds]
-          )
-        : [];
+          );
+        }
+      }
       const catalog = await q(
         `SELECT id, name, subtitle, price, currency FROM packages
           WHERE active = 1 AND (is_extern = 0 OR is_extern IS NULL)
@@ -93,6 +108,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               serviceId: Number(s.id_service || 0),
               name: s.service_name || "",
               description: s.description || "",
+              url: s.service_url || "",
               status: s.status_name || "Pendiente",
             })),
         })),

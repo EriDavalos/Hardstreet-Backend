@@ -6,7 +6,14 @@
 // ==================================================================
 
 // ---------- Row types (snake_case tal cual la BD) ----------
-export interface ServiceRow { id: number; name: string | null; description: string | null; icon: string | null; }
+export interface ServiceRow {
+  id: number;
+  name: string | null;
+  description: string | null;
+  icon: string | null;
+  /** Liga base del Drive afiliada al servicio (opcional). */
+  url?: string | null;
+}
 export interface TierRow { id: number; name: string | null; tier: number | null; }
 export interface PackageCategoryRow { id: number; name: string | null; icon: string | null; }
 export interface StatusRow { id: number; name: string | null; }
@@ -39,7 +46,13 @@ export interface RoleRow { id: number; name: string | null; }
 export interface Tier { id: number; name: string; tier: number; }
 export interface PackageCategory { id: number; name: string; icon: string; }
 export interface Status { id: number; name: string; }
-export interface Service { id: number; name: string; description: string; icon: string; }
+export interface Service {
+  id: number;
+  name: string;
+  description: string;
+  icon: string;
+  url: string;
+}
 
 export interface Package {
   id: number;
@@ -113,7 +126,13 @@ export function mapStatus(r: StatusRow): Status {
 }
 
 export function mapService(r: ServiceRow): Service {
-  return { id: r.id, name: str(r.name), description: str(r.description), icon: str(r.icon) };
+  return {
+    id: r.id,
+    name: str(r.name),
+    description: str(r.description),
+    icon: str(r.icon),
+    url: str(r.url),
+  };
 }
 
 export function mapPackage(
@@ -149,7 +168,9 @@ export function mapPurchasedPackageService(
     description: str(r.description),
     deliveryDate: r.delivery_date === null || r.delivery_date === undefined ? null : num(r.delivery_date),
     status: status ? mapStatus(status) : { id: 0, name: "Pendiente" },
-    service: service ? mapService(service) : { id: 0, name: "", description: "", icon: "" },
+    service: service
+      ? mapService(service)
+      : { id: 0, name: "", description: "", icon: "", url: "" },
   };
 }
 

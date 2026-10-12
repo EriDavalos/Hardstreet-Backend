@@ -76,8 +76,19 @@ export async function getPackages(opts: { extern?: boolean; category?: string } 
 
 // ---------- Catalogo: servicios ----------
 export async function getServices() {
-  const rows = await q<ServiceRow>(`SELECT id, name, description, icon FROM services WHERE active = 1 ORDER BY id`);
-  return rows.map(mapService);
+  try {
+    const rows = await q<ServiceRow>(
+      `SELECT id, name, description, icon, url FROM services WHERE active = 1 ORDER BY id`
+    );
+    return rows.map(mapService);
+  } catch {
+    // Migración 2026-10-13_services_url.sql aún no aplicada: sin la columna
+    // `url` el catálogo sigue funcionando (sin ligas).
+    const rows = await q<ServiceRow>(
+      `SELECT id, name, description, icon FROM services WHERE active = 1 ORDER BY id`
+    );
+    return rows.map(mapService);
+  }
 }
 
 // ---------- Cliente: paquetes comprados de un usuario ----------
