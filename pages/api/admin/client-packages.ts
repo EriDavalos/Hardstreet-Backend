@@ -33,12 +33,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         `SELECT up.id AS users_package_id, pp.id, pp.name, pp.subtitle, pp.description,
                 pp.price, pp.currency, pp.paid, pp.id_status, st.name AS status_name,
                 pp.id_package, p.name AS package_name,
+                t.name AS tier_name, pc.name AS category_name, p.url_image,
                 (SELECT COUNT(*) FROM schedules ag
                   WHERE ag.id_purchased_package = pp.id AND ag.active = 1) AS agendas_count
            FROM users_packages up
            JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
            LEFT JOIN status st ON st.id = pp.id_status
            LEFT JOIN packages p ON p.id = pp.id_package
+           LEFT JOIN tiers t ON t.id = pp.id_tier
+           LEFT JOIN packages_categories pc ON pc.id = pp.id_package_category
           WHERE up.id_user = ? AND up.active = 1
           ORDER BY up.id DESC`,
         [userId]
@@ -77,6 +80,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           status: r.status_name || "Pendiente",
           packageId: r.id_package,
           packageName: r.package_name,
+          // Identidad del catálogo: el panel pinta el paquete con el mismo
+          // "flyer" que la web (tier, categoría e imagen).
+          tierName: r.tier_name || "",
+          categoryName: r.category_name || "",
+          urlImage: r.url_image || "",
           agendaCount: Number(r.agendas_count || 0),
           services: pkgServices
             .filter((s: any) => Number(s.id_purchased_package) === Number(r.id))

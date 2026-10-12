@@ -131,15 +131,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       let movements: Row[] = [];
       let movementsAvailable = true;
       try {
+        // El `kind` sale del UNION: los abonos son 'abono' y los
+        // movimientos propios conservan su tipo (antes TODOS salían como
+        // 'abono', así que un gasto nunca se contaba como gasto y todo se
+        // colaba en el total abonado).
         movements = await q<Row>(
-          `SELECT id, 'abono' AS kind, amount, description, source, created
+          `SELECT id, kind, amount, description, source, created
              FROM (
-               SELECT id, amount, description, 'payment' AS source,
+               SELECT id, 'abono' AS kind, amount, description,
+                      'payment' AS source,
                       DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created
                  FROM purchased_packages_payments
                 WHERE id_purchased_package = ? AND active = 1
                UNION ALL
-               SELECT id, amount, description, 'movement' AS source,
+               SELECT id, kind, amount, description, 'movement' AS source,
                       DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created
                  FROM purchased_packages_movements
                 WHERE id_purchased_package = ? AND active = 1
@@ -205,12 +210,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           created: m.created || "",
         })),
         movementsAvailable,
-        totals: {
-          abonado: sumBy(movements, (m) => m.kind === "abono"),
-          invertido: sumBy(movements, (m) => m.kind === "inversion"),
-          gastado: sumBy(movements, (m) => m.kind === "gasto"),
-          abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
-        },
+        // Estos totales son SOLO informativos de la pestaña Movimientos:
+        // gastos, inversiones y abonos externos NO tocan `paid` (abonado)
+        // ni el saldo, que siguen saliendo de purchased_packages_payments.
+        totals: (() => {
+          const invertido = sumBy(movements, (m) => m.kind === "inversion");
+          return {
+            abonado: sumBy(movements, (m) => m.kind === "abono"),
+            invertido,
+            // Inversión = un tipo de gasto: "Gastado" incluye ambos.
+            gastado: sumBy(movements, (m) => m.kind === "gasto") + invertido,
+            abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
+          };
+        })(),
         canFinish: !finished && pending.length === 0 && missing <= 0,
         blockers,
       });
