@@ -19,8 +19,8 @@ const DRIVE_BASE = (
 ).replace(/\/+$/, "");
 
 const APP_RELEASE = {
-  version: process.env.APP_VERSION || "1.0.3",
-  minVersion: process.env.APP_MIN_VERSION || "1.0.3",
+  version: process.env.APP_VERSION || "1.0.4",
+  minVersion: process.env.APP_MIN_VERSION || "1.0.4",
   notes: process.env.APP_NOTES || "",
   downloads: {
     // Sin .exe publicado todavía: vacío → el diálogo muestra "aún sin enlace".

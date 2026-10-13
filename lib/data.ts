@@ -107,17 +107,26 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
   const ppIds = ppRows.map((r) => r.id);
 
   // Servicios comprados + su servicio base + estatus
-  const svcRows = await q<PurchasedPackageServiceRow & { svc_name: string | null; svc_description: string | null; svc_icon: string | null; status_name: string | null }>(
-    `SELECT pps.id, pps.description, pps.delivery_date, pps.id_purchased_package, pps.id_status, pps.id_service,
+  // (`s.url` = carpeta del Drive afiliada al servicio; si la BD aún no tiene
+  //  la columna 2026-10-13_services_url.sql, se repite sin ella).
+  type SvcRow = PurchasedPackageServiceRow & {
+    svc_name: string | null; svc_description: string | null;
+    svc_icon: string | null; status_name: string | null; svc_url?: string | null;
+  };
+  const svcSelect = `SELECT pps.id, pps.description, pps.delivery_date, pps.id_purchased_package, pps.id_status, pps.id_service,
             s.name AS svc_name, s.description AS svc_description, s.icon AS svc_icon,
-            st.name AS status_name
+            st.name AS status_name{URL}
        FROM purchased_packages_services pps
        LEFT JOIN services s ON s.id = pps.id_service
        LEFT JOIN status st ON st.id = pps.id_status
       WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
-      ORDER BY pps.id ASC`,
-    [ppIds]
-  );
+      ORDER BY pps.id ASC`;
+  let svcRows: SvcRow[];
+  try {
+    svcRows = await q<SvcRow>(svcSelect.replace("{URL}", ", s.url AS svc_url"), [ppIds]);
+  } catch {
+    svcRows = await q<SvcRow>(svcSelect.replace("{URL}", ""), [ppIds]);
+  }
 
   // Paquetes principales (para heredar datos) + estatus global de la compra
   const pkgIds = [...new Set(ppRows.map((r) => r.id_package).filter((v): v is number => !!v))];
@@ -168,7 +177,7 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
         mapPurchasedPackageService(
           s,
           s.svc_name
-            ? { id: s.id_service || 0, name: s.svc_name, description: s.svc_description || "", icon: s.svc_icon || "" }
+            ? { id: s.id_service || 0, name: s.svc_name, description: s.svc_description || "", icon: s.svc_icon || "", url: s.svc_url || "" }
             : null,
           s.status_name ? { id: s.id_status || 0, name: s.status_name } : null
         )

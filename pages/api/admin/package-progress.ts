@@ -13,6 +13,8 @@ import { q, exec, transaccion } from "../../../lib/db";
 //   POST  { action, ... }
 //     abonar              { purchasedPackageId, amount, description }
 //     movimiento          { purchasedPackageId, kind, amount, description }
+//       kind = inversion | gasto | ahorro | abono_externo
+//       (el AHORRO se aparta del disponible: abonado - gastado)
 //     quitar-movimiento   { movementId, source }
 //     completar-servicio  { serviceId, description? }
 //     reabrir-servicio    { serviceId }
@@ -22,7 +24,8 @@ import { q, exec, transaccion } from "../../../lib/db";
 //     reabrir-paquete     { purchasedPackageId }
 //
 // Requiere la migración 2026-10-12_package_admin.sql:
-//   * purchased_packages_movements (inversion | gasto | abono_externo)
+//   * purchased_packages_movements (varchar: inversion | gasto | ahorro |
+//     abono_externo; el tipo nuevo no necesita migración)
 //   * purchased_packages_services.finished_at
 //   * purchased_packages.finished_at
 //   * status 6 = 'Terminado'
@@ -38,7 +41,12 @@ const ST_PROCESS = 2; // En proceso -> servicio reabierto
 const ST_FINISHED = 6; // Terminado  -> paquete cerrado
 
 /** Tipos de movimiento propios (los abonos van aparte). */
-const MOVEMENT_KINDS = ["inversion", "gasto", "abono_externo"] as const;
+const MOVEMENT_KINDS = [
+  "inversion",
+  "gasto",
+  "ahorro",
+  "abono_externo",
+] as const;
 type MovementKind = (typeof MOVEMENT_KINDS)[number];
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
@@ -230,16 +238,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         })),
         movementsAvailable,
         // Estos totales son SOLO informativos de la pestaña Movimientos:
-        // gastos, inversiones y abonos externos NO tocan `paid` (abonado)
-        // ni el saldo, que siguen saliendo de purchased_packages_payments.
+        // gastos, inversiones, ahorros y abonos externos NO tocan `paid`
+        // (abonado) ni el saldo, que siguen saliendo de
+        // purchased_packages_payments.
         totals: (() => {
+          const round2 = (n: number) => Math.round(n * 100) / 100;
+          const abonado = sumBy(movements, (m) => m.kind === "abono");
           const invertido = sumBy(movements, (m) => m.kind === "inversion");
+          // Inversión = un tipo de gasto: "Gastado" incluye ambos.
+          const gastado = sumBy(movements, (m) => m.kind === "gasto") + invertido;
           return {
-            abonado: sumBy(movements, (m) => m.kind === "abono"),
+            abonado,
             invertido,
-            // Inversión = un tipo de gasto: "Gastado" incluye ambos.
-            gastado: sumBy(movements, (m) => m.kind === "gasto") + invertido,
+            gastado,
+            ahorrado: sumBy(movements, (m) => m.kind === "ahorro"),
             abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
+            // DISPONIBLE = lo abonado menos lo gastado (gasto + inversión):
+            // es el dinero libre del paquete y la BASE del ahorro en
+            // porcentaje que ofrece el panel.
+            disponible: Math.max(0, round2(abonado - gastado)),
           };
         })(),
         canFinish: !finished && pending.length === 0 && missing <= 0,
