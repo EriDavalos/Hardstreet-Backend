@@ -15,11 +15,16 @@ import { q, exec } from "../../../lib/db";
 //               módulo pueda desglosar cada fila de su tabla; los abonos
 //               (payments) vienen con kind = 'abono'.
 //
-//   POST  { purchasedPackageId, kind?, amount, description? }
+//   POST  { purchasedPackageId?, kind?, amount, description? }
 //     Registra un movimiento de tipo gasto | inversion | ahorro |
 //     abono_externo (por defecto 'ahorro'). El porcentaje se calcula en la
 //     app a partir del `disponible` que ya devuelve este mismo GET, para no
 //     tener dos fórmulas distintas.
+//
+//     SIN `purchasedPackageId` el movimiento es GENERAL (del negocio, sin
+//     paquete): el módulo Finanzas ya no obliga a elegir un paquete. Esos
+//     movimientos afectan a los TOTALES del negocio (gastos, inversiones,
+//     ahorro, abono externo y disponible) y se agrupan en `general`.
 //
 // Fuentes (las mismas del administrador del paquete):
 //   purchased_packages.paid            -> abonos cobrados
@@ -123,18 +128,28 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       type ByKind = ReturnType<typeof emptyByKind>;
 
       const byKind = new Map<number, ByKind>();
+      // Movimientos GENERALES (sin paquete): son del negocio entero.
+      const general = emptyByKind();
       for (const m of movements) {
         const id = Number(m.id_purchased_package || 0);
         const kind = String(m.kind || "");
-        if (!id) continue;
-        const bucket = byKind.get(id) ?? emptyByKind();
         const total = Number(m.total || 0);
+        const bucket = id ? byKind.get(id) ?? emptyByKind() : general;
         if (kind === "inversion") bucket.inversion += total;
         else if (kind === "ahorro") bucket.ahorro += total;
         else if (kind === "abono_externo") bucket.abonoExterno += total;
         else bucket.gasto += total;
-        byKind.set(id, bucket);
+        if (id) byKind.set(id, bucket);
       }
+
+      let generalOut = {
+        gastos: 0,
+        inversiones: 0,
+        salidas: 0,
+        ahorro: 0,
+        abonoExterno: 0,
+        neto: 0,
+      };
 
       const totals = {
         facturado: 0,
@@ -189,6 +204,31 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           disponible,
         };
       });
+
+      // ---- Movimientos GENERALES del negocio ----
+      // Gastado = gasto + inversión; el ahorro se aparta y el abono externo
+      // entra por fuera, igual que en un paquete.
+      const generalGastado = general.gasto + general.inversion;
+      const generalNeto =
+        general.abonoExterno - generalGastado - general.ahorro;
+      generalOut = {
+        gastos: round2(general.gasto),
+        inversiones: round2(general.inversion),
+        salidas: round2(generalGastado),
+        ahorro: round2(general.ahorro),
+        abonoExterno: round2(general.abonoExterno),
+        neto: round2(generalNeto),
+      };
+      // El negocio entero: lo que suman los paquetes MENOS lo que se gastó,
+      // se apartó o entró por fuera del paquete.
+      totals.gastos += general.gasto;
+      totals.inversiones += general.inversion;
+      totals.ahorro += general.ahorro;
+      totals.abonoExterno += general.abonoExterno;
+      totals.disponible = Math.max(
+        0,
+        round2(totals.disponible - generalGastado - general.ahorro + general.abonoExterno)
+      );
 
       for (const key of Object.keys(totals) as (keyof typeof totals)[]) {
         totals[key] = round2(totals[key]);
@@ -262,13 +302,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       let movementRows: Row[] = [];
       if (movementsAvailable) {
         try {
+          // LEFT JOIN: los movimientos GENERALES (sin paquete) también
+          // salen en el desglose, con packageId = 0.
           const rows = await q<Row>(
             `SELECT m.id, m.id_purchased_package AS package_id, m.kind,
                     m.amount, m.description,
                     DATE_FORMAT(m.created, '%Y-%m-%dT%H:%i:%s') AS created
                FROM purchased_packages_movements m
-               JOIN purchased_packages pp ON pp.id = m.id_purchased_package
-              WHERE m.active = 1 AND pp.active = 1
+               LEFT JOIN purchased_packages pp ON pp.id = m.id_purchased_package
+              WHERE m.active = 1 AND (pp.id IS NULL OR pp.active = 1)
               ORDER BY m.created DESC, m.id DESC
               LIMIT 400`
           );
@@ -293,6 +335,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       res.status(200).json({
         currency,
         totals,
+        // Dinero registrado SIN paquete (gastos/inversiones/ahorro del
+        // negocio). La tabla de la app lo muestra como grupo "General".
+        general: generalOut,
         packages: packagesOut,
         months: [...series.values()],
         movements: movementRows.map((m) => {
@@ -302,7 +347,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           };
           return {
             id: Number(m.id),
-            packageId: Number(m.package_id),
+            packageId: Number(m.package_id || 0),
             packageName: meta.name,
             clientName: meta.clientName,
             kind: String(m.kind || "gasto"),
@@ -320,12 +365,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     // ================================ POST ===============================
     // Registra un movimiento (gasto | inversion | ahorro | abono_externo).
     // Sin `kind` se asume AHORRO: es el caso que ya usaba el módulo.
+    // Sin `purchasedPackageId` el movimiento es GENERAL (del negocio).
     const b = (req.body || {}) as Record<string, unknown>;
     const purchasedPackageId = Number(b.purchasedPackageId || 0);
-    if (!purchasedPackageId) {
-      res.status(400).json({ error: "Indica el paquete comprado" });
-      return;
-    }
     const amount = Number(b.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
       res.status(400).json({ error: "El monto debe ser mayor a 0" });
@@ -335,26 +377,44 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const kind = (MOVE_KINDS as readonly string[]).includes(kindRaw)
       ? kindRaw
       : "ahorro";
-    const exists = await q(
-      `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
-      [purchasedPackageId]
-    );
-    if (!exists.length) {
-      res.status(404).json({ error: "Paquete comprado no encontrado" });
-      return;
+    // Con paquete: se valida que exista. Sin paquete: movimiento general.
+    if (purchasedPackageId) {
+      const exists = await q(
+        `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
+        [purchasedPackageId]
+      );
+      if (!exists.length) {
+        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        return;
+      }
     }
     const description = norm(b.description);
-    const r = await exec(
-      `INSERT INTO purchased_packages_movements
-         (id_purchased_package, kind, amount, description)
-       VALUES (?, ?, ?, ?)`,
-      [purchasedPackageId, kind, round2(amount), description || null]
-    );
+    let r: { insertId?: number };
+    try {
+      r = await exec(
+        `INSERT INTO purchased_packages_movements
+           (id_purchased_package, kind, amount, description)
+         VALUES (?, ?, ?, ?)`,
+        [purchasedPackageId || null, kind, round2(amount), description || null]
+      );
+    } catch (e) {
+      // La columna sigue siendo NOT NULL: falta la migración que permite los
+      // movimientos GENERALES (del negocio, sin paquete).
+      if (!purchasedPackageId) {
+        res.status(409).json({
+          error:
+            "Falta aplicar la migración 2026-10-15 (movimientos generales sin paquete)",
+        });
+        return;
+      }
+      throw e;
+    }
     res.status(201).json({
       ok: true,
       id: r.insertId,
       kind,
       amount: round2(amount),
+      general: !purchasedPackageId,
     });
   } catch (e) {
     console.error("[admin/finance]", e);

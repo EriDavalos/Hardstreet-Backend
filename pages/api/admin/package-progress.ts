@@ -111,15 +111,29 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         res.status(400).json({ error: "Falta purchasedPackageId" });
         return;
       }
-      const pkgRows = await q<Row>(
-        `SELECT pp.id, pp.name, pp.price, pp.paid, pp.id_status,
-                st.name AS status_name,
-                DATE_FORMAT(pp.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at
-           FROM purchased_packages pp
-           LEFT JOIN status st ON st.id = pp.id_status
-          WHERE pp.id = ? AND pp.active = 1`,
-        [purchasedPackageId]
-      );
+      let pkgRows: Row[];
+      try {
+        pkgRows = await q<Row>(
+          `SELECT pp.id, pp.name, pp.price, pp.paid, pp.id_status, pp.drive_path,
+                  st.name AS status_name,
+                  DATE_FORMAT(pp.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at
+             FROM purchased_packages pp
+             LEFT JOIN status st ON st.id = pp.id_status
+            WHERE pp.id = ? AND pp.active = 1`,
+          [purchasedPackageId]
+        );
+      } catch {
+        // Migración 2026-10-15 (carpeta compartida) aún no aplicada.
+        pkgRows = await q<Row>(
+          `SELECT pp.id, pp.name, pp.price, pp.paid, pp.id_status,
+                  st.name AS status_name,
+                  DATE_FORMAT(pp.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at
+             FROM purchased_packages pp
+             LEFT JOIN status st ON st.id = pp.id_status
+            WHERE pp.id = ? AND pp.active = 1`,
+          [purchasedPackageId]
+        );
+      }
       if (!pkgRows.length) {
         res.status(404).json({ error: "Paquete comprado no encontrado" });
         return;
@@ -218,6 +232,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           statusId: Number(pkg.id_status || 0),
           finished,
           finishedAt: pkg.finished_at || null,
+          // Carpeta del Drive COMPARTIDA con el cliente de este paquete
+          // ('' = todavía no se le comparte ninguna). Se administra en la
+          // pestaña Drive del administrador del paquete.
+          drivePath: String(pkg.drive_path || ""),
         },
         services: services.map((s) => ({
           id: Number(s.id),
@@ -581,6 +599,43 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return { id: Number(ins.insertId), paid };
       });
       res.status(201).json({ ok: true, ...out });
+      return;
+    }
+
+    // ---- Carpeta del Drive COMPARTIDA con el cliente del paquete ----
+    // `path` vacío = dejar de compartir. La ruta se normaliza (sin barras
+    // iniciales/finales y sin '..') porque el drive del cliente la usa tal
+    // cual para limitar lo que ve.
+    if (actionName === "compartir-directorio") {
+      const purchasedPackageId = Number(b.purchasedPackageId || 0);
+      if (!purchasedPackageId) {
+        res.status(400).json({ error: "Indica el paquete comprado" });
+        return;
+      }
+      const clean = norm(b.path)
+        .replace(/\\/g, "/")
+        .split("/")
+        .map((s) => s.trim())
+        .filter((s) => s !== "" && s !== "." && s !== "..")
+        .join("/");
+      let r: { affectedRows?: number };
+      try {
+        r = await exec(
+          `UPDATE purchased_packages SET drive_path = ? WHERE id = ? AND active = 1`,
+          [clean || null, purchasedPackageId]
+        );
+      } catch {
+        res.status(409).json({
+          error:
+            "Falta aplicar la migración 2026-10-15 (carpeta compartida del paquete)",
+        });
+        return;
+      }
+      if (!r.affectedRows) {
+        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        return;
+      }
+      res.status(200).json({ ok: true, drivePath: clean });
       return;
     }
 
