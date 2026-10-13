@@ -6,16 +6,20 @@ import { q, exec } from "../../../lib/db";
 // ==================================================================
 // FINANZAS DEL NEGOCIO -> /api/admin/finance
 //
-//   GET   { currency, totals, packages, months }
-//     totals   ganancias (abonos cobrados), porCobrar (saldo), facturado,
-//              disponible, ahorro, inversiones, gastos, abonoExterno
-//     packages dinero de CADA paquete activo, con su cliente
-//     months   últimos 6 meses: ganancias vs. gastos/inversiones/ahorro
+//   GET   { currency, totals, packages, months, movements }
+//     totals    ganancias (abonos cobrados), porCobrar (saldo), facturado,
+//               disponible, ahorro, inversiones, gastos, abonoExterno
+//     packages  dinero de CADA paquete activo, con su cliente
+//     months    últimos 6 meses: ganancias vs. gastos/inversiones/ahorro
+//     movements movimientos INDIVIDUALES (con paquete y cliente) para que el
+//               módulo pueda desglosar cada fila de su tabla; los abonos
+//               (payments) vienen con kind = 'abono'.
 //
-//   POST  { purchasedPackageId, amount, description? }
-//     Destina un monto al AHORRO del paquete (movimiento kind = 'ahorro').
-//     El porcentaje se calcula en la app a partir del `disponible` que ya
-//     devuelve este mismo GET, para no tener dos fórmulas distintas.
+//   POST  { purchasedPackageId, kind?, amount, description? }
+//     Registra un movimiento de tipo gasto | inversion | ahorro |
+//     abono_externo (por defecto 'ahorro'). El porcentaje se calcula en la
+//     app a partir del `disponible` que ya devuelve este mismo GET, para no
+//     tener dos fórmulas distintas.
 //
 // Fuentes (las mismas del administrador del paquete):
 //   purchased_packages.paid            -> abonos cobrados
@@ -151,7 +155,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // Gastado = gasto + inversión (la inversión también es dinero que
         // sale), igual que en el administrador del paquete.
         const gastado = k.gasto + k.inversion;
-        const disponible = Math.max(0, round2(paid - gastado));
+        // DISPONIBLE = abonado - gastado - ahorro + abono externo.
+        // El ahorro se APARTA (sale del disponible) y el abono externo es
+        // dinero que entra por fuera del paquete (se suma). Misma fórmula
+        // que /api/admin/package-progress.
+        const disponible = Math.max(
+          0,
+          round2(paid - gastado - k.ahorro + k.abonoExterno)
+        );
         const porCobrar = Math.max(0, round2(price - paid));
 
         totals.facturado += price;
@@ -241,11 +252,65 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         packagesOut.find((p) => p.currency)?.currency ||
         String(packages[0]?.currency || "MXN");
 
+      // ---- Movimientos INDIVIDUALES (desglose de la tabla) ----
+      // La tabla expande cada fila: los paquetes para ver su resumen y cada
+      // tipo de movimiento para ver sus registros uno por uno.
+      const nameById = new Map<number, { name: string; clientName: string }>();
+      for (const p of packagesOut) {
+        nameById.set(p.id, { name: p.name, clientName: p.clientName });
+      }
+      let movementRows: Row[] = [];
+      if (movementsAvailable) {
+        try {
+          const rows = await q<Row>(
+            `SELECT m.id, m.id_purchased_package AS package_id, m.kind,
+                    m.amount, m.description,
+                    DATE_FORMAT(m.created, '%Y-%m-%dT%H:%i:%s') AS created
+               FROM purchased_packages_movements m
+               JOIN purchased_packages pp ON pp.id = m.id_purchased_package
+              WHERE m.active = 1 AND pp.active = 1
+              ORDER BY m.created DESC, m.id DESC
+              LIMIT 400`
+          );
+          const pays = await q<Row>(
+            `SELECT p.id, p.id_purchased_package AS package_id,
+                    'abono' AS kind, p.amount, p.description,
+                    DATE_FORMAT(p.created, '%Y-%m-%dT%H:%i:%s') AS created
+               FROM purchased_packages_payments p
+               JOIN purchased_packages pp ON pp.id = p.id_purchased_package
+              WHERE p.active = 1 AND pp.active = 1
+              ORDER BY p.created DESC, p.id DESC
+              LIMIT 400`
+          );
+          movementRows = [...pays, ...rows].sort((a, b) =>
+            String(b.created).localeCompare(String(a.created))
+          );
+        } catch {
+          movementRows = [];
+        }
+      }
+
       res.status(200).json({
         currency,
         totals,
         packages: packagesOut,
         months: [...series.values()],
+        movements: movementRows.map((m) => {
+          const meta = nameById.get(Number(m.package_id)) || {
+            name: "",
+            clientName: "",
+          };
+          return {
+            id: Number(m.id),
+            packageId: Number(m.package_id),
+            packageName: meta.name,
+            clientName: meta.clientName,
+            kind: String(m.kind || "gasto"),
+            amount: round2(Number(m.amount || 0)),
+            description: String(m.description || ""),
+            created: m.created || "",
+          };
+        }),
         movementsAvailable,
         moveKinds: MOVE_KINDS,
       });
@@ -253,7 +318,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     }
 
     // ================================ POST ===============================
-    // Destina un monto al AHORRO de un paquete comprado.
+    // Registra un movimiento (gasto | inversion | ahorro | abono_externo).
+    // Sin `kind` se asume AHORRO: es el caso que ya usaba el módulo.
     const b = (req.body || {}) as Record<string, unknown>;
     const purchasedPackageId = Number(b.purchasedPackageId || 0);
     if (!purchasedPackageId) {
@@ -265,6 +331,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       res.status(400).json({ error: "El monto debe ser mayor a 0" });
       return;
     }
+    const kindRaw = norm(b.kind).toLowerCase().replace(/-/g, "_");
+    const kind = (MOVE_KINDS as readonly string[]).includes(kindRaw)
+      ? kindRaw
+      : "ahorro";
     const exists = await q(
       `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
       [purchasedPackageId]
@@ -277,13 +347,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const r = await exec(
       `INSERT INTO purchased_packages_movements
          (id_purchased_package, kind, amount, description)
-       VALUES (?, 'ahorro', ?, ?)`,
-      [purchasedPackageId, round2(amount), description || null]
+       VALUES (?, ?, ?, ?)`,
+      [purchasedPackageId, kind, round2(amount), description || null]
     );
     res.status(201).json({
       ok: true,
       id: r.insertId,
-      kind: "ahorro",
+      kind,
       amount: round2(amount),
     });
   } catch (e) {

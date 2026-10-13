@@ -14,7 +14,10 @@ import { q, exec, transaccion } from "../../../lib/db";
 //     abonar              { purchasedPackageId, amount, description }
 //     movimiento          { purchasedPackageId, kind, amount, description }
 //       kind = inversion | gasto | ahorro | abono_externo
-//       (el AHORRO se aparta del disponible: abonado - gastado)
+//     editar-movimiento   { movementId, source, kind?, amount?, description? }
+//       Solo si el paquete NO está finalizado. En un abono (source
+//       'payment') se recalcula `paid`; en un movimiento propio se puede
+//       cambiar el tipo, el monto y el concepto.
 //     quitar-movimiento   { movementId, source }
 //     completar-servicio  { serviceId, description? }
 //     reabrir-servicio    { serviceId }
@@ -253,10 +256,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             gastado,
             ahorrado: sumBy(movements, (m) => m.kind === "ahorro"),
             abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
-            // DISPONIBLE = lo abonado menos lo gastado (gasto + inversión):
-            // es el dinero libre del paquete y la BASE del ahorro en
+            // DISPONIBLE = abonado - gastado (gasto + inversión) - ahorro +
+            // abono externo. El AHORRO se aparta (sale del disponible) y el
+            // ABONO EXTERNO es dinero que entra por fuera del paquete, así
+            // que se suma. Es el dinero libre y la BASE del ahorro en
             // porcentaje que ofrece el panel.
-            disponible: Math.max(0, round2(abonado - gastado)),
+            disponible: Math.max(
+              0,
+              round2(
+                abonado -
+                  gastado -
+                  sumBy(movements, (m) => m.kind === "ahorro") +
+                  sumBy(movements, (m) => m.kind === "abono_externo")
+              )
+            ),
           };
         })(),
         canFinish: !finished && pending.length === 0 && missing <= 0,
@@ -358,6 +371,82 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       res.status(200).json({ ok: true });
+      return;
+    }
+
+    // ---- Editar un movimiento o un abono (paquete NO finalizado) ----
+    if (actionName === "editar-movimiento") {
+      const movementId = Number(b.movementId || 0);
+      if (!movementId) {
+        res.status(400).json({ error: "Falta el movimiento" });
+        return;
+      }
+      const source = norm(b.source) === "payment" ? "payment" : "movement";
+      const table =
+        source === "payment"
+          ? "purchased_packages_payments"
+          : "purchased_packages_movements";
+      const found = await q<Row>(
+        `SELECT m.id_purchased_package, pp.id_status
+           FROM ${table} m
+           JOIN purchased_packages pp ON pp.id = m.id_purchased_package
+          WHERE m.id = ? AND m.active = 1`,
+        [movementId]
+      );
+      if (!found.length) {
+        res.status(404).json({
+          error: source === "payment" ? "Abono no encontrado" : "Movimiento no encontrado",
+        });
+        return;
+      }
+      // El historial de un paquete terminado es solo de consulta.
+      if (Number(found[0].id_status) === ST_FINISHED) {
+        res.status(400).json({
+          error: "El paquete está finalizado: reábrelo para editar movimientos",
+        });
+        return;
+      }
+      const fields: string[] = [];
+      const params: unknown[] = [];
+      if (b.amount !== undefined) {
+        const amount = asAmount(b.amount);
+        if (amount === null) {
+          res.status(400).json({ error: "El monto debe ser mayor a 0" });
+          return;
+        }
+        fields.push("`amount` = ?");
+        params.push(amount);
+      }
+      if (b.description !== undefined) {
+        fields.push("`description` = ?");
+        params.push(norm(b.description) || null);
+      }
+      if (source === "movement" && b.kind !== undefined) {
+        const kind = asKind(b.kind);
+        if (!kind) {
+          res.status(400).json({ error: "Tipo de movimiento inválido" });
+          return;
+        }
+        fields.push("`kind` = ?");
+        params.push(kind);
+      }
+      if (!fields.length) {
+        res.status(400).json({ error: "Nada que actualizar" });
+        return;
+      }
+      const purchasedPackageId = Number(found[0].id_purchased_package || 0);
+      const paid = await transaccion(async (conn) => {
+        await conn.query(
+          `UPDATE ${table} SET ${fields.join(", ")} WHERE id = ?`,
+          [...params, movementId]
+        );
+        // Un abono alimenta `paid`: hay que recuadrarlo.
+        if (source === "payment" && purchasedPackageId) {
+          return await recomputePaid(conn, purchasedPackageId);
+        }
+        return 0;
+      });
+      res.status(200).json({ ok: true, paid });
       return;
     }
 
