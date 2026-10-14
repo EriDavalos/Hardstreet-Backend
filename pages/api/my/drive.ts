@@ -3,7 +3,11 @@ import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 import { userIsAdmin, userRoleId } from "../../../lib/permissions";
-import { normalizeDrivePath, packageDrivePathsByIds } from "../../../lib/drive-paths";
+import {
+  normalizeDrivePath,
+  packageDrivePathsByIds,
+  userDrivePaths,
+} from "../../../lib/drive-paths";
 
 // ==================================================================
 // Carpetas COMPARTIDAS con el usuario logueado  ->  /api/my/drive
@@ -69,6 +73,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         .filter((p) => p !== "")
         .map((path) => ({ packageId, packageName, path }));
     });
+
+    // Carpetas compartidas DIRECTAMENTE con el usuario (no con un paquete en
+    // particular): las ve en todos sus paquetes. Van marcadas con
+    // packageId = 0 para que el cliente sepa que no son de un paquete.
+    for (const path of await userDrivePaths(Number(session.sub))) {
+      const clean = normalizeDrivePath(path);
+      if (clean === "") continue;
+      if (paths.some((p) => p.path === clean)) continue;
+      paths.push({ packageId: 0, packageName: "Compartido contigo", path: clean });
+    }
 
     const role = String(session.role || "");
     res.status(200).json({

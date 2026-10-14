@@ -58,9 +58,13 @@ export async function packageDrivePaths(
 ): Promise<string[]> {
   const out: string[] = [];
   try {
+    // OJO: `COALESCE(id_user, 0) = 0` deja fuera las carpetas compartidas
+    // DIRECTAMENTE con el cliente (esas salen en [userDrivePaths]): si no, la
+    // carpeta del cliente se leería también como carpeta del paquete.
     const rows = await q<{ path: string }>(
       `SELECT path FROM purchased_packages_drive
         WHERE id_purchased_package = ? AND active = 1
+          AND COALESCE(id_user, 0) = 0
         ORDER BY id ASC`,
       [purchasedPackageId]
     );
@@ -90,11 +94,13 @@ export async function packageDrivePathsByIds(
   for (const id of ids) map.set(id, []);
   if (!ids.length) return map;
 
-  // Carpetas de la tabla nueva.
+  // Carpetas de la tabla nueva (solo las DEL PAQUETE: las del cliente se
+  // piden aparte con [userDrivePathsByIds]).
   try {
     const rows = await q<{ id_purchased_package: number; path: string }>(
       `SELECT id_purchased_package, path FROM purchased_packages_drive
         WHERE active = 1 AND id_purchased_package IN (?)
+          AND COALESCE(id_user, 0) = 0
         ORDER BY id ASC`,
       [ids]
     );
@@ -154,8 +160,70 @@ async function siblingPackagePaths(
 }
 
 /**
+ * Carpetas compartidas DIRECTAMENTE con un CLIENTE (con `id_user`), sin
+ * importar el paquete: el cliente las ve en TODOS sus paquetes.
+ *
+ * Devuelve [] si la migración (columna `id_user`) todavía no se aplicó.
+ */
+export async function userDrivePaths(userId: number): Promise<string[]> {
+  const out: string[] = [];
+  if (!userId) return out;
+  try {
+    const rows = await q<{ path: string }>(
+      `SELECT path FROM purchased_packages_drive
+        WHERE id_user = ? AND active = 1
+        ORDER BY id ASC`,
+      [userId]
+    );
+    for (const r of rows) pushPath(out, r.path);
+  } catch {
+    // Columna pendiente de migración: sin carpetas del cliente.
+  }
+  return out;
+}
+
+/** Versión en lote de [userDrivePaths]. */
+export async function userDrivePathsByIds(
+  userIds: number[]
+): Promise<Map<number, string[]>> {
+  const ids = [...new Set(userIds.filter((n) => Number(n) > 0))];
+  const map = new Map<number, string[]>();
+  for (const id of ids) map.set(id, []);
+  if (!ids.length) return map;
+  try {
+    const rows = await q<{ id_user: number; path: string }>(
+      `SELECT id_user, path FROM purchased_packages_drive
+        WHERE active = 1 AND id_user IN (?)
+        ORDER BY id ASC`,
+      [ids]
+    );
+    for (const r of rows) pushPath(map.get(Number(r.id_user)) ?? [], r.path);
+  } catch {
+    // Columna pendiente de migración.
+  }
+  return map;
+}
+
+/**
+ * ¿Una carpeta COMPARTIDA DIRECTAMENTE con el cliente [userId] se solapa con
+ * [path]? Devuelve esa carpeta o null.
+ */
+export async function userSharedConflict(
+  userId: number,
+  path: string
+): Promise<string | null> {
+  const target = normalizeDrivePath(path);
+  if (!target || !userId) return null;
+  for (const other of await userDrivePaths(userId)) {
+    if (drivePathsOverlap(target, other)) return other;
+  }
+  return null;
+}
+
+/**
  * ¿Algún cliente de la compra [purchasedPackageId] ya tiene compartida, en
- * OTRO de sus paquetes, una carpeta que se solapa con [path]?
+ * OTRO de sus paquetes (o directamente con su usuario), una carpeta que se
+ * solapa con [path]?
  *
  * Devuelve esa carpeta (para poder decirle al usuario cuál es) o null.
  */
@@ -170,5 +238,26 @@ export async function sharedDriveConflict(
       if (drivePathsOverlap(target, other)) return other;
     }
   }
+  // Y las compartidas DIRECTO al cliente de ese paquete.
+  for (const cid of await packageClientIds(purchasedPackageId)) {
+    const clash = await userSharedConflict(cid, target);
+    if (clash) return clash;
+  }
   return null;
+}
+
+/** Clientes (usuarios) vinculados a un paquete comprado. */
+export async function packageClientIds(
+  purchasedPackageId: number
+): Promise<number[]> {
+  try {
+    const rows = await q<{ id_user: number }>(
+      `SELECT DISTINCT id_user FROM users_packages
+        WHERE id_purchased_package = ? AND active = 1`,
+      [purchasedPackageId]
+    );
+    return rows.map((r) => Number(r.id_user)).filter((n) => n > 0);
+  } catch {
+    return [];
+  }
 }

@@ -92,8 +92,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     // ================================ GET ================================
     if (req.method === "GET") {
-      // Paquetes activos con su cliente (subselect: un paquete puede tener
-      // más de un vínculo y no queremos filas duplicadas).
+      // Paquetes activos CON UN CLIENTE ACTIVO (subselect: un paquete puede
+      // tener más de un vínculo y no queremos filas duplicadas).
+      //
+      // Un cliente dado de baja (users.active = 0) NO cuenta: sus paquetes
+      // desaparecen del módulo, así no suman precios (facturado) ni aparecen
+      // en el historial. Lo mismo si el vínculo (users_packages) está
+      // desactivado. Así, un cliente en activo 0 no infla los totales.
       const packages = await q<Row>(
         `SELECT pp.id, pp.name, pp.price, pp.paid, pp.currency,
                 (SELECT TRIM(CONCAT(u2.name, ' ', COALESCE(u2.lastname, '')))
@@ -104,6 +109,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                   ORDER BY up2.id LIMIT 1) AS client_name
            FROM purchased_packages pp
           WHERE pp.active = 1
+            AND EXISTS (SELECT 1
+                          FROM users_packages upx
+                          JOIN users ux ON ux.id = upx.id_user
+                         WHERE upx.id_purchased_package = pp.id
+                           AND upx.active = 1 AND ux.active = 1)
           ORDER BY pp.id DESC`
       );
 
@@ -127,6 +137,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         inversion: 0,
         ahorro: 0,
         abonoExterno: 0,
+        // Los PAGOS a colaboradores/empleados son un gasto INVISIBLE: se
+        // registran (para saber a quién se le pagó) pero NO se descuentan
+        // del paquete ni del disponible.
+        pagos: 0,
       });
       type ByKind = ReturnType<typeof emptyByKind>;
 
@@ -141,6 +155,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (kind === "inversion") bucket.inversion += total;
         else if (kind === "ahorro") bucket.ahorro += total;
         else if (kind === "abono_externo") bucket.abonoExterno += total;
+        else if (kind === "pago") bucket.pagos += total;
         else bucket.gasto += total;
         if (id) byKind.set(id, bucket);
       }
@@ -151,6 +166,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         salidas: 0,
         ahorro: 0,
         abonoExterno: 0,
+        pagos: 0,
         neto: 0,
       };
 
@@ -163,6 +179,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         inversiones: 0,
         gastos: 0,
         abonoExterno: 0,
+        // Pagos repartidos: solo informativos (no son una salida).
+        pagos: 0,
+        // Ganancia ESTIMADA: el ahorro y la inversión se cuentan como salida
+        // (el dinero se movió, aunque siga siendo del negocio), pero el GASTO
+        // no se descuenta: es el "gasto inconveniente".
+        gananciaEstimada: 0,
+        // Ganancia REAL: la estimada MENOS los gastos (lo que de verdad
+        // queda). Coincide con el disponible del negocio.
+        gananciaReal: 0,
       };
 
       const packagesOut = packages.map((p) => {
@@ -171,7 +196,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const paid = Number(p.paid || 0);
         const k = byKind.get(id) ?? emptyByKind();
         // Gastado = gasto + inversión (la inversión también es dinero que
-        // sale), igual que en el administrador del paquete.
+        // sale). Los PAGOS no entran: son un gasto invisible.
         const gastado = k.gasto + k.inversion;
         // DISPONIBLE = abonado - gastado - ahorro + abono externo.
         // El ahorro se APARTA (sale del disponible) y el abono externo es
@@ -191,6 +216,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         totals.inversiones += k.inversion;
         totals.gastos += k.gasto;
         totals.abonoExterno += k.abonoExterno;
+        totals.pagos += k.pagos;
 
         return {
           id,
@@ -204,6 +230,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           inversiones: round2(k.inversion),
           abonoExterno: round2(k.abonoExterno),
           ahorro: round2(k.ahorro),
+          pagos: round2(k.pagos),
+          // Ganancia estimada/real del paquete (mismo criterio que el total).
+          gananciaEstimada: round2(
+            paid - k.inversion - k.ahorro + k.abonoExterno
+          ),
+          gananciaReal: disponible,
           disponible,
         };
       });
@@ -220,6 +252,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         salidas: round2(generalGastado),
         ahorro: round2(general.ahorro),
         abonoExterno: round2(general.abonoExterno),
+        pagos: round2(general.pagos),
         neto: round2(generalNeto),
       };
       // El negocio entero: lo que suman los paquetes MENOS lo que se gastó,
@@ -228,10 +261,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       totals.inversiones += general.inversion;
       totals.ahorro += general.ahorro;
       totals.abonoExterno += general.abonoExterno;
+      totals.pagos += general.pagos;
       totals.disponible = Math.max(
         0,
         round2(totals.disponible - generalGastado - general.ahorro + general.abonoExterno)
       );
+      // Ganancia estimada = cobrado + abono externo - inversión - ahorro
+      // (el gasto no se descuenta). Ganancia real = estimada - gastos, que es
+      // exactamente el disponible del negocio.
+      totals.gananciaEstimada = round2(
+        totals.ganancias +
+          totals.abonoExterno -
+          totals.inversiones -
+          totals.ahorro
+      );
+      totals.gananciaReal = round2(totals.gananciaEstimada - totals.gastos);
 
       for (const key of Object.keys(totals) as (keyof typeof totals)[]) {
         totals[key] = round2(totals[key]);
@@ -285,6 +329,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           if (kind === "inversion") bucket.inversiones = total;
           else if (kind === "ahorro") bucket.ahorro = total;
           else if (kind === "abono_externo") bucket.abonoExterno = total;
+          // Los pagos NO son salida: no entran en las barras de gastos.
+          else if (kind === "pago") continue;
           else bucket.gastos = total;
         }
       } catch {
@@ -304,23 +350,36 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       let movementRows: Row[] = [];
       if (movementsAvailable) {
+        // El destinatario del pago (colaborador/empleado) es opcional: si la
+        // columna `id_user` todavía no existe, se vuelve a consultar sin el
+        // JOIN en vez de quedarse sin historial.
+        const movementsQuery = (withUser: boolean) =>
+          `SELECT m.id, m.id_purchased_package AS package_id, m.kind,
+                  m.amount, m.description,
+                  DATE_FORMAT(m.created, '%Y-%m-%dT%H:%i:%s') AS created,${
+                    withUser
+                      ? " m.id_user AS user_id, CONCAT_WS(' ', u.name, u.lastname) AS user_name"
+                      : " NULL AS user_id, NULL AS user_name"
+                  }
+             FROM purchased_packages_movements m
+             LEFT JOIN purchased_packages pp ON pp.id = m.id_purchased_package${
+               withUser ? " LEFT JOIN users u ON u.id = m.id_user" : ""
+             }
+            WHERE m.active = 1 AND (pp.id IS NULL OR pp.active = 1)
+            ORDER BY m.created DESC, m.id DESC
+            LIMIT 400`;
         try {
-          // LEFT JOIN: los movimientos GENERALES (sin paquete) también
-          // salen en el desglose, con packageId = 0.
-          const rows = await q<Row>(
-            `SELECT m.id, m.id_purchased_package AS package_id, m.kind,
-                    m.amount, m.description,
-                    DATE_FORMAT(m.created, '%Y-%m-%dT%H:%i:%s') AS created
-               FROM purchased_packages_movements m
-               LEFT JOIN purchased_packages pp ON pp.id = m.id_purchased_package
-              WHERE m.active = 1 AND (pp.id IS NULL OR pp.active = 1)
-              ORDER BY m.created DESC, m.id DESC
-              LIMIT 400`
-          );
+          let rows: Row[];
+          try {
+            rows = await q<Row>(movementsQuery(true));
+          } catch {
+            rows = await q<Row>(movementsQuery(false));
+          }
           const pays = await q<Row>(
             `SELECT p.id, p.id_purchased_package AS package_id,
                     'abono' AS kind, p.amount, p.description,
-                    DATE_FORMAT(p.created, '%Y-%m-%dT%H:%i:%s') AS created
+                    DATE_FORMAT(p.created, '%Y-%m-%dT%H:%i:%s') AS created,
+                    NULL AS user_id, NULL AS user_name
                FROM purchased_packages_payments p
                JOIN purchased_packages pp ON pp.id = p.id_purchased_package
               WHERE p.active = 1 AND pp.active = 1
@@ -333,6 +392,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         } catch {
           movementRows = [];
         }
+        // Solo paquetes VIGENTES (con cliente activo) o movimientos
+        // generales: así un cliente dado de baja tampoco sale en el historial.
+        movementRows = movementRows.filter((m) => {
+          const pid = Number(m.package_id || 0);
+          return pid === 0 || nameById.has(pid);
+        });
       }
 
       res.status(200).json({
@@ -357,6 +422,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             amount: round2(Number(m.amount || 0)),
             description: String(m.description || ""),
             created: m.created || "",
+            // Quién recibió el pago (solo movimientos con destinatario).
+            userName: String(m.user_name || "").trim(),
           };
         }),
         movementsAvailable,
