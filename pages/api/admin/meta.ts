@@ -7,8 +7,15 @@ import { q } from "../../../lib/db";
 // Metadatos del panel  ->  /api/admin/meta
 //   GET  módulos de la tabla `modules` + acciones de `permissions`.
 //   Sin grupos ni submódulos: la BD es la única fuente de verdad.
-//   Cada módulo se puede proteger con cualquiera de las 5 acciones.
-//   Cada módulo lleva `key` = modules.module (clave) y `name`.
+//
+//   Cada módulo trae:
+//     - key / name / url / order
+//     - categoryId / categoryKey / categoryName / categoryOrder (o null si
+//       el módulo va "suelto", como Dashboard)
+//     - actions: SOLO los permisos APLICABLES a ese módulo, según la tabla
+//       `modules_permissions` (muchos a muchos). Así "Descargar" no se
+//       ofrece en Clientes, etc.
+//   Además `categories`: el catálogo de categorías ordenado (menor = arriba).
 // ==================================================================
 
 const ACTION_LABELS: Record<string, string> = {
@@ -17,6 +24,7 @@ const ACTION_LABELS: Record<string, string> = {
   update: "Editar",
   delete: "Eliminar",
   download: "Descargar",
+  admin_package: "Administrar paquete",
 };
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
@@ -37,32 +45,86 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       name: string | null;
       url: string | null;
       order: number | null;
+      categoryId: number | null;
+      categoryKey: string | null;
+      categoryName: string | null;
+      categoryOrder: number | null;
     }>(
-      `SELECT id, \`module\`, name, url, \`order\`
-         FROM modules
-        WHERE active = 1
-        ORDER BY \`order\` ASC, id ASC`
+      // Orden: módulos SUELTOS primero (COALESCE en 0), luego por categoría
+      // (menor = arriba) y dentro por el `order` del módulo (menor = primero).
+      `SELECT m.id, m.\`module\`, m.name, m.url, m.\`order\`,
+              mc.id AS categoryId, mc.\`key\` AS categoryKey,
+              mc.description AS categoryName, mc.\`order\` AS categoryOrder
+         FROM modules m
+         LEFT JOIN module_categories mc
+                ON mc.id = m.id_module_category AND mc.active = 1
+        WHERE m.active = 1
+        ORDER BY COALESCE(mc.\`order\`, 0) ASC, m.\`order\` ASC, m.id ASC`
     );
     const permissions = await q<{ id: number; key: string | null }>(
       `SELECT id, \`key\` FROM permissions WHERE active = 1 ORDER BY id ASC`
     );
+    // Permisos APLICABLES a cada módulo (relación muchos-a-muchos).
+    const modPerms = await q<{ id_module: number; kkey: string | null }>(
+      `SELECT mp.id_module, p.\`key\` AS kkey
+         FROM modules_permissions mp
+         JOIN permissions p ON p.id = mp.id_permission AND p.active = 1
+        WHERE mp.active = 1`
+    );
+    const allowed = new Map<number, Set<string>>();
+    for (const r of modPerms) {
+      const k = String(r.kkey || "").toLowerCase().trim();
+      if (!k) continue;
+      if (!allowed.has(r.id_module)) allowed.set(r.id_module, new Set());
+      allowed.get(r.id_module)!.add(k);
+    }
+
+    const catalog = permissions.map((p) => {
+      const key = String(p.key || "").toLowerCase();
+      return { id: p.id, key: p.key, label: ACTION_LABELS[key] || p.key };
+    });
+
+    const categories = modules
+      .filter((m) => m.categoryId !== null)
+      .reduce<
+        { id: number; key: string | null; name: string | null; order: number | null }[]
+      >((acc, m) => {
+        if (acc.some((c) => c.id === m.categoryId)) return acc;
+        acc.push({
+          id: m.categoryId as number,
+          key: m.categoryKey,
+          name: m.categoryName,
+          order: m.categoryOrder,
+        });
+        return acc;
+      }, [])
+      .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 
     res.status(200).json({
-      modules: modules.map((m) => ({
-        id: m.id,
-        key: String(m.module || "").toLowerCase().trim(),
-        name: m.name,
-        url: m.url,
-        order: m.order,
-        actions: permissions.map((p) => {
-          const key = String(p.key || "").toLowerCase();
-          return { id: p.id, key: p.key, label: ACTION_LABELS[key] || p.key };
-        }),
-      })),
-      permissions: permissions.map((p) => {
-        const key = String(p.key || "").toLowerCase();
-        return { id: p.id, key: p.key, label: ACTION_LABELS[key] || p.key };
+      categories,
+      modules: modules.map((m) => {
+        const keys = allowed.get(m.id);
+        // Un módulo sin permisos mapeados no ofrece acciones (evita mezclar
+        // "Descargar" donde no aplica); los módulos registrados sí los tienen.
+        const actions = keys
+          ? catalog.filter((a) =>
+              keys.has(String(a.key || "").toLowerCase())
+            )
+          : [];
+        return {
+          id: m.id,
+          key: String(m.module || "").toLowerCase().trim(),
+          name: m.name,
+          url: m.url,
+          order: m.order,
+          categoryId: m.categoryId,
+          categoryKey: m.categoryKey,
+          categoryName: m.categoryName,
+          categoryOrder: m.categoryOrder,
+          actions,
+        };
       }),
+      permissions: catalog,
     });
   } catch (e) {
     console.error("[admin/meta]", e);
