@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
 import { q, exec, transaccion } from "../../../lib/db";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // Paquetes de un cliente (solo rol Admin)  ->  /api/admin/client-packages
@@ -13,20 +15,22 @@ import { q, exec, transaccion } from "../../../lib/db";
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // Permiso sobre "clientes": ver para GET; editar para asignar/quitar.
+  let me: { sub: number; role: string } | null = null;
   if (req.method === "GET") {
-    if (!(await requirePermission(req, res, "clientes", "read"))) return;
+    me = await requirePermission(req, res, "clientes", "read");
   } else if (req.method === "POST") {
-    if (!(await requirePermission(req, res, "clientes", "update"))) return;
+    me = await requirePermission(req, res, "clientes", "update");
   } else {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
+  if (!me) return;
 
   try {
     if (req.method === "GET") {
       const userId = Number(req.query.userId || 0);
       if (!userId) {
-        res.status(400).json({ error: "Falta userId" });
+        fail(res, 400, "Falta userId", "Indica de qué cliente quieres los paquetes");
         return;
       }
       const purchased = await q(
@@ -127,12 +131,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const b = (req.body || {}) as Record<string, unknown>;
       const userId = Number(b.userId || 0);
       if (!userId) {
-        res.status(400).json({ error: "Falta userId" });
+        fail(res, 400, "Falta userId", "Indica a qué cliente le vas a mover los paquetes");
         return;
       }
       const user = await q(`SELECT id FROM users WHERE id = ? AND active = 1`, [userId]);
       if (!user.length) {
-        res.status(404).json({ error: "Usuario no encontrado" });
+        fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${userId}`);
         return;
       }
 
@@ -140,7 +144,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (b.usersPackageId !== undefined && b.usersPackageId !== null && b.usersPackageId !== "") {
         const linkId = Number(b.usersPackageId || 0);
         if (!linkId) {
-          res.status(400).json({ error: "usersPackageId invalido" });
+          fail(res, 400, "usersPackageId inválido", "Indica qué paquete del cliente quieres quitar");
           return;
         }
         const r = await exec(
@@ -148,10 +152,24 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [linkId, userId]
         );
         if (!r.affectedRows) {
-          res.status(404).json({ error: "Paquete no encontrado para este cliente" });
+          fail(res, 404, "Paquete no encontrado para este cliente", `El vínculo ${linkId} no existe o ya estaba inactivo`);
           return;
         }
-        res.status(200).json({ ok: true, removed: true });
+        await logActivity({
+          userId: me.sub,
+          module: "clientes",
+          moduleName: "Clientes",
+          action: "delete",
+          entity: "paquete-cliente",
+          entityId: linkId,
+          description: "Paquete quitado del cliente exitosamente",
+          details: { userId, usersPackageId: linkId },
+          req,
+        });
+        ok(res, "Paquete quitado del cliente exitosamente", {
+          removed: true,
+          item: { usersPackageId: linkId, userId },
+        });
         return;
       }
 
@@ -159,7 +177,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (b.purchasedPackageId !== undefined && b.purchasedPackageId !== null && b.purchasedPackageId !== "") {
         const ppId = Number(b.purchasedPackageId || 0);
         if (!ppId) {
-          res.status(400).json({ error: "purchasedPackageId invalido" });
+          fail(res, 400, "purchasedPackageId inválido", "Indica qué paquete quieres asignar");
           return;
         }
         const exists = await q(
@@ -167,7 +185,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [ppId]
         );
         if (!exists.length) {
-          res.status(404).json({ error: "Paquete comprado no encontrado" });
+          fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${ppId}`);
           return;
         }
         const dup = await q(
@@ -175,21 +193,39 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [userId, ppId]
         );
         if (dup.length) {
-          res.status(409).json({ error: "Ese paquete ya esta asignado al cliente" });
+          fail(res, 409, "Ese paquete ya está asignado al cliente", `users_packages existente #${dup.length}`);
           return;
         }
         const r = await exec(
           `INSERT INTO users_packages (id_user, id_purchased_package) VALUES (?, ?)`,
           [userId, ppId]
         );
-        res.status(201).json({ ok: true, id: r.insertId });
+        await logActivity({
+          userId: me.sub,
+          module: "clientes",
+          moduleName: "Clientes",
+          action: "create",
+          entity: "paquete-cliente",
+          entityId: r.insertId,
+          description: "Paquete asignado al cliente exitosamente",
+          details: { userId, purchasedPackageId: ppId },
+          req,
+        });
+        created(res, "Paquete asignado al cliente exitosamente", {
+          item: { usersPackageId: r.insertId, userId, purchasedPackageId: ppId },
+        });
         return;
       }
 
       // Crear compra nueva desde el catalogo y asignarla
       const packageId = Number(b.packageId || 0);
       if (!packageId) {
-        res.status(400).json({ error: "Indica packageId, purchasedPackageId o usersPackageId" });
+        fail(
+          res,
+          400,
+          "Indica packageId, purchasedPackageId o usersPackageId",
+          "Elige un paquete del catálogo o una compra existente"
+        );
         return;
       }
       const pkg: any[] = await q(
@@ -198,7 +234,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [packageId]
       );
       if (!pkg.length) {
-        res.status(404).json({ error: "Paquete no encontrado" });
+        fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${packageId}`);
         return;
       }
       const p = pkg[0];
@@ -232,13 +268,28 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return { purchasedPackageId: ppId, usersPackageId: Number((linkRes as any).insertId) };
       });
 
-      res.status(201).json({ ok: true, ...result });
+      const item = { userId, ...result, packageId };
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "create",
+        entity: "compra-paquete",
+        entityId: result.purchasedPackageId,
+        description: "Paquete creado y asignado al cliente exitosamente",
+        details: item,
+        req,
+      });
+      created(res, "Paquete creado y asignado al cliente exitosamente", {
+        ...result,
+        item,
+      });
       return;
     }
 
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
   } catch (e) {
     console.error("[admin/client-packages]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación de los paquetes del cliente");
   }
 });

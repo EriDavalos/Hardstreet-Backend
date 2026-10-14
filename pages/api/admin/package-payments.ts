@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
 import { q, transaccion } from "../../../lib/db";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // Abonos de un paquete comprado  ->  /api/admin/package-payments
@@ -42,10 +44,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "clientes", action))) return;
+  const me = await requirePermission(req, res, "clientes", action);
+  if (!me) return;
 
   try {
     // ---------------- Listar abonos ----------------
@@ -53,7 +56,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const userId = Number(req.query.userId || 0);
       const purchasedPackageId = Number(req.query.purchasedPackageId || 0);
       if (!userId && !purchasedPackageId) {
-        res.status(400).json({ error: "Falta userId o purchasedPackageId" });
+        fail(res, 400, "Falta userId o purchasedPackageId", "Indica de qué cliente o paquete quieres los abonos");
         return;
       }
 
@@ -96,12 +99,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const b = (req.body || {}) as Record<string, unknown>;
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Indica el paquete comprado" });
+        fail(res, 400, "Indica el paquete comprado", "El abono debe pertenecer a un paquete del cliente");
         return;
       }
       const amount = Number(b.amount);
       if (!Number.isFinite(amount) || amount <= 0) {
-        res.status(400).json({ error: "El monto del abono debe ser mayor a 0" });
+        fail(res, 400, "El monto del abono debe ser mayor a 0", "Escribe un monto válido");
         return;
       }
       const exists = await q(
@@ -109,7 +112,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [purchasedPackageId]
       );
       if (!exists.length) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
       const description =
@@ -125,7 +128,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return { id: Number(ins.insertId), paid };
       });
 
-      res.status(201).json({ ok: true, ...out });
+      const item = { id: out.id, purchasedPackageId, amount, description };
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "create",
+        entity: "abono",
+        entityId: out.id,
+        description: "Abono registrado exitosamente",
+        details: item,
+        req,
+      });
+      created(res, "Abono registrado exitosamente", { ...out, item });
       return;
     }
 
@@ -133,7 +148,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (req.method === "DELETE") {
       const id = Number(req.query.id || 0);
       if (!id) {
-        res.status(400).json({ error: "Falta el id del abono" });
+        fail(res, 400, "Falta el id del abono", "Indica qué abono quieres eliminar");
         return;
       }
       const found = await q<{ id_purchased_package: number | null }>(
@@ -142,7 +157,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [id]
       );
       if (!found.length) {
-        res.status(404).json({ error: "Abono no encontrado" });
+        fail(res, 404, "Abono no encontrado", `No hay un abono activo con id ${id}`);
         return;
       }
       const purchasedPackageId = Number(found[0].id_purchased_package || 0);
@@ -155,13 +170,24 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return purchasedPackageId ? await recomputePaid(conn, purchasedPackageId) : 0;
       });
 
-      res.status(200).json({ ok: true, paid });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "delete",
+        entity: "abono",
+        entityId: id,
+        description: "Abono eliminado exitosamente",
+        details: { id, paid },
+        req,
+      });
+      ok(res, "Abono eliminado exitosamente", { paid, item: { id, paid } });
       return;
     }
 
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
   } catch (e) {
     console.error("[admin/package-payments]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del abono");
   }
 });

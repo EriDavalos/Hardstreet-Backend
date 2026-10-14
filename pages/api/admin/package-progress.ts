@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import type { PoolConnection } from "mysql2/promise";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 import { q, exec, transaccion } from "../../../lib/db";
 
 // ==================================================================
@@ -98,17 +100,18 @@ function sumBy(rows: Row[], predicate: (r: Row) => boolean): number {
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const action = req.method === "GET" ? "read" : "update";
   if (req.method !== "GET" && req.method !== "POST") {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "clientes", action))) return;
+  const me = await requirePermission(req, res, "clientes", action);
+  if (!me) return;
 
   try {
     // ================================ GET ================================
     if (req.method === "GET") {
       const purchasedPackageId = Number(req.query.purchasedPackageId || 0);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Falta purchasedPackageId" });
+        fail(res, 400, "Falta purchasedPackageId", "Indica de qué paquete quieres el detalle");
         return;
       }
       let pkgRows: Row[];
@@ -135,7 +138,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
       }
       if (!pkgRows.length) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
 
@@ -304,7 +307,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "finalizar") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Indica el paquete comprado" });
+        fail(res, 400, "Indica el paquete comprado", "La acción necesita el paquete del cliente");
         return;
       }
       const rows = await q<Row>(
@@ -313,7 +316,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [purchasedPackageId]
       );
       if (!rows.length) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
       const pending = await q<Row>(
@@ -322,22 +325,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [purchasedPackageId, ST_DONE]
       );
       if (pending.length) {
-        res.status(400).json({
-          error:
-            pending.length === 1
-              ? "No se puede finalizar: hay 1 servicio sin terminar"
-              : `No se puede finalizar: hay ${pending.length} servicios sin terminar`,
-        });
+        fail(
+          res,
+          400,
+          "No se puede finalizar el paquete",
+          pending.length === 1
+            ? "Hay 1 servicio sin terminar"
+            : `Hay ${pending.length} servicios sin terminar`
+        );
         return;
       }
       const price = Number(rows[0].price || 0);
       const paid = Number(rows[0].paid || 0);
       if (paid + 0.01 < price) {
-        res.status(400).json({
-          error: `No se puede finalizar: el pago está incompleto (faltan ${(
-            price - paid
-          ).toFixed(2)})`,
-        });
+        fail(
+          res,
+          400,
+          "No se puede finalizar el paquete",
+          `El pago está incompleto: faltan ${(price - paid).toFixed(2)}`
+        );
         return;
       }
       await exec(
@@ -346,7 +352,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           WHERE id = ?`,
         [ST_FINISHED, purchasedPackageId]
       );
-      res.status(200).json({ ok: true, finished: true });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "paquete-cliente",
+        entityId: purchasedPackageId,
+        description: "Paquete finalizado exitosamente",
+        details: { purchasedPackageId, finished: true },
+        req,
+      });
+      ok(res, "Paquete finalizado exitosamente", {
+        finished: true,
+        item: { purchasedPackageId, finished: true },
+      });
       return;
     }
 
@@ -354,7 +374,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "reabrir-paquete") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Indica el paquete comprado" });
+        fail(res, 400, "Indica el paquete comprado", "La acción necesita el paquete del cliente");
         return;
       }
       const r = await exec(
@@ -364,10 +384,24 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [ST_PROCESS, purchasedPackageId]
       );
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
-      res.status(200).json({ ok: true, finished: false });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "paquete-cliente",
+        entityId: purchasedPackageId,
+        description: "Paquete reabierto exitosamente",
+        details: { purchasedPackageId, finished: false },
+        req,
+      });
+      ok(res, "Paquete reabierto exitosamente", {
+        finished: false,
+        item: { purchasedPackageId, finished: false },
+      });
       return;
     }
 
@@ -375,7 +409,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "reabrir-servicio") {
       const serviceId = Number(b.serviceId || 0);
       if (!serviceId) {
-        res.status(400).json({ error: "Falta el servicio" });
+        fail(res, 400, "Falta el servicio", "Indica qué servicio del paquete quieres reabrir");
         return;
       }
       const r = await exec(
@@ -385,10 +419,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [ST_PROCESS, serviceId]
       );
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Servicio no encontrado" });
+        fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${serviceId}`);
         return;
       }
-      res.status(200).json({ ok: true });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "servicio-paquete",
+        entityId: serviceId,
+        description: "Servicio reabierto exitosamente",
+        details: { serviceId },
+        req,
+      });
+      ok(res, "Servicio reabierto exitosamente", { item: { serviceId } });
       return;
     }
 
@@ -396,7 +441,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "editar-movimiento") {
       const movementId = Number(b.movementId || 0);
       if (!movementId) {
-        res.status(400).json({ error: "Falta el movimiento" });
+        fail(res, 400, "Falta el movimiento", "Indica qué movimiento quieres editar");
         return;
       }
       const source = norm(b.source) === "payment" ? "payment" : "movement";
@@ -412,16 +457,22 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [movementId]
       );
       if (!found.length) {
-        res.status(404).json({
-          error: source === "payment" ? "Abono no encontrado" : "Movimiento no encontrado",
-        });
+        fail(
+          res,
+          404,
+          source === "payment" ? "Abono no encontrado" : "Movimiento no encontrado",
+          `No hay un registro activo con id ${movementId}`
+        );
         return;
       }
       // El historial de un paquete terminado es solo de consulta.
       if (Number(found[0].id_status) === ST_FINISHED) {
-        res.status(400).json({
-          error: "El paquete está finalizado: reábrelo para editar movimientos",
-        });
+        fail(
+          res,
+          400,
+          "El paquete está finalizado",
+          "Reábrelo para poder editar sus movimientos"
+        );
         return;
       }
       const fields: string[] = [];
@@ -429,7 +480,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (b.amount !== undefined) {
         const amount = asAmount(b.amount);
         if (amount === null) {
-          res.status(400).json({ error: "El monto debe ser mayor a 0" });
+          fail(res, 400, "El monto debe ser mayor a 0", "Escribe un monto válido");
           return;
         }
         fields.push("`amount` = ?");
@@ -442,14 +493,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (source === "movement" && b.kind !== undefined) {
         const kind = asKind(b.kind);
         if (!kind) {
-          res.status(400).json({ error: "Tipo de movimiento inválido" });
+          fail(res, 400, "Tipo de movimiento inválido", String(b.kind));
           return;
         }
         fields.push("`kind` = ?");
         params.push(kind);
       }
       if (!fields.length) {
-        res.status(400).json({ error: "Nada que actualizar" });
+        fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del movimiento");
         return;
       }
       const purchasedPackageId = Number(found[0].id_purchased_package || 0);
@@ -464,7 +515,24 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         return 0;
       });
-      res.status(200).json({ ok: true, paid });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: source === "payment" ? "abono" : "movimiento",
+        entityId: movementId,
+        description:
+          source === "payment"
+            ? "Abono actualizado exitosamente"
+            : "Movimiento actualizado exitosamente",
+        details: { id: movementId, purchase: purchasedPackageId, ...b },
+        req,
+      });
+      ok(res, "Movimiento actualizado exitosamente", {
+        paid,
+        item: { id: movementId, paid },
+      });
       return;
     }
 
@@ -472,7 +540,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "quitar-movimiento") {
       const movementId = Number(b.movementId || 0);
       if (!movementId) {
-        res.status(400).json({ error: "Falta el movimiento" });
+        fail(res, 400, "Falta el movimiento", "Indica qué movimiento quieres quitar");
         return;
       }
       const source = norm(b.source) === "payment" ? "payment" : "movement";
@@ -483,7 +551,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [movementId]
         );
         if (!found.length) {
-          res.status(404).json({ error: "Abono no encontrado" });
+          fail(res, 404, "Abono no encontrado", `No hay un abono activo con id ${movementId}`);
           return;
         }
         const purchasedPackageId = Number(found[0].id_purchased_package || 0);
@@ -496,7 +564,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             ? await recomputePaid(conn, purchasedPackageId)
             : 0;
         });
-        res.status(200).json({ ok: true, paid });
+        await logActivity({
+          userId: me.sub,
+          module: "clientes",
+          moduleName: "Clientes",
+          action: "delete",
+          entity: "abono",
+          entityId: movementId,
+          description: "Abono eliminado exitosamente",
+          details: { id: movementId, purchase: purchasedPackageId, paid },
+          req,
+        });
+        ok(res, "Abono eliminado exitosamente", { paid, item: { id: movementId, paid } });
         return;
       }
       const r = await exec(
@@ -504,10 +583,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [movementId]
       );
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Movimiento no encontrado" });
+        fail(res, 404, "Movimiento no encontrado", `No hay un movimiento activo con id ${movementId}`);
         return;
       }
-      res.status(200).json({ ok: true });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "delete",
+        entity: "movimiento",
+        entityId: movementId,
+        description: "Movimiento eliminado exitosamente",
+        details: { id: movementId },
+        req,
+      });
+      ok(res, "Movimiento eliminado exitosamente", { item: { id: movementId } });
       return;
     }
 
@@ -515,7 +605,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "actualizar-servicio" || actionName === "completar-servicio") {
       const serviceId = Number(b.serviceId || 0);
       if (!serviceId) {
-        res.status(400).json({ error: "Falta el servicio" });
+        fail(res, 400, "Falta el servicio", "Indica qué servicio del paquete quieres actualizar");
         return;
       }
       const fields: string[] = [];
@@ -529,7 +619,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         params.push(ST_DONE);
       }
       if (!fields.length) {
-        res.status(400).json({ error: "Nada que actualizar" });
+        fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del servicio");
         return;
       }
       const r = await exec(
@@ -539,10 +629,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [...params, serviceId]
       );
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Servicio no encontrado" });
+        fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${serviceId}`);
         return;
       }
-      res.status(200).json({ ok: true });
+      const done = actionName === "completar-servicio";
+      const message = done
+        ? "Servicio marcado como terminado exitosamente"
+        : "Servicio actualizado exitosamente";
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "servicio-paquete",
+        entityId: serviceId,
+        description: message,
+        details: { serviceId, done, ...b },
+        req,
+      });
+      ok(res, message, { item: { serviceId, done } });
       return;
     }
 
@@ -551,7 +656,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "actualizar-servicio-url") {
       const serviceId = Number(b.serviceId || 0);
       if (!serviceId) {
-        res.status(400).json({ error: "Falta el servicio" });
+        fail(res, 400, "Falta el servicio", "Indica de qué servicio quieres guardar la liga");
         return;
       }
       const url = norm(b.url);
@@ -560,10 +665,23 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         serviceId,
       ]);
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Servicio no encontrado" });
+        fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${serviceId}`);
         return;
       }
-      res.status(200).json({ ok: true });
+      await logActivity({
+        userId: me.sub,
+        module: "services",
+        moduleName: "Servicios",
+        action: "update",
+        entity: "servicio",
+        entityId: serviceId,
+        description: "Liga del servicio actualizada exitosamente",
+        details: { serviceId, url },
+        req,
+      });
+      ok(res, "Liga del servicio actualizada exitosamente", {
+        item: { serviceId, url },
+      });
       return;
     }
 
@@ -572,11 +690,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       const amount = asAmount(b.amount);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Indica el paquete comprado" });
+        fail(res, 400, "Indica el paquete comprado", "El abono debe pertenecer a un paquete del cliente");
         return;
       }
       if (amount === null) {
-        res.status(400).json({ error: "El monto del abono debe ser mayor a 0" });
+        fail(res, 400, "El monto del abono debe ser mayor a 0", "Escribe un monto válido");
         return;
       }
       const exists = await q(
@@ -584,7 +702,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [purchasedPackageId]
       );
       if (!exists.length) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
       const description = norm(b.description);
@@ -598,7 +716,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const paid = await recomputePaid(conn, purchasedPackageId);
         return { id: Number(ins.insertId), paid };
       });
-      res.status(201).json({ ok: true, ...out });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "create",
+        entity: "abono",
+        entityId: out.id,
+        description: "Abono registrado exitosamente",
+        details: { ...out, purchasedPackageId, amount, description },
+        req,
+      });
+      created(res, "Abono registrado exitosamente", {
+        ...out,
+        item: { id: out.id, purchasedPackageId, amount },
+      });
       return;
     }
 
@@ -609,7 +741,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (actionName === "compartir-directorio") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Indica el paquete comprado" });
+        fail(res, 400, "Indica el paquete comprado", "La acción necesita el paquete del cliente");
         return;
       }
       const clean = norm(b.path)
@@ -625,17 +757,36 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [clean || null, purchasedPackageId]
         );
       } catch {
-        res.status(409).json({
-          error:
-            "Falta aplicar la migración 2026-10-15 (carpeta compartida del paquete)",
-        });
+        fail(
+          res,
+          409,
+          "No se pudo compartir la carpeta",
+          "Falta aplicar la migración 2026-10-15 (carpeta compartida del paquete)"
+        );
         return;
       }
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
-      res.status(200).json({ ok: true, drivePath: clean });
+      const message = clean
+        ? "Carpeta compartida con el cliente exitosamente"
+        : "Se dejó de compartir la carpeta exitosamente";
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "paquete-cliente",
+        entityId: purchasedPackageId,
+        description: message,
+        details: { purchasedPackageId, drivePath: clean },
+        req,
+      });
+      ok(res, message, {
+        drivePath: clean,
+        item: { purchasedPackageId, drivePath: clean },
+      });
       return;
     }
 
@@ -645,15 +796,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const kind = asKind(b.kind);
       const amount = asAmount(b.amount);
       if (!purchasedPackageId) {
-        res.status(400).json({ error: "Indica el paquete comprado" });
+        fail(res, 400, "Indica el paquete comprado", "El movimiento debe pertenecer a un paquete del cliente");
         return;
       }
       if (!kind) {
-        res.status(400).json({ error: "Tipo de movimiento inválido" });
+        fail(res, 400, "Tipo de movimiento inválido", String(b.kind ?? ""));
         return;
       }
       if (amount === null) {
-        res.status(400).json({ error: "El monto debe ser mayor a 0" });
+        fail(res, 400, "El monto debe ser mayor a 0", "Escribe un monto válido");
         return;
       }
       const exists = await q(
@@ -661,7 +812,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [purchasedPackageId]
       );
       if (!exists.length) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
       const description = norm(b.description);
@@ -671,13 +822,29 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
          VALUES (?, ?, ?, ?)`,
         [purchasedPackageId, kind, amount, description || null]
       );
-      res.status(201).json({ ok: true, id: r.insertId, kind, amount });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "create",
+        entity: "movimiento",
+        entityId: r.insertId,
+        description: "Movimiento registrado exitosamente",
+        details: { id: r.insertId, purchasedPackageId, kind, amount, description },
+        req,
+      });
+      created(res, "Movimiento registrado exitosamente", {
+        id: r.insertId,
+        kind,
+        amount,
+        item: { id: r.insertId, kind, amount, purchasedPackageId },
+      });
       return;
     }
 
-    res.status(400).json({ error: "Acción no reconocida" });
+    fail(res, 400, "Acción no reconocida", String(b.action ?? ""));
   } catch (e) {
     console.error("[admin/package-progress]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del paquete");
   }
 });

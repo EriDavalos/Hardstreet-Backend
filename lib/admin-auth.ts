@@ -4,6 +4,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getSession } from "./auth";
 import { q } from "./db";
+import { fail } from "./api-response";
 
 /** Nombre del rol que puede administrar (coincide con roles.name = 'Admin'). */
 export const ADMIN_ROLE = "Admin";
@@ -21,7 +22,7 @@ export async function requireAdmin(
 ): Promise<{ sub: number } | null> {
   const session = await getSession(req);
   if (!session) {
-    res.status(401).json({ error: "No autenticado" });
+    fail(res, 401, "No autenticado", "Inicia sesión para continuar");
     return null;
   }
   const rows = await q<{ id_role: number | null; role_name: string | null }>(
@@ -34,7 +35,7 @@ export async function requireAdmin(
   );
   const role = rows[0];
   if (!role || String(role.role_name || "").toLowerCase() !== ADMIN_ROLE.toLowerCase()) {
-    res.status(403).json({ error: "Solo administradores" });
+    fail(res, 403, "Solo administradores", "Este recurso es solo para el rol Admin");
     return null;
   }
   return { sub: session.sub };

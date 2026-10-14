@@ -3,6 +3,8 @@ import bcrypt from "bcryptjs";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
 import { q, exec, transaccion } from "../../../lib/db";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // Catálogo de PAQUETES (solo con permiso sobre el módulo "paquetes")
@@ -26,7 +28,7 @@ async function resolveServiceIds(
 ): Promise<number[] | null | undefined> {
   if (raw === undefined) return undefined; // no vino el campo
   if (!Array.isArray(raw)) {
-    res.status(400).json({ error: "serviceIds debe ser una lista de ids" });
+    fail(res, 400, "serviceIds debe ser una lista de ids", typeof raw);
     return null;
   }
   const ids = [...new Set(raw.map((v) => Number(v) || 0).filter(Boolean))];
@@ -38,7 +40,7 @@ async function resolveServiceIds(
     const valid = new Set(found.map((f) => Number(f.id)));
     const missing = ids.filter((id) => !valid.has(id));
     if (missing.length) {
-      res.status(400).json({ error: `Servicio inexistente: id ${missing[0]}` });
+      fail(res, 400, "Servicio inexistente", `No hay un servicio activo con id ${missing[0]}`);
       return null;
     }
   }
@@ -73,6 +75,63 @@ async function replaceServices(
   }
 }
 
+type PackageRowFull = {
+  id: number;
+  name: string | null;
+  subtitle: string | null;
+  description: string | null;
+  price: string | number | null;
+  currency: string | null;
+  id_tier: number | null;
+  id_package_category: number | null;
+  is_extern: number | null;
+  url_image: string | null;
+  tier_name: string | null;
+  tier_num: number | null;
+  cat_name: string | null;
+};
+
+/** Modelo del paquete (misma forma que el listado) para `item`. */
+async function packageModel(id: number) {
+  const rows = await q<PackageRowFull>(
+    `SELECT p.id, p.name, p.subtitle, p.description, p.price, p.currency,
+            p.id_tier, p.id_package_category, p.is_extern, p.url_image,
+            t.name AS tier_name, t.tier AS tier_num, pc.name AS cat_name
+       FROM packages p
+       LEFT JOIN tiers t ON t.id = p.id_tier
+       LEFT JOIN packages_categories pc ON pc.id = p.id_package_category
+      WHERE p.id = ? LIMIT 1`,
+    [id]
+  );
+  if (!rows.length) return { id };
+  const p = rows[0];
+  const svcRows = await q<{ id: number; name: string | null }>(
+    `SELECT s.id, s.name
+       FROM packages_services ps
+       JOIN services s ON s.id = ps.id_service AND s.active = 1
+      WHERE ps.active = 1 AND ps.id_package = ?
+      ORDER BY ps.id ASC`,
+    [id]
+  );
+  return {
+    id: p.id,
+    name: p.name || "",
+    subtitle: p.subtitle || "",
+    description: p.description || "",
+    price: Number(p.price || 0),
+    currency: p.currency || "MXN",
+    tierId: p.id_tier,
+    tierName: p.tier_name || "",
+    tierNum: Number(p.tier_num || 3),
+    categoryId: p.id_package_category,
+    categoryName: p.cat_name || "",
+    isExtern: p.is_extern === 1,
+    urlImage: p.url_image || "",
+    serviceIds: svcRows.map((s) => Number(s.id)),
+    serviceNames: svcRows.map((s) => s.name || ""),
+  };
+}
+
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // Permiso por acción sobre el módulo "paquetes" (Admin pasa siempre).
   const ACTIONS: Record<string, "read" | "create" | "update" | "delete"> = {
@@ -84,10 +143,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "paquetes", action))) return;
+  const me = await requirePermission(req, res, "paquetes", action);
+  if (!me) return;
 
   try {
     switch (req.method) {
@@ -152,27 +212,27 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const name = norm(b.name);
         if (!name) {
-          res.status(400).json({ error: "El nombre del paquete es obligatorio" });
+          fail(res, 400, "El nombre del paquete es obligatorio", "Escribe el nombre del paquete");
           return;
         }
         const tierId = Number(b.id_tier || 0) || null;
         const catId = Number(b.id_package_category || 0) || null;
         if (!tierId) {
-          res.status(400).json({ error: "Indica el tier del paquete" });
+          fail(res, 400, "Indica el tier del paquete", "Elige el tier (básico, medio, alto…)");
           return;
         }
         if (!catId) {
-          res.status(400).json({ error: "Indica la categoría del paquete" });
+          fail(res, 400, "Indica la categoría del paquete", "Elige la categoría del paquete");
           return;
         }
         const tier = await q(`SELECT id FROM tiers WHERE id = ? AND active = 1`, [tierId]);
         if (!tier.length) {
-          res.status(400).json({ error: "El tier indicado no existe" });
+          fail(res, 400, "El tier indicado no existe", `No hay un tier activo con id ${tierId}`);
           return;
         }
         const cat = await q(`SELECT id FROM packages_categories WHERE id = ? AND active = 1`, [catId]);
         if (!cat.length) {
-          res.status(400).json({ error: "La categoría indicada no existe" });
+          fail(res, 400, "La categoría indicada no existe", `No hay una categoría activa con id ${catId}`);
           return;
         }
         const serviceIds = await resolveServiceIds(res, b.serviceIds);
@@ -197,7 +257,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (serviceIds && serviceIds.length) {
           await transaccion((conn) => replaceServices(conn, r.insertId, serviceIds));
         }
-        res.status(201).json({ ok: true, id: r.insertId });
+        const item = await packageModel(r.insertId);
+        await logActivity({
+          userId: me.sub,
+          module: "paquetes",
+          moduleName: "Paquetes",
+          action: "create",
+          entity: "paquete",
+          entityId: r.insertId,
+          description: "Paquete creado exitosamente",
+          details: item,
+          req,
+        });
+        created(res, "Paquete creado exitosamente", { item });
         return;
       }
 
@@ -206,12 +278,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const id = Number(b.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del paquete" });
+          fail(res, 400, "Falta el id del paquete", "Indica qué paquete quieres modificar");
           return;
         }
         const exists = await q(`SELECT id FROM packages WHERE id = ? AND active = 1`, [id]);
         if (!exists.length) {
-          res.status(404).json({ error: "Paquete no encontrado" });
+          fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${id}`);
           return;
         }
         const fields: string[] = [];
@@ -220,7 +292,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           if (b[key] !== undefined) {
             const v = norm(b[key]);
             if (key === "name" && !v) {
-              res.status(400).json({ error: "El nombre no puede estar vacío" });
+              fail(res, 400, "El nombre no puede estar vacío", "Escribe el nombre del paquete");
               return;
             }
             fields.push(`\`${key}\` = ?`);
@@ -248,7 +320,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           if (tierId) {
             const tier = await q(`SELECT id FROM tiers WHERE id = ? AND active = 1`, [tierId]);
             if (!tier.length) {
-              res.status(400).json({ error: "El tier indicado no existe" });
+              fail(res, 400, "El tier indicado no existe", `No hay un tier activo con id ${tierId}`);
               return;
             }
           }
@@ -263,7 +335,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               [catId]
             );
             if (!cat.length) {
-              res.status(400).json({ error: "La categoría indicada no existe" });
+              fail(res, 400, "La categoría indicada no existe", `No hay una categoría activa con id ${catId}`);
               return;
             }
           }
@@ -279,14 +351,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (serviceIds !== undefined) {
           await transaccion((conn) => replaceServices(conn, id, serviceIds));
         }
-        res.status(200).json({ ok: true });
+        const item = await packageModel(id);
+        await logActivity({
+          userId: me.sub,
+          module: "paquetes",
+          moduleName: "Paquetes",
+          action: "update",
+          entity: "paquete",
+          entityId: id,
+          description: "Paquete actualizado exitosamente",
+          details: item,
+          req,
+        });
+        ok(res, "Paquete actualizado exitosamente", { item });
         return;
       }
 
       case "DELETE": {
         const id = Number(req.query.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del paquete" });
+          fail(res, 400, "Falta el id del paquete", "Indica qué paquete quieres eliminar");
           return;
         }
         // ¿El paquete está vendido a algún cliente? No se puede eliminar.
@@ -297,25 +381,39 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [id]
         );
         if (sold.length) {
-          res.status(409).json({
-            error: "No se puede eliminar: hay clientes con este paquete asignado",
-          });
+          fail(
+            res,
+            409,
+            "No se puede eliminar: hay clientes con este paquete asignado",
+            "Quita el paquete de esos clientes y vuelve a intentarlo"
+          );
           return;
         }
         const r = await exec(`UPDATE packages SET active = 0 WHERE id = ?`, [id]);
         if (!r.affectedRows) {
-          res.status(404).json({ error: "Paquete no encontrado" });
+          fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${id}`);
           return;
         }
-        res.status(200).json({ ok: true });
+        await logActivity({
+          userId: me.sub,
+          module: "paquetes",
+          moduleName: "Paquetes",
+          action: "delete",
+          entity: "paquete",
+          entityId: id,
+          description: "Paquete eliminado exitosamente",
+          details: { id },
+          req,
+        });
+        ok(res, "Paquete eliminado exitosamente", { item: { id } });
         return;
       }
 
       default:
-        res.status(405).json({ error: "Metodo no permitido" });
+        fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     }
   } catch (e) {
     console.error("[admin/packages]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del paquete");
   }
 });

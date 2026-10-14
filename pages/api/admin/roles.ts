@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { q, exec, transaccion } from "../../../lib/db";
 import { requirePermission } from "../../../lib/permissions";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // CRUD de roles + asignacion de permisos (solo rol Admin)
@@ -62,7 +64,7 @@ async function validateRole(
 ): Promise<{ ok: boolean; name?: string; permissions?: PermInput[] }> {
   const name = typeof b.name === "string" ? b.name.trim() : "";
   if (opts.withName && !name) {
-    res.status(400).json({ error: "El nombre del rol es obligatorio" });
+    fail(res, 400, "El nombre del rol es obligatorio", "Escribe cómo se llamará el rol");
     return { ok: false };
   }
   if (name) {
@@ -71,7 +73,7 @@ async function validateRole(
       [name.toLowerCase(), opts.excludeId || 0]
     );
     if (dup.length) {
-      res.status(409).json({ error: "Ya existe un rol con ese nombre" });
+      fail(res, 409, "Ya existe un rol con ese nombre", name);
       return { ok: false };
     }
   }
@@ -95,10 +97,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "roles", action))) return;
+  const me = await requirePermission(req, res, "roles", action);
+  if (!me) return;
 
   try {
     switch (req.method) {
@@ -131,7 +134,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (v.permissions?.length) {
           await transaccion((conn) => savePermissions(conn, r.insertId, v.permissions!));
         }
-        res.status(201).json({ ok: true, id: r.insertId });
+        const item = { id: r.insertId, name: v.name };
+        await logActivity({
+          userId: me.sub,
+          module: "rols",
+          moduleName: "Roles",
+          action: "create",
+          entity: "rol",
+          entityId: r.insertId,
+          description: "Rol creado exitosamente",
+          details: item,
+          req,
+        });
+        created(res, "Rol creado exitosamente", { item });
         return;
       }
 
@@ -140,7 +155,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const id = Number(b.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del rol" });
+          fail(res, 400, "Falta el id del rol", "Indica qué rol quieres modificar");
           return;
         }
         const v = await validateRole(res, b, { withName: false, excludeId: id });
@@ -151,34 +166,65 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (v.permissions !== undefined) {
           await transaccion((conn) => savePermissions(conn, id, v.permissions!));
         }
-        res.status(200).json({ ok: true });
+        const item = { id, name: v.name };
+        await logActivity({
+          userId: me.sub,
+          module: "rols",
+          moduleName: "Roles",
+          action: "update",
+          entity: "rol",
+          entityId: id,
+          description: "Rol actualizado exitosamente",
+          details: {
+            ...item,
+            permissionsChanged: v.permissions !== undefined,
+          },
+          req,
+        });
+        ok(res, "Rol actualizado exitosamente", { item });
         return;
       }
 
       case "DELETE": {
         const id = Number(req.query.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del rol" });
+          fail(res, 400, "Falta el id del rol", "Indica qué rol quieres eliminar");
           return;
         }
         const inUse = await q(`SELECT id FROM users WHERE id_role = ? AND active = 1 LIMIT 1`, [id]);
         if (inUse.length) {
-          res.status(409).json({ error: "No se puede eliminar: hay usuarios con este rol" });
+          fail(
+            res,
+            409,
+            "No se puede eliminar: hay usuarios con este rol",
+            "Reasigna a esos usuarios a otro rol primero"
+          );
           return;
         }
         await transaccion(async (conn) => {
           await conn.query(`UPDATE permissions_roles SET active = 0 WHERE id_role = ?`, [id]);
           await conn.query(`UPDATE roles SET active = 0 WHERE id = ?`, [id]);
         });
-        res.status(200).json({ ok: true });
+        await logActivity({
+          userId: me.sub,
+          module: "rols",
+          moduleName: "Roles",
+          action: "delete",
+          entity: "rol",
+          entityId: id,
+          description: "Rol eliminado exitosamente",
+          details: { id },
+          req,
+        });
+        ok(res, "Rol eliminado exitosamente", { item: { id } });
         return;
       }
 
       default:
-        res.status(405).json({ error: "Metodo no permitido" });
+        fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     }
   } catch (e) {
     console.error("[admin/roles]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del rol");
   }
 });

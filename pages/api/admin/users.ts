@@ -4,6 +4,8 @@ import { withCors } from "../../../lib/cors";
 import { q, exec } from "../../../lib/db";
 import { requirePermission } from "../../../lib/permissions";
 import { mapUser, UserRow } from "../../../lib/mappers";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // CRUD de usuarios (solo rol Admin)  ->  /api/admin/users
@@ -14,6 +16,23 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 // ==================================================================
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+
+/** Modelo del usuario tal como lo expone el listado (para `item`). */
+async function userModel(id: number) {
+  const rows = await q<UserRow & { role_name: string | null }>(
+    `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
+       FROM users u
+       LEFT JOIN roles r ON r.id = u.id_role
+      WHERE u.id = ? LIMIT 1`,
+    [id]
+  );
+  if (!rows.length) return { id };
+  const u = rows[0];
+  return {
+    ...mapUser(u, { id: u.id_role || 0, name: u.role_name }),
+    roleId: u.id_role || null,
+  };
+}
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // Permiso por acción: ver / crear / editar / eliminar el módulo "usuarios".
@@ -27,7 +46,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
   const me = await requirePermission(req, res, "usuarios", action);
@@ -69,12 +88,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const number = norm(b.number);
 
         if (!name || !email || !password) {
-          res.status(400).json({ error: "Nombre, email y contrasena son obligatorios" });
+          fail(
+            res,
+            400,
+            "Nombre, email y contraseña son obligatorios",
+            "Completa los tres campos para crear al usuario"
+          );
           return;
         }
         const dup = await q(`SELECT id FROM users WHERE LOWER(email) = ? AND active = 1`, [email]);
         if (dup.length) {
-          res.status(409).json({ error: "Ya existe un usuario con ese email" });
+          fail(res, 409, "Ya existe un usuario con ese email", email);
           return;
         }
         const hash = await bcrypt.hash(password, 10);
@@ -83,7 +107,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
            VALUES (?, ?, ?, ?, ?, ?)`,
           [name, lastname, number, email, hash, id_role]
         );
-        res.status(201).json({ ok: true, id: r.insertId });
+        const item = { id: r.insertId, name, lastname, number, email, roleId: id_role };
+        await logActivity({
+          userId: me.sub,
+          module: "usuarios",
+          moduleName: "Usuarios",
+          action: "create",
+          entity: "usuario",
+          entityId: r.insertId,
+          description: "Usuario creado exitosamente",
+          details: item,
+          req,
+        });
+        created(res, "Usuario creado exitosamente", { item });
         return;
       }
 
@@ -92,7 +128,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const id = Number(b.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del usuario" });
+          fail(res, 400, "Falta el id del usuario", "Indica qué usuario quieres modificar");
           return;
         }
         const fields: string[] = [];
@@ -106,7 +142,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (b.email !== undefined) {
           const email = norm(b.email).toLowerCase();
           if (!email) {
-            res.status(400).json({ error: "El email no puede estar vacio" });
+            fail(res, 400, "El email no puede estar vacío", "Escribe un correo válido");
             return;
           }
           const dup = await q(
@@ -114,7 +150,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             [email, id]
           );
           if (dup.length) {
-            res.status(409).json({ error: "Ya existe un usuario con ese email" });
+            fail(res, 409, "Ya existe un usuario con ese email", email);
             return;
           }
           fields.push(`email = ?`);
@@ -129,7 +165,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           if (id_role) {
             const role = await q(`SELECT id FROM roles WHERE id = ? AND active = 1`, [id_role]);
             if (!role.length) {
-              res.status(400).json({ error: "El rol indicado no existe" });
+              fail(res, 400, "El rol indicado no existe", `No hay un rol activo con id ${id_role}`);
               return;
             }
           }
@@ -137,42 +173,65 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           params.push(id_role);
         }
         if (!fields.length) {
-          res.status(400).json({ error: "Nada que actualizar" });
+          fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del usuario");
           return;
         }
         const r = await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, [...params, id]);
         if (!r.affectedRows) {
-          res.status(404).json({ error: "Usuario no encontrado" });
+          fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${id}`);
           return;
         }
-        res.status(200).json({ ok: true });
+        const item = await userModel(id);
+        await logActivity({
+          userId: me.sub,
+          module: "usuarios",
+          moduleName: "Usuarios",
+          action: "update",
+          entity: "usuario",
+          entityId: id,
+          description: "Usuario actualizado exitosamente",
+          details: item,
+          req,
+        });
+        ok(res, "Usuario actualizado exitosamente", { item });
         return;
       }
 
       case "DELETE": {
         const id = Number(req.query.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del usuario" });
+          fail(res, 400, "Falta el id del usuario", "Indica qué usuario quieres eliminar");
           return;
         }
         if (id === me.sub) {
-          res.status(400).json({ error: "No puedes eliminar tu propia cuenta" });
+          fail(res, 400, "No puedes eliminar tu propia cuenta", "Estás intentando borrar tu sesión actual");
           return;
         }
         const r = await exec(`UPDATE users SET active = 0 WHERE id = ?`, [id]);
         if (!r.affectedRows) {
-          res.status(404).json({ error: "Usuario no encontrado" });
+          fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${id}`);
           return;
         }
-        res.status(200).json({ ok: true });
+        await logActivity({
+          userId: me.sub,
+          module: "usuarios",
+          moduleName: "Usuarios",
+          action: "delete",
+          entity: "usuario",
+          entityId: id,
+          description: "Usuario eliminado exitosamente",
+          details: { id },
+          req,
+        });
+        ok(res, "Usuario eliminado exitosamente", { item: { id } });
         return;
       }
 
       default:
-        res.status(405).json({ error: "Metodo no permitido" });
+        fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     }
   } catch (e) {
     console.error("[admin/users]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del usuario");
   }
 });

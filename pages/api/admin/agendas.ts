@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // Agendas de eventos por paquete comprado  ->  /api/admin/agendas
@@ -51,10 +53,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "schedules", action))) return;
+  const me = await requirePermission(req, res, "schedules", action);
+  if (!me) return;
 
   try {
     switch (req.method) {
@@ -141,12 +144,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const purchasedPackageId = Number(b.purchasedPackageId || 0);
         if (!purchasedPackageId) {
-          res.status(400).json({ error: "Indica el paquete comprado" });
+          fail(res, 400, "Indica el paquete comprado", "La agenda debe pertenecer a un paquete del cliente");
           return;
         }
         const eventDate = normalizeDateTime(b.eventDate ?? b.datetime);
         if (!eventDate) {
-          res.status(400).json({ error: "Fecha y hora invalida" });
+          fail(res, 400, "Fecha y hora inválida", "Usa el formato YYYY-MM-DD HH:MM");
           return;
         }
         const pkg = await q(
@@ -154,13 +157,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [purchasedPackageId]
         );
         if (!pkg.length) {
-          res.status(404).json({ error: "Paquete comprado no encontrado" });
+          fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
           return;
         }
         const serviceId =
           Number(b.serviceId ?? b.id_service ?? 0) || null;
         if (serviceId && !(await serviceExists(serviceId))) {
-          res.status(400).json({ error: "Servicio inexistente" });
+          fail(res, 400, "Servicio inexistente", `No hay un servicio activo con id ${serviceId}`);
           return;
         }
         const description = norm(b.description);
@@ -169,7 +172,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
            VALUES (?, ?, ?, ?)`,
           [purchasedPackageId, serviceId, eventDate, description || null]
         );
-        res.status(201).json({ ok: true, id: r.insertId });
+        const item = {
+          id: r.insertId,
+          purchasedPackageId,
+          serviceId,
+          eventDate,
+          description,
+        };
+        await logActivity({
+          userId: me.sub,
+          module: "schedules",
+          moduleName: "Agendas",
+          action: "create",
+          entity: "agenda",
+          entityId: r.insertId,
+          description: "Agenda creada exitosamente",
+          details: item,
+          req,
+        });
+        created(res, "Agenda creada exitosamente", { item });
         return;
       }
 
@@ -178,7 +199,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const id = Number(b.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id de la agenda" });
+          fail(res, 400, "Falta el id de la agenda", "Indica qué agenda quieres modificar");
           return;
         }
         const exists = await q(
@@ -186,7 +207,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [id]
         );
         if (!exists.length) {
-          res.status(404).json({ error: "Agenda no encontrada" });
+          fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);
           return;
         }
 
@@ -196,7 +217,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (b.serviceId !== undefined || b.id_service !== undefined) {
           const serviceId = Number(b.serviceId ?? b.id_service ?? 0) || null;
           if (serviceId && !(await serviceExists(serviceId))) {
-            res.status(400).json({ error: "Servicio inexistente" });
+            fail(res, 400, "Servicio inexistente", `No hay un servicio activo con id ${serviceId}`);
             return;
           }
           fields.push("`id_service` = ?");
@@ -205,7 +226,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (b.eventDate !== undefined || b.datetime !== undefined) {
           const eventDate = normalizeDateTime(b.eventDate ?? b.datetime);
           if (!eventDate) {
-            res.status(400).json({ error: "Fecha y hora invalida" });
+            fail(res, 400, "Fecha y hora inválida", "Usa el formato YYYY-MM-DD HH:MM");
             return;
           }
           fields.push("`event_date` = ?");
@@ -217,7 +238,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           params.push(description || null);
         }
         if (!fields.length) {
-          res.status(400).json({ error: "Nada que actualizar" });
+          fail(res, 400, "Nada que actualizar", "No enviaste ningún campo de la agenda");
           return;
         }
 
@@ -225,30 +246,58 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `UPDATE schedules SET ${fields.join(", ")} WHERE id = ?`,
           [...params, id]
         );
-        res.status(200).json({ ok: true });
+        await logActivity({
+          userId: me.sub,
+          module: "schedules",
+          moduleName: "Agendas",
+          action: "update",
+          entity: "agenda",
+          entityId: id,
+          description: "Agenda actualizada exitosamente",
+          details: { id, ...b },
+          req,
+        });
+        ok(res, "Agenda actualizada exitosamente", {
+          item: {
+            id,
+            eventDate: b.eventDate ?? b.datetime,
+            description: b.description,
+          },
+        });
         return;
       }
 
       case "DELETE": {
         const id = Number(req.query.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id de la agenda" });
+          fail(res, 400, "Falta el id de la agenda", "Indica qué agenda quieres eliminar");
           return;
         }
         const r = await exec(`UPDATE schedules SET active = 0 WHERE id = ?`, [id]);
         if (!r.affectedRows) {
-          res.status(404).json({ error: "Agenda no encontrada" });
+          fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);
           return;
         }
-        res.status(200).json({ ok: true });
+        await logActivity({
+          userId: me.sub,
+          module: "schedules",
+          moduleName: "Agendas",
+          action: "delete",
+          entity: "agenda",
+          entityId: id,
+          description: "Agenda eliminada exitosamente",
+          details: { id },
+          req,
+        });
+        ok(res, "Agenda eliminada exitosamente", { item: { id } });
         return;
       }
 
       default:
-        res.status(405).json({ error: "Metodo no permitido" });
+        fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     }
   } catch (e) {
     console.error("[admin/agendas]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación de la agenda");
   }
 });

@@ -3,6 +3,7 @@
 // Permite llamar la API desde el frontend estatico (otro puerto/dominio)
 // ==================================================================
 import type { NextApiRequest, NextApiResponse } from "next";
+import { fail } from "./api-response";
 
 export function withCors(handler: (req: NextApiRequest, res: NextApiResponse) => void | Promise<void>) {
   return async (req: NextApiRequest, res: NextApiResponse) => {
@@ -21,7 +22,7 @@ export function withCors(handler: (req: NextApiRequest, res: NextApiResponse) =>
       // Sin DB o error inesperado -> JSON en vez de HTML 500
       console.error("[API]", e);
       if (!res.headersSent) {
-        res.status(500).json({ error: "Error interno del servidor" });
+        fail(res, 500, "Hubo un error", "Error interno del servidor");
       }
     }
   };

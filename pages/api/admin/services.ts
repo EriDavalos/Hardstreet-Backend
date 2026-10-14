@@ -2,6 +2,8 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // Catálogo de SERVICIOS (módulo "Servicios") -> /api/admin/services
@@ -47,10 +49,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "Servicios", action))) return;
+  const me = await requirePermission(req, res, "Servicios", action);
+  if (!me) return;
 
   try {
     if (req.method === "GET") {
@@ -78,15 +81,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (req.method === "DELETE") {
       const id = Number(req.query.id || 0);
       if (!id) {
-        res.status(400).json({ error: "Falta el servicio" });
+        fail(res, 400, "Falta el servicio", "Indica qué servicio quieres eliminar");
         return;
       }
       const r = await exec(`UPDATE services SET active = 0 WHERE id = ?`, [id]);
       if (!r.affectedRows) {
-        res.status(404).json({ error: "Servicio no encontrado" });
+        fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${id}`);
         return;
       }
-      res.status(200).json({ ok: true });
+      await logActivity({
+        userId: me.sub,
+        module: "services",
+        moduleName: "Servicios",
+        action: "delete",
+        entity: "servicio",
+        entityId: id,
+        description: "Servicio eliminado exitosamente",
+        details: { id },
+        req,
+      });
+      ok(res, "Servicio eliminado exitosamente", { item: { id } });
       return;
     }
 
@@ -98,7 +112,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
     if (req.method === "POST") {
       if (!name) {
-        res.status(400).json({ error: "Escribe el nombre del servicio" });
+        fail(res, 400, "Escribe el nombre del servicio", "El nombre no puede ir vacío");
         return;
       }
       const r = await exec(
@@ -106,21 +120,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
          VALUES (?, ?, ?, ?)`,
         [name, description || null, icon || null, url || null]
       );
-      res.status(201).json({ ok: true, id: Number(r.insertId) });
+      const item = { id: Number(r.insertId), name, description, icon, url };
+      await logActivity({
+        userId: me.sub,
+        module: "services",
+        moduleName: "Servicios",
+        action: "create",
+        entity: "servicio",
+        entityId: Number(r.insertId),
+        description: "Servicio creado exitosamente",
+        details: item,
+        req,
+      });
+      created(res, "Servicio creado exitosamente", { item });
       return;
     }
 
     // ---- PUT / PATCH: actualiza solo los campos enviados ----
     const id = Number(b.id || 0);
     if (!id) {
-      res.status(400).json({ error: "Falta el servicio" });
+      fail(res, 400, "Falta el servicio", "Indica qué servicio quieres modificar");
       return;
     }
     const fields: string[] = [];
     const params: unknown[] = [];
     if (b.name !== undefined) {
       if (!name) {
-        res.status(400).json({ error: "El nombre no puede ir vacío" });
+        fail(res, 400, "El nombre no puede ir vacío", "Escribe el nombre del servicio");
         return;
       }
       fields.push("`name` = ?");
@@ -139,7 +165,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       params.push(url || null);
     }
     if (!fields.length) {
-      res.status(400).json({ error: "Nada que actualizar" });
+      fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del servicio");
       return;
     }
     const r = await exec(
@@ -147,13 +173,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       [...params, id]
     );
     if (!r.affectedRows) {
-      res.status(404).json({ error: "Servicio no encontrado" });
+      fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${id}`);
       return;
     }
-    res.status(200).json({ ok: true });
+    const item = { id, name, description, icon, url };
+    await logActivity({
+      userId: me.sub,
+      module: "services",
+      moduleName: "Servicios",
+      action: "update",
+      entity: "servicio",
+      entityId: id,
+      description: "Servicio actualizado exitosamente",
+      details: item,
+      req,
+    });
+    ok(res, "Servicio actualizado exitosamente", { item });
     return;
   } catch (e) {
     console.error("[admin/services]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del servicio");
   }
 });

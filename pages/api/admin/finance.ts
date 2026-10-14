@@ -1,6 +1,8 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 import { q, exec } from "../../../lib/db";
 
 // ==================================================================
@@ -81,10 +83,11 @@ function windowStart(count: number): string {
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const action = req.method === "GET" ? "read" : "update";
   if (req.method !== "GET" && req.method !== "POST") {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "Finanzas", action))) return;
+  const me = await requirePermission(req, res, "Finanzas", action);
+  if (!me) return;
 
   try {
     // ================================ GET ================================
@@ -370,7 +373,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const purchasedPackageId = Number(b.purchasedPackageId || 0);
     const amount = Number(b.amount);
     if (!Number.isFinite(amount) || amount <= 0) {
-      res.status(400).json({ error: "El monto debe ser mayor a 0" });
+      fail(res, 400, "El monto debe ser mayor a 0", "Escribe un monto válido");
       return;
     }
     const kindRaw = norm(b.kind).toLowerCase().replace(/-/g, "_");
@@ -384,7 +387,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [purchasedPackageId]
       );
       if (!exists.length) {
-        res.status(404).json({ error: "Paquete comprado no encontrado" });
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
     }
@@ -401,23 +404,38 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // La columna sigue siendo NOT NULL: falta la migración que permite los
       // movimientos GENERALES (del negocio, sin paquete).
       if (!purchasedPackageId) {
-        res.status(409).json({
-          error:
-            "Falta aplicar la migración 2026-10-15 (movimientos generales sin paquete)",
-        });
+        fail(
+          res,
+          409,
+          "No se pudo registrar el movimiento",
+          "Falta aplicar la migración 2026-10-15 (movimientos generales sin paquete)"
+        );
         return;
       }
       throw e;
     }
-    res.status(201).json({
-      ok: true,
+    const item = {
       id: r.insertId,
       kind,
       amount: round2(amount),
+      description,
+      purchasedPackageId: purchasedPackageId || null,
       general: !purchasedPackageId,
+    };
+    await logActivity({
+      userId: me.sub,
+      module: "finance",
+      moduleName: "Finanzas",
+      action: "create",
+      entity: "movimiento",
+      entityId: r.insertId,
+      description: "Movimiento registrado exitosamente",
+      details: item,
+      req,
     });
+    created(res, "Movimiento registrado exitosamente", { ...item, item });
   } catch (e) {
     console.error("[admin/finance]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo registrar el movimiento de finanzas");
   }
 });

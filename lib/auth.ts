@@ -3,6 +3,7 @@
 // ==================================================================
 import type { NextApiRequest, NextApiResponse } from "next";
 import { SignJWT, jwtVerify } from "jose";
+import { fail } from "./api-response";
 
 
 const MAX_AGE = 60 * 60 * 24 * 7; // 7 dias
@@ -59,7 +60,7 @@ export async function requireUser(
 ): Promise<SessionPayload | null> {
   const session = await getSession(req);
   if (!session) {
-    res.status(401).json({ error: "No autenticado" });
+    fail(res, 401, "No autenticado", "Inicia sesión para continuar");
     return null;
   }
   return session;

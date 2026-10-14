@@ -5,6 +5,8 @@ import { CLIENT_ROLE } from "../../../lib/admin-auth";
 import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
 import { mapUser, UserRow } from "../../../lib/mappers";
+import { ok, created, fail } from "../../../lib/api-response";
+import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // Clientes (solo rol Admin)  ->  /api/admin/clients
@@ -28,6 +30,20 @@ async function clientRoleId(): Promise<number | null> {
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 
+/** Modelo del cliente tal como lo expone el listado (para `item`). */
+async function clientModel(id: number) {
+  const rows = await q<UserRow & { role_name: string | null }>(
+    `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
+       FROM users u
+       LEFT JOIN roles r ON r.id = u.id_role
+      WHERE u.id = ? LIMIT 1`,
+    [id]
+  );
+  if (!rows.length) return { id };
+  const u = rows[0];
+  return mapUser(u, { id: u.id_role || 0, name: u.role_name });
+}
+
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // Permiso por acción sobre el módulo "clientes" (Admin pasa siempre).
   const ACTIONS: Record<string, "read" | "create" | "update" | "delete"> = {
@@ -39,14 +55,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   };
   const action = ACTIONS[req.method || ""];
   if (!action) {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "clientes", action))) return;
+  const me = await requirePermission(req, res, "clientes", action);
+  if (!me) return;
 
   const roleId = await clientRoleId();
   if (!roleId) {
-    res.status(500).json({ error: "No existe el rol 'Cliente' en la base de datos" });
+    fail(
+      res,
+      500,
+      "Hubo un error",
+      "No existe el rol 'Cliente' en la base de datos"
+    );
     return;
   }
 
@@ -81,12 +103,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const password = typeof b.password === "string" ? b.password : "";
         const number = norm(b.number);
         if (!name || !email || !password) {
-          res.status(400).json({ error: "Nombre, email y contrasena son obligatorios" });
+          fail(
+            res,
+            400,
+            "Nombre, email y contraseña son obligatorios",
+            "Completa los tres campos para crear al cliente"
+          );
           return;
         }
         const dup = await q(`SELECT id FROM users WHERE LOWER(email) = ? AND active = 1`, [email]);
         if (dup.length) {
-          res.status(409).json({ error: "Ya existe un usuario con ese email" });
+          fail(res, 409, "Ya existe un usuario con ese email", email);
           return;
         }
         const hash = await bcrypt.hash(password, 10);
@@ -95,7 +122,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
            VALUES (?, ?, ?, ?, ?, ?)`,
           [name, lastname, number, email, hash, roleId]
         );
-        res.status(201).json({ ok: true, id: r.insertId });
+        const item = { id: r.insertId, name, lastname, number, email };
+        await logActivity({
+          userId: me.sub,
+          module: "clientes",
+          moduleName: "Clientes",
+          action: "create",
+          entity: "cliente",
+          entityId: r.insertId,
+          description: "Cliente creado exitosamente",
+          details: item,
+          req,
+        });
+        created(res, "Cliente creado exitosamente", { item });
         return;
       }
 
@@ -104,13 +143,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const b = (req.body || {}) as Record<string, unknown>;
         const id = Number(b.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del cliente" });
+          fail(res, 400, "Falta el id del cliente", "Indica qué cliente quieres modificar");
           return;
         }
         // Solo clientes: evita editar admins desde este modulo
         const isClient = await q(`SELECT id FROM users WHERE id = ? AND id_role = ? AND active = 1`, [id, roleId]);
         if (!isClient.length) {
-          res.status(404).json({ error: "Cliente no encontrado" });
+          fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${id}`);
           return;
         }
         const fields: string[] = [];
@@ -124,7 +163,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (b.email !== undefined) {
           const email = norm(b.email).toLowerCase();
           if (!email) {
-            res.status(400).json({ error: "El email no puede estar vacio" });
+            fail(res, 400, "El email no puede estar vacío", "Escribe un correo válido");
             return;
           }
           const dup = await q(
@@ -132,7 +171,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             [email, id]
           );
           if (dup.length) {
-            res.status(409).json({ error: "Ya existe un usuario con ese email" });
+            fail(res, 409, "Ya existe un usuario con ese email", email);
             return;
           }
           fields.push(`email = ?`);
@@ -143,18 +182,30 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           params.push(await bcrypt.hash(b.password, 10));
         }
         if (!fields.length) {
-          res.status(400).json({ error: "Nada que actualizar" });
+          fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del cliente");
           return;
         }
         await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, [...params, id]);
-        res.status(200).json({ ok: true });
+        const item = await clientModel(id);
+        await logActivity({
+          userId: me.sub,
+          module: "clientes",
+          moduleName: "Clientes",
+          action: "update",
+          entity: "cliente",
+          entityId: id,
+          description: "Cliente actualizado exitosamente",
+          details: item,
+          req,
+        });
+        ok(res, "Cliente actualizado exitosamente", { item });
         return;
       }
 
       case "DELETE": {
         const id = Number(req.query.id || 0);
         if (!id) {
-          res.status(400).json({ error: "Falta el id del cliente" });
+          fail(res, 400, "Falta el id del cliente", "Indica qué cliente quieres eliminar");
           return;
         }
         const r = await exec(
@@ -162,18 +213,29 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [id, roleId]
         );
         if (!r.affectedRows) {
-          res.status(404).json({ error: "Cliente no encontrado" });
+          fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${id}`);
           return;
         }
-        res.status(200).json({ ok: true });
+        await logActivity({
+          userId: me.sub,
+          module: "clientes",
+          moduleName: "Clientes",
+          action: "delete",
+          entity: "cliente",
+          entityId: id,
+          description: "Cliente eliminado exitosamente",
+          details: { id },
+          req,
+        });
+        ok(res, "Cliente eliminado exitosamente", { item: { id } });
         return;
       }
 
       default:
-        res.status(405).json({ error: "Metodo no permitido" });
+        fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     }
   } catch (e) {
     console.error("[admin/clients]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudo completar la operación del cliente");
   }
 });

@@ -3,6 +3,7 @@ import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 import { userRoleId, userIsAdmin } from "../../../lib/permissions";
+import { fail } from "../../../lib/api-response";
 
 // ==================================================================
 // Permisos del usuario autenticado  ->  /api/admin/permission
@@ -24,7 +25,7 @@ import { userRoleId, userIsAdmin } from "../../../lib/permissions";
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   if (req.method !== "GET") {
-    res.status(405).json({ error: "Metodo no permitido" });
+    fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
 
@@ -34,7 +35,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     const roleId = await userRoleId(session.sub);
     if (!roleId) {
-      res.status(401).json({ error: "Sesión inválida" });
+      fail(res, 401, "Sesión inválida", "Tu usuario ya no existe o está inactivo");
       return;
     }
 
@@ -120,6 +121,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     res.status(200).json({ isAdmin, modules });
   } catch (e) {
     console.error("[admin/permission]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudieron cargar tus permisos");
   }
 });

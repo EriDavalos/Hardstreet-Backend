@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
+import { fail } from "../../../lib/api-response";
 
 // ==================================================================
 // Metadatos del panel  ->  /api/admin/meta
@@ -35,7 +36,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   try {
     if (req.method !== "GET") {
-      res.status(405).json({ error: "Metodo no permitido" });
+      fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
       return;
     }
 
@@ -128,6 +129,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     });
   } catch (e) {
     console.error("[admin/meta]", e);
-    res.status(500).json({ error: "Error interno del servidor" });
+    fail(res, 500, "Hubo un error", "No se pudieron cargar los metadatos del panel");
   }
 });

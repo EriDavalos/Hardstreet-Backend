@@ -13,6 +13,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getSession } from "./auth";
 import { q } from "./db";
+import { fail } from "./api-response";
 
 export const ADMIN_ROLE = "Admin";
 
@@ -83,13 +84,13 @@ export async function requirePermission(
 
   const session = await getSession(req);
   if (!session) {
-    res.status(401).json({ error: "No autenticado" });
+    fail(res, 401, "No autenticado", "Inicia sesión para continuar");
     return null;
   }
 
   const roleId = await userRoleId(session.sub);
   if (!roleId) {
-    res.status(401).json({ error: "Sesión inválida" });
+    fail(res, 401, "Sesión inválida", "Tu usuario ya no existe o está inactivo");
     return null;
   }
 
@@ -98,11 +99,12 @@ export async function requirePermission(
   }
 
   if (!(await roleCan(roleId, module, action))) {
-    res.status(403).json({
-      error: "No tienes permiso para realizar esta acción",
-      module,
-      action,
-    });
+    fail(
+      res,
+      403,
+      "No tienes permiso para realizar esta acción",
+      `A tu rol le falta el permiso "${action}" en el módulo "${module}"`
+    );
     return null;
   }
 
@@ -125,13 +127,13 @@ export async function requireAnyPermission(
 
   const session = await getSession(req);
   if (!session) {
-    res.status(401).json({ error: "No autenticado" });
+    fail(res, 401, "No autenticado", "Inicia sesión para continuar");
     return null;
   }
 
   const roleId = await userRoleId(session.sub);
   if (!roleId) {
-    res.status(401).json({ error: "Sesión inválida" });
+    fail(res, 401, "Sesión inválida", "Tu usuario ya no existe o está inactivo");
     return null;
   }
 
@@ -149,7 +151,12 @@ export async function requireAnyPermission(
     [roleId, module, module]
   );
   if (!rows.length) {
-    res.status(403).json({ error: "No tienes acceso a este módulo", module });
+    fail(
+      res,
+      403,
+      "No puedes acceder a este módulo",
+      `Tu rol no tiene ningún permiso sobre el módulo "${module}"`
+    );
     return null;
   }
   return { sub: session.sub, role: session.role };
