@@ -2,6 +2,7 @@
 // HARD STREET BACKEND - Consultas de datos
 // ==================================================================
 import { q } from "./db";
+import { serviceSharesByIds } from "./service-shares";
 import {
   mapPackage, mapPurchasedPackage, mapPurchasedPackageService,
   mapPackageCategory, mapTier, mapStatus, mapService, mapGallery,
@@ -160,6 +161,10 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
     ? await q<StatusRow>(`SELECT id, name FROM status WHERE id IN (?)`, [stIds])
     : [];
 
+  // Opciones de compartir POR SERVICIO (carpeta, liga y cuántos elementos
+  // marcó el cliente en su Drive). Sin migración quedan vacías.
+  const shares = await serviceSharesByIds(svcRows.map((s) => Number(s.id)));
+
   return ppRows.map((r) => {
     const pkgRow = pkgRows.find((p) => p.id === r.id_package) || null;
     const pkg: Package = pkgRow
@@ -173,15 +178,21 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
 
     const services = svcRows
       .filter((s) => s.id_purchased_package === r.id)
-      .map((s) =>
-        mapPurchasedPackageService(
-          s,
-          s.svc_name
-            ? { id: s.id_service || 0, name: s.svc_name, description: s.svc_description || "", icon: s.svc_icon || "", url: s.svc_url || "" }
-            : null,
-          s.status_name ? { id: s.id_status || 0, name: s.status_name } : null
-        )
-      );
+      .map((s) => {
+        const share = shares.get(Number(s.id));
+        return {
+          ...mapPurchasedPackageService(
+            s,
+            s.svc_name
+              ? { id: s.id_service || 0, name: s.svc_name, description: s.svc_description || "", icon: s.svc_icon || "", url: s.svc_url || "" }
+              : null,
+            s.status_name ? { id: s.id_status || 0, name: s.status_name } : null
+          ),
+          shareFolder: share?.folder ?? "",
+          shareLink: share?.link ?? "",
+          items: share?.items ?? 0,
+        };
+      });
 
     const st = stRows.find((s) => s.id === r.id_status) || null;
     return mapPurchasedPackage(r, pkg, services, st);

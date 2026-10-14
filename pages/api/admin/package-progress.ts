@@ -10,6 +10,10 @@ import {
   packageDrivePaths,
   sharedDriveConflict,
 } from "../../../lib/drive-paths";
+import {
+  saveServiceShare,
+  serviceSharesByIds,
+} from "../../../lib/service-shares";
 
 // ==================================================================
 // ADMINISTRACIÓN DEL PAQUETE DEL CLIENTE -> /api/admin/package-progress
@@ -30,6 +34,8 @@ import {
 //     reabrir-servicio    { serviceId }
 //     actualizar-servicio { serviceId, description }
 //     actualizar-servicio-url { serviceId, url }  (liga del Drive del servicio)
+//     actualizar-servicio-share { serviceId, folder, link } (carpeta y liga
+//       compartidas de UN servicio del paquete)
 //     agregar-directorio  { purchasedPackageId, path }
 //       Suma UNA carpeta del Drive a las compartidas con el cliente (el
 //       paquete puede compartir varias).
@@ -249,6 +255,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
       }
 
+      // Opciones de compartir por SERVICIO (carpeta, liga y elementos que
+      // marcó el cliente). Sin migración quedan vacías.
+      const shares = await serviceSharesByIds(services.map((s) => Number(s.id)));
+
       // Movimientos = abonos (payments) + movimientos propios. Si la
       // migración aún no se aplicó, el modal sigue funcionando sin ellos.
       let movements: Row[] = [];
@@ -322,18 +332,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           drivePath: sharedPaths[0] || "",
           drivePaths: sharedPaths,
         },
-        services: services.map((s) => ({
-          id: Number(s.id),
-          serviceId: Number(s.id_service || 0),
-          name: String(s.service_name || "Servicio"),
-          icon: String(s.service_icon || ""),
-          url: String(s.service_url || ""),
-          description: String(s.description || ""),
-          status: String(s.status_name || "Pendiente"),
-          statusId: Number(s.id_status || 0),
-          done: Number(s.id_status) === ST_DONE,
-          finishedAt: s.finished_at || null,
-        })),
+        services: services.map((s) => {
+          const share = shares.get(Number(s.id));
+          return {
+            id: Number(s.id),
+            serviceId: Number(s.id_service || 0),
+            name: String(s.service_name || "Servicio"),
+            icon: String(s.service_icon || ""),
+            url: String(s.service_url || ""),
+            // Opciones de compartir del SERVICIO (carpeta y liga propias del
+            // servicio del paquete) y cuántos elementos marcó el cliente.
+            shareFolder: share?.folder ?? "",
+            shareLink: share?.link ?? "",
+            items: share?.items ?? 0,
+            description: String(s.description || ""),
+            status: String(s.status_name || "Pendiente"),
+            statusId: Number(s.id_status || 0),
+            done: Number(s.id_status) === ST_DONE,
+            finishedAt: s.finished_at || null,
+          };
+        }),
         movements: movements.map((m) => ({
           id: Number(m.id),
           kind: String(m.kind || "gasto"),
@@ -763,6 +781,56 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       });
       ok(res, "Liga del servicio actualizada exitosamente", {
         item: { serviceId, url },
+      });
+      return;
+    }
+
+    // ---- Opciones de compartir de un servicio del PAQUETE ----
+    // `folder` = carpeta del Drive compartida para ESE servicio y `link` = la
+    // liga (si las hay). Junto con la selección que marca el cliente forman
+    // las opciones de compartir del servicio (migración
+    // purchased_packages_services_shares).
+    if (actionName === "actualizar-servicio-share") {
+      const serviceId = Number(b.serviceId || 0);
+      if (!serviceId) {
+        fail(res, 400, "Falta el servicio", "Indica qué servicio del paquete quieres compartir");
+        return;
+      }
+      const folder = norm(b.folder);
+      const link = norm(b.link);
+      const exists = await q(
+        `SELECT id FROM purchased_packages_services
+          WHERE id = ? AND active = 1`,
+        [serviceId]
+      );
+      if (!exists.length) {
+        fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${serviceId}`);
+        return;
+      }
+      try {
+        await saveServiceShare(serviceId, folder, link);
+      } catch {
+        fail(
+          res,
+          500,
+          "Falta aplicar la migración de servicios",
+          "La tabla purchased_packages_services_shares no existe todavía"
+        );
+        return;
+      }
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "servicio-paquete-share",
+        entityId: serviceId,
+        description: "Opciones de compartir del servicio actualizadas exitosamente",
+        details: { serviceId, folder, link },
+        req,
+      });
+      ok(res, "Opciones de compartir actualizadas exitosamente", {
+        item: { serviceId, folder, link },
       });
       return;
     }
