@@ -81,6 +81,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           );
         }
       }
+      // Carpeta del Drive compartida por cada compra: el panel la necesita
+      // para NO ofrecer una carpeta que se solape con otra ya compartida
+      // a este mismo cliente. Columna pendiente de migración → sin datos,
+      // sin romper el listado.
+      const drivePaths = new Map<number, string>();
+      if (purchasedIds.length) {
+        try {
+          const rows = await q(
+            `SELECT id, drive_path FROM purchased_packages WHERE id IN (?)`,
+            [purchasedIds]
+          );
+          for (const r of rows as any[]) {
+            const p = String(r.drive_path || "").trim();
+            if (p) drivePaths.set(Number(r.id), p);
+          }
+        } catch {
+          // Sin migración todavía: el panel no puede anticipar choques.
+        }
+      }
       const catalog = await q(
         `SELECT id, name, subtitle, price, currency FROM packages
           WHERE active = 1 AND (is_extern = 0 OR is_extern IS NULL)
@@ -105,6 +124,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           categoryName: r.category_name || "",
           urlImage: r.url_image || "",
           agendaCount: Number(r.agendas_count || 0),
+          // Carpeta compartida del Drive ("" = ninguna).
+          drivePath: drivePaths.get(Number(r.id)) || "",
           services: pkgServices
             .filter((s: any) => Number(s.id_purchased_package) === Number(r.id))
             .map((s: any) => ({

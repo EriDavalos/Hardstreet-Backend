@@ -5,6 +5,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { q, exec, transaccion } from "../../../lib/db";
+import { sharedDriveConflict } from "../../../lib/drive-paths";
 
 // ==================================================================
 // ADMINISTRACIÓN DEL PAQUETE DEL CLIENTE -> /api/admin/package-progress
@@ -737,7 +738,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     // ---- Carpeta del Drive COMPARTIDA con el cliente del paquete ----
     // `path` vacío = dejar de compartir. La ruta se normaliza (sin barras
     // iniciales/finales y sin '..') porque el drive del cliente la usa tal
-    // cual para limitar lo que ve.
+    // cual para limitar lo que ve. Además NO se permite compartir una carpeta
+    // que se solape con otra ya compartida a los mismos clientes: sería el
+    // mismo contenido dos veces.
     if (actionName === "compartir-directorio") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
@@ -750,6 +753,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         .map((s) => s.trim())
         .filter((s) => s !== "" && s !== "." && s !== "..")
         .join("/");
+      // Choque con otra carpeta ya compartida a los mismos clientes.
+      if (clean) {
+        const clash = await sharedDriveConflict(purchasedPackageId, clean);
+        if (clash) {
+          fail(
+            res,
+            409,
+            "Esa carpeta se solapa con una ya compartida",
+            `«${clash}» ya está compartida con el cliente y contiene a «${clean}» ` +
+              `(o está dentro de ella). Comparte solo una de las dos para no ` +
+              `duplicar el mismo contenido.`
+          );
+          return;
+        }
+      }
       let r: { affectedRows?: number };
       try {
         r = await exec(
