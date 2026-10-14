@@ -5,7 +5,11 @@ import { requirePermission } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { q, exec, transaccion } from "../../../lib/db";
-import { sharedDriveConflict } from "../../../lib/drive-paths";
+import {
+  drivePathsOverlap,
+  packageDrivePaths,
+  sharedDriveConflict,
+} from "../../../lib/drive-paths";
 
 // ==================================================================
 // ADMINISTRACIÓN DEL PAQUETE DEL CLIENTE -> /api/admin/package-progress
@@ -26,6 +30,13 @@ import { sharedDriveConflict } from "../../../lib/drive-paths";
 //     reabrir-servicio    { serviceId }
 //     actualizar-servicio { serviceId, description }
 //     actualizar-servicio-url { serviceId, url }  (liga del Drive del servicio)
+//     agregar-directorio  { purchasedPackageId, path }
+//       Suma UNA carpeta del Drive a las compartidas con el cliente (el
+//       paquete puede compartir varias).
+//     quitar-directorio   { purchasedPackageId, path }
+//       Deja de compartir esa carpeta.
+//     compartir-directorio { purchasedPackageId, path }
+//       Compatibilidad: deja UNA sola carpeta compartida ('' = ninguna).
 //     finalizar           { purchasedPackageId }
 //     reabrir-paquete     { purchasedPackageId }
 //
@@ -90,6 +101,71 @@ async function recomputePaid(
 }
 
 type Row = Record<string, any>;
+
+/** Normaliza una ruta del Drive ('' si no queda nada útil). */
+function cleanDrivePath(raw: unknown): string {
+  return norm(raw)
+    .replace(/\\/g, "/")
+    .split("/")
+    .map((s) => s.trim())
+    .filter((s) => s !== "" && s !== "." && s !== "..")
+    .join("/");
+}
+
+/** Sincroniza la columna vieja `drive_path` con la PRIMERA carpeta. */
+async function syncLegacyDrivePath(
+  purchasedPackageId: number,
+  paths: string[]
+): Promise<void> {
+  try {
+    await exec(
+      `UPDATE purchased_packages SET drive_path = ? WHERE id = ?`,
+      [paths[0] ?? null, purchasedPackageId]
+    );
+  } catch {
+    // Migración pendiente de la columna vieja: la tabla nueva ya tiene todo.
+  }
+}
+
+/**
+ * Deja EXACTAMENTE [paths] como las carpetas del Drive compartidas con el
+ * cliente de ese paquete (tabla `purchased_packages_drive` + columna vieja).
+ *
+ * Devuelve 'missing' si el paquete no existe y 'no-table' si la migración
+ * todavía no se aplicó (se deja al menos la columna vieja al día).
+ */
+async function setPackageDriveFolders(
+  purchasedPackageId: number,
+  paths: string[]
+): Promise<"ok" | "missing" | "no-table"> {
+  const exists = await q(
+    `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
+    [purchasedPackageId]
+  );
+  if (!exists.length) return "missing";
+  try {
+    await transaccion(async (conn) => {
+      await conn.query(
+        `UPDATE purchased_packages_drive
+            SET active = 0
+          WHERE id_purchased_package = ? AND active = 1`,
+        [purchasedPackageId]
+      );
+      for (const p of paths) {
+        await conn.query(
+          `INSERT INTO purchased_packages_drive (id_purchased_package, path)
+           VALUES (?, ?)`,
+          [purchasedPackageId, p]
+        );
+      }
+    });
+  } catch {
+    await syncLegacyDrivePath(purchasedPackageId, paths);
+    return "no-table";
+  }
+  await syncLegacyDrivePath(purchasedPackageId, paths);
+  return "ok";
+}
 
 /** Totales por tipo de movimiento + abonado. */
 function sumBy(rows: Row[], predicate: (r: Row) => boolean): number {
@@ -204,6 +280,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         console.error("[admin/package-progress] movimientos:", e);
       }
 
+      // Carpetas compartidas de ESTE paquete (puede tener varias).
+      const sharedPaths = await packageDrivePaths(purchasedPackageId);
+
       const pkg = pkgRows[0];
       const price = Number(pkg.price || 0);
       const paid = Number(pkg.paid || 0);
@@ -236,10 +315,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           statusId: Number(pkg.id_status || 0),
           finished,
           finishedAt: pkg.finished_at || null,
-          // Carpeta del Drive COMPARTIDA con el cliente de este paquete
-          // ('' = todavía no se le comparte ninguna). Se administra en la
-          // pestaña Drive del administrador del paquete.
-          drivePath: String(pkg.drive_path || ""),
+          // Carpetas del Drive COMPARTIDAS con el cliente de este paquete
+          // (vacío = todavía no se le comparte ninguna). Se administran en la
+          // pestaña Drive del administrador del paquete. `drivePath` sigue
+          // siendo la PRIMERA carpeta (compatibilidad con lo ya existente).
+          drivePath: sharedPaths[0] || "",
+          drivePaths: sharedPaths,
         },
         services: services.map((s) => ({
           id: Number(s.id),
@@ -735,24 +816,126 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
+    // ---- Agregar UNA carpeta del Drive a las compartidas del paquete ----
+    // Un paquete puede compartir VARIAS carpetas. La ruta se normaliza (sin
+    // barras iniciales/finales y sin '..') y NO se permite que se solape con
+    // otra ya compartida a los mismos clientes: sería el mismo contenido dos
+    // veces.
+    if (actionName === "agregar-directorio") {
+      const purchasedPackageId = Number(b.purchasedPackageId || 0);
+      if (!purchasedPackageId) {
+        fail(res, 400, "Indica el paquete comprado", "La acción necesita el paquete del cliente");
+        return;
+      }
+      const clean = cleanDrivePath(b.path);
+      if (!clean) {
+        fail(res, 400, "Elige una carpeta del Drive", "La acción necesita la carpeta que se va a compartir");
+        return;
+      }
+      // ¿Ya está (o se solapa con otra) en ESTE paquete?
+      const current = await packageDrivePaths(purchasedPackageId);
+      const own = current.find((p) => drivePathsOverlap(clean, p));
+      if (own) {
+        fail(
+          res,
+          409,
+          "Esa carpeta ya está compartida",
+          `«${own}» ya se comparte con el cliente en este paquete ` +
+            `(o contiene a «${clean}»). Comparte solo una de las dos.`
+        );
+        return;
+      }
+      // Choque con otra carpeta compartida en OTRO paquete del cliente.
+      const clash = await sharedDriveConflict(purchasedPackageId, clean);
+      if (clash) {
+        fail(
+          res,
+          409,
+          "Esa carpeta se solapa con una ya compartida",
+          `«${clash}» ya está compartida con el cliente y contiene a «${clean}» ` +
+            `(o está dentro de ella). Comparte solo una de las dos para no ` +
+            `duplicar el mismo contenido.`
+        );
+        return;
+      }
+      const next = [...current, clean];
+      const saved = await setPackageDriveFolders(purchasedPackageId, next);
+      if (saved === "missing") {
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
+        return;
+      }
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "paquete-cliente",
+        entityId: purchasedPackageId,
+        description: "Carpeta compartida con el cliente exitosamente",
+        details: { purchasedPackageId, drivePaths: next },
+        req,
+      });
+      ok(res, "Carpeta compartida con el cliente exitosamente", {
+        drivePath: next[0] ?? "",
+        drivePaths: next,
+        item: { purchasedPackageId, drivePaths: next },
+      });
+      return;
+    }
+
+    // ---- Dejar de compartir UNA carpeta del paquete ----
+    if (actionName === "quitar-directorio") {
+      const purchasedPackageId = Number(b.purchasedPackageId || 0);
+      if (!purchasedPackageId) {
+        fail(res, 400, "Indica el paquete comprado", "La acción necesita el paquete del cliente");
+        return;
+      }
+      const clean = cleanDrivePath(b.path);
+      if (!clean) {
+        fail(res, 400, "Elige la carpeta", "La acción necesita la carpeta que se deja de compartir");
+        return;
+      }
+      const current = await packageDrivePaths(purchasedPackageId);
+      const next = current.filter((p) => p !== clean);
+      if (next.length === current.length) {
+        fail(res, 404, "Carpeta no compartida", `«${clean}» no está compartida en este paquete`);
+        return;
+      }
+      const saved = await setPackageDriveFolders(purchasedPackageId, next);
+      if (saved === "missing") {
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
+        return;
+      }
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "paquete-cliente",
+        entityId: purchasedPackageId,
+        description: "Se dejó de compartir la carpeta exitosamente",
+        details: { purchasedPackageId, drivePath: clean, drivePaths: next },
+        req,
+      });
+      ok(res, "Se dejó de compartir la carpeta exitosamente", {
+        drivePath: next[0] ?? "",
+        drivePaths: next,
+        item: { purchasedPackageId, drivePaths: next },
+      });
+      return;
+    }
+
     // ---- Carpeta del Drive COMPARTIDA con el cliente del paquete ----
-    // `path` vacío = dejar de compartir. La ruta se normaliza (sin barras
-    // iniciales/finales y sin '..') porque el drive del cliente la usa tal
-    // cual para limitar lo que ve. Además NO se permite compartir una carpeta
-    // que se solape con otra ya compartida a los mismos clientes: sería el
-    // mismo contenido dos veces.
+    // COMPATIBILIDAD: deja UNA sola carpeta compartida (`path` vacío = dejar
+    // de compartir todas). El panel nuevo usa `agregar-directorio` y
+    // `quitar-directorio`, que sí admite varias carpetas por paquete.
     if (actionName === "compartir-directorio") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
         fail(res, 400, "Indica el paquete comprado", "La acción necesita el paquete del cliente");
         return;
       }
-      const clean = norm(b.path)
-        .replace(/\\/g, "/")
-        .split("/")
-        .map((s) => s.trim())
-        .filter((s) => s !== "" && s !== "." && s !== "..")
-        .join("/");
+      const clean = cleanDrivePath(b.path);
       // Choque con otra carpeta ya compartida a los mismos clientes.
       if (clean) {
         const clash = await sharedDriveConflict(purchasedPackageId, clean);
@@ -768,22 +951,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
       }
-      let r: { affectedRows?: number };
-      try {
-        r = await exec(
-          `UPDATE purchased_packages SET drive_path = ? WHERE id = ? AND active = 1`,
-          [clean || null, purchasedPackageId]
-        );
-      } catch {
-        fail(
-          res,
-          409,
-          "No se pudo compartir la carpeta",
-          "Falta aplicar la migración 2026-10-15 (carpeta compartida del paquete)"
-        );
-        return;
-      }
-      if (!r.affectedRows) {
+      const saved = await setPackageDriveFolders(
+        purchasedPackageId,
+        clean ? [clean] : []
+      );
+      if (saved === "missing") {
         fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }

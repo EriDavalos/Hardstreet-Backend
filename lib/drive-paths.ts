@@ -1,9 +1,14 @@
 // ==================================================================
 // HARD STREET BACKEND - Carpetas del Drive compartidas
 // ==================================================================
-// El estudio le comparte a cada cliente UNA carpeta del Drive por paquete
-// (`purchased_packages.drive_path`). Estas reglas son las MISMAS que aplica el
-// panel (app Flutter, lib/drive_base.dart):
+// El estudio le comparte a cada cliente las carpetas del Drive que quiera,
+// por paquete comprado. El origen de verdad es la tabla
+// `purchased_packages_drive` (VARIAS carpetas por paquete); la columna vieja
+// `purchased_packages.drive_path` se conserva SINCRONIZADA con la primera
+// carpeta, así los clientes que todavía la lean no se quedan sin datos.
+//
+// Estas reglas son las MISMAS que aplica el panel (app Flutter,
+// lib/drive_base.dart):
 //
 //   * una ruta se normaliza: separador '/', sin barras al principio/final y
 //     sin '.' ni '..';
@@ -35,24 +40,96 @@ export function drivePathsOverlap(a: string, b: string): boolean {
   return x.startsWith(`${y}/`) || y.startsWith(`${x}/`);
 }
 
+/** Acumula una carpeta normalizada sin repetirla. */
+function pushPath(out: string[], raw: unknown): void {
+  const p = normalizeDrivePath(raw);
+  if (p && !out.includes(p)) out.push(p);
+}
+
 /**
- * ¿Algún cliente de la compra [purchasedPackageId] ya tiene compartida, en
- * OTRO de sus paquetes, una carpeta que se solapa con [path]?
+ * Carpetas compartidas de UN paquete comprado (en su orden de alta).
  *
- * Devuelve esa carpeta (para poder decirle al usuario cuál es) o null.
- * Es INSENSIBLE a un backend sin la migración: si la columna `drive_path`
- * todavía no existe, simplemente no valida (igual que el resto del panel).
+ * Lee la tabla nueva; si el paquete todavía no tiene filas ahí (migración sin
+ * aplicar o carpeta guardada con la columna vieja) cae a `drive_path`.
+ * Nunca lanza: sin migración devuelve lo que se pueda.
  */
-export async function sharedDriveConflict(
-  purchasedPackageId: number,
-  path: string
-): Promise<string | null> {
-  const target = normalizeDrivePath(path);
-  if (!target) return null;
-  let rows: { id: number; drive_path: string }[];
+export async function packageDrivePaths(
+  purchasedPackageId: number
+): Promise<string[]> {
+  const out: string[] = [];
   try {
-    rows = await q<{ id: number; drive_path: string }>(
-      `SELECT DISTINCT pp.id, pp.drive_path
+    const rows = await q<{ path: string }>(
+      `SELECT path FROM purchased_packages_drive
+        WHERE id_purchased_package = ? AND active = 1
+        ORDER BY id ASC`,
+      [purchasedPackageId]
+    );
+    for (const r of rows) pushPath(out, r.path);
+    if (out.length) return out;
+  } catch {
+    // Tabla pendiente de migración: se usa la columna vieja.
+  }
+  try {
+    const rows = await q<{ drive_path: string }>(
+      `SELECT drive_path FROM purchased_packages WHERE id = ? AND active = 1`,
+      [purchasedPackageId]
+    );
+    pushPath(out, rows[0]?.drive_path);
+  } catch {
+    // Sin columna tampoco: sin carpetas.
+  }
+  return out;
+}
+
+/** Versión en lote de [packageDrivePaths] (una sola consulta por tabla). */
+export async function packageDrivePathsByIds(
+  purchasedPackageIds: number[]
+): Promise<Map<number, string[]>> {
+  const ids = [...new Set(purchasedPackageIds.filter((n) => Number(n) > 0))];
+  const map = new Map<number, string[]>();
+  for (const id of ids) map.set(id, []);
+  if (!ids.length) return map;
+
+  // Carpetas de la tabla nueva.
+  try {
+    const rows = await q<{ id_purchased_package: number; path: string }>(
+      `SELECT id_purchased_package, path FROM purchased_packages_drive
+        WHERE active = 1 AND id_purchased_package IN (?)
+        ORDER BY id ASC`,
+      [ids]
+    );
+    for (const r of rows) {
+      pushPath(map.get(Number(r.id_purchased_package)) ?? [], r.path);
+    }
+  } catch {
+    // Tabla pendiente de migración.
+  }
+
+  // Paquetes SIN filas en la tabla nueva: se toma la columna vieja (así las
+  // carpetas compartidas antes de la migración no desaparecen).
+  const missing = ids.filter((id) => (map.get(id) ?? []).length === 0);
+  if (missing.length) {
+    try {
+      const rows = await q<{ id: number; drive_path: string }>(
+        `SELECT id, drive_path FROM purchased_packages WHERE id IN (?)`,
+        [missing]
+      );
+      for (const r of rows) pushPath(map.get(Number(r.id)) ?? [], r.drive_path);
+    } catch {
+      // Sin columna: sin datos.
+    }
+  }
+  return map;
+}
+
+/** Nombres (y carpetas) de los paquetes con los que comparte clientes [id]. */
+async function siblingPackagePaths(
+  purchasedPackageId: number
+): Promise<{ id: number; name: string; paths: string[] }[]> {
+  let rows: { id: number; name: string; drive_path: string | null }[];
+  try {
+    rows = await q<{ id: number; name: string; drive_path: string | null }>(
+      `SELECT DISTINCT pp.id, pp.name, pp.drive_path
          FROM users_packages up
          JOIN purchased_packages pp
            ON pp.id = up.id_purchased_package AND pp.active = 1
@@ -66,11 +143,32 @@ export async function sharedDriveConflict(
     );
   } catch {
     // Columna pendiente de migración: sin validación posible.
-    return null;
+    return [];
   }
-  for (const r of rows) {
-    const other = normalizeDrivePath(r.drive_path);
-    if (other && drivePathsOverlap(target, other)) return other;
+  const folders = await packageDrivePathsByIds(rows.map((r) => Number(r.id)));
+  return rows.map((r) => ({
+    id: Number(r.id),
+    name: String(r.name || ""),
+    paths: folders.get(Number(r.id)) ?? [],
+  }));
+}
+
+/**
+ * ¿Algún cliente de la compra [purchasedPackageId] ya tiene compartida, en
+ * OTRO de sus paquetes, una carpeta que se solapa con [path]?
+ *
+ * Devuelve esa carpeta (para poder decirle al usuario cuál es) o null.
+ */
+export async function sharedDriveConflict(
+  purchasedPackageId: number,
+  path: string
+): Promise<string | null> {
+  const target = normalizeDrivePath(path);
+  if (!target) return null;
+  for (const sib of await siblingPackagePaths(purchasedPackageId)) {
+    for (const other of sib.paths) {
+      if (drivePathsOverlap(target, other)) return other;
+    }
   }
   return null;
 }

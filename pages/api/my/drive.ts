@@ -3,6 +3,7 @@ import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 import { userIsAdmin, userRoleId } from "../../../lib/permissions";
+import { normalizeDrivePath, packageDrivePathsByIds } from "../../../lib/drive-paths";
 
 // ==================================================================
 // Carpetas COMPARTIDAS con el usuario logueado  ->  /api/my/drive
@@ -13,14 +14,16 @@ import { userIsAdmin, userRoleId } from "../../../lib/permissions";
 //     paths: [ { packageId, packageName, path } ]
 //   }
 //
-// `paths` sale de `purchased_packages.drive_path` de los paquetes ACTIVOS
-// del usuario (la carpeta que el estudio le compartió desde el
-// administrador del paquete). El drive del cliente muestra SOLO esas
-// carpetas; sin ellas no ve nada (aún no se le comparte nada).
+// `paths` sale de las carpetas compartidas de los paquetes ACTIVOS del
+// usuario (tabla `purchased_packages_drive`, con la columna vieja
+// `purchased_packages.drive_path` como respaldo): un paquete puede compartir
+// VARIAS carpetas, así que aquí sale una entrada por carpeta. El drive del
+// cliente muestra SOLO esas carpetas; sin ellas no ve nada (aún no se le
+// comparte nada).
 //
-// El rol ADMIN nunca se limita: ve el drive completo. Si la migración
-// `2026-10-15_movimientos_generales_y_carpeta_compartida.sql` todavía no
-// se aplicó, la consulta cae a un modo sin carpetas en vez de fallar.
+// El rol ADMIN nunca se limita: ve el drive completo. Si las migraciones
+// todavía no se aplicaron, la consulta cae a un modo sin carpetas en vez de
+// fallar.
 // ==================================================================
 
 type Row = Record<string, any>;
@@ -41,17 +44,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     let rows: Row[];
     try {
       rows = await q<Row>(
-        `SELECT pp.id AS package_id, pp.name, pp.drive_path
-           FROM users_packages up
-           JOIN purchased_packages pp
-             ON pp.id = up.id_purchased_package AND pp.active = 1
-          WHERE up.id_user = ? AND up.active = 1
-          ORDER BY up.id DESC`,
-        [session.sub]
-      );
-    } catch {
-      // Columna `drive_path` pendiente de migración: sin carpetas.
-      rows = await q<Row>(
         `SELECT pp.id AS package_id, pp.name
            FROM users_packages up
            JOIN purchased_packages pp
@@ -60,15 +52,23 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           ORDER BY up.id DESC`,
         [session.sub]
       );
+    } catch {
+      rows = [];
     }
 
-    const paths = rows
-      .map((r) => ({
-        packageId: Number(r.package_id || 0),
-        packageName: String(r.name || ""),
-        path: String(r.drive_path || "").trim(),
-      }))
-      .filter((p) => p.path !== "");
+    // Las carpetas de cada paquete (tabla nueva + respaldo de la columna vieja).
+    const folders = await packageDrivePathsByIds(
+      rows.map((r) => Number(r.package_id || 0))
+    );
+
+    const paths = rows.flatMap((r) => {
+      const packageId = Number(r.package_id || 0);
+      const packageName = String(r.name || "");
+      return (folders.get(packageId) ?? [])
+        .map((p) => normalizeDrivePath(p))
+        .filter((p) => p !== "")
+        .map((path) => ({ packageId, packageName, path }));
+    });
 
     const role = String(session.role || "");
     res.status(200).json({
