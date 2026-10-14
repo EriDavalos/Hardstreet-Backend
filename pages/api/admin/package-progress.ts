@@ -69,6 +69,9 @@ const MOVEMENT_KINDS = [
   "gasto",
   "ahorro",
   "abono_externo",
+  // Pago repartido a un colaborador o empleado. Cuenta como gasto, pero se
+  // etiqueta aparte para poder ver a quién se le pagó.
+  "pago",
 ] as const;
 type MovementKind = (typeof MOVEMENT_KINDS)[number];
 
@@ -107,6 +110,68 @@ async function recomputePaid(
 }
 
 type Row = Record<string, any>;
+
+/**
+ * Colaboradores y empleados activos: únicos destinatarios de un pago
+ * repartido. Devuelve [] (sin romper la petición) si la consulta falla.
+ */
+async function loadRecipients(): Promise<Row[]> {
+  try {
+    return await q<Row>(
+      `SELECT u.id, CONCAT_WS(' ', u.name, u.lastname) AS name, r.name AS role_name
+         FROM users u
+         JOIN roles r ON r.id = u.id_role
+        WHERE u.active = 1 AND r.active = 1
+          AND LOWER(r.name) IN ('colaborador', 'empleado')
+        ORDER BY r.name ASC, u.name ASC`
+    );
+  } catch (e) {
+    console.error("[admin/package-progress] destinatarios:", e);
+    return [];
+  }
+}
+
+// ¿`purchased_packages_movements` ya tiene la columna `id_user`? Se detecta
+// una sola vez por proceso: si la migración todavía no se aplicó, los
+// movimientos se guardan igual (sin destinatario) en vez de romper el alta.
+let movementsHaveUserColumn: boolean | null = null;
+
+/** Inserta un movimiento, con destinatario si la columna existe. */
+async function insertMovementSafe(args: {
+  purchasedPackageId: number;
+  kind: string;
+  amount: number;
+  description?: string;
+  userId?: number | null;
+}): Promise<{ insertId: number }> {
+  const { purchasedPackageId, kind, amount, description, userId } = args;
+  if (userId && movementsHaveUserColumn !== false) {
+    try {
+      const r = await exec(
+        `INSERT INTO purchased_packages_movements
+           (id_purchased_package, kind, amount, description, id_user)
+         VALUES (?, ?, ?, ?, ?)`,
+        [purchasedPackageId, kind, amount, description || null, userId]
+      );
+      movementsHaveUserColumn = true;
+      return { insertId: Number(r.insertId) };
+    } catch (e) {
+      if (movementsHaveUserColumn === true) throw e;
+      movementsHaveUserColumn = false;
+      console.error(
+        "[admin/package-progress] id_user no disponible en movimientos:",
+        e
+      );
+    }
+  }
+  const r = await exec(
+    `INSERT INTO purchased_packages_movements
+       (id_purchased_package, kind, amount, description)
+     VALUES (?, ?, ?, ?)`,
+    [purchasedPackageId, kind, amount, description || null]
+  );
+  return { insertId: Number(r.insertId) };
+}
 
 /** Normaliza una ruta del Drive ('' si no queda nada útil). */
 function cleanDrivePath(raw: unknown): string {
@@ -268,27 +333,52 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // movimientos propios conservan su tipo (antes TODOS salían como
         // 'abono', así que un gasto nunca se contaba como gasto y todo se
         // colaba en el total abonado).
-        movements = await q<Row>(
-          `SELECT id, kind, amount, description, source, created
+        //
+        // Los movimientos propios llevan `id_user` (a quién se le pagó o
+        // quién lo registró). Si esa columna todavía no existe (migración
+        // pendiente) se cae a la consulta anterior para no perder la lista.
+        const baseQuery = (withUser: boolean) =>
+          `SELECT id, kind, amount, description, source, created,
+                  user_id, user_name
              FROM (
                SELECT id, 'abono' AS kind, amount, description,
                       'payment' AS source,
-                      DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created
+                      DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created,
+                      NULL AS user_id, NULL AS user_name
                  FROM purchased_packages_payments
                 WHERE id_purchased_package = ? AND active = 1
                UNION ALL
-               SELECT id, kind, amount, description, 'movement' AS source,
-                      DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created
-                 FROM purchased_packages_movements
-                WHERE id_purchased_package = ? AND active = 1
+               SELECT mv.id, mv.kind, mv.amount, mv.description,
+                      'movement' AS source,
+                      DATE_FORMAT(mv.created, '%Y-%m-%dT%H:%i:%s') AS created,${
+                        withUser
+                          ? " mv.id_user AS user_id, CONCAT_WS(' ', u.name, u.lastname) AS user_name"
+                          : " NULL AS user_id, NULL AS user_name"
+                      }
+                 FROM purchased_packages_movements mv${
+                   withUser ? " LEFT JOIN users u ON u.id = mv.id_user" : ""
+                 }
+                WHERE mv.id_purchased_package = ? AND mv.active = 1
              ) m
-            ORDER BY m.created DESC, m.id DESC`,
-          [purchasedPackageId, purchasedPackageId]
-        );
+            ORDER BY m.created DESC, m.id DESC`;
+        try {
+          movements = await q<Row>(baseQuery(true), [
+            purchasedPackageId,
+            purchasedPackageId,
+          ]);
+        } catch {
+          movements = await q<Row>(baseQuery(false), [
+            purchasedPackageId,
+            purchasedPackageId,
+          ]);
+        }
       } catch (e) {
         movementsAvailable = false;
         console.error("[admin/package-progress] movimientos:", e);
       }
+
+      // Colaboradores y empleados activos: únicos destinatarios del reparto.
+      const recipients = await loadRecipients();
 
       // Carpetas compartidas de ESTE paquete (puede tener varias).
       const sharedPaths = await packageDrivePaths(purchasedPackageId);
@@ -359,6 +449,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           amount: Number(m.amount || 0),
           description: String(m.description || ""),
           created: m.created || "",
+          // Destinatario del pago (solo movimientos propios).
+          userId: m.user_id == null ? null : Number(m.user_id),
+          userName: String(m.user_name || ""),
+        })),
+        // A quién se le puede repartir un pago: colaboradores y empleados.
+        recipients: recipients.map((u) => ({
+          id: Number(u.id),
+          name: String(u.name || "").trim() || `Usuario #${Number(u.id)}`,
+          roleName: String(u.role_name || ""),
         })),
         movementsAvailable,
         // Estos totales son SOLO informativos de la pestaña Movimientos:
@@ -369,12 +468,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           const round2 = (n: number) => Math.round(n * 100) / 100;
           const abonado = sumBy(movements, (m) => m.kind === "abono");
           const invertido = sumBy(movements, (m) => m.kind === "inversion");
-          // Inversión = un tipo de gasto: "Gastado" incluye ambos.
-          const gastado = sumBy(movements, (m) => m.kind === "gasto") + invertido;
+          // Los PAGOS repartidos también son dinero que sale del paquete.
+          const pagos = sumBy(movements, (m) => m.kind === "pago");
+          // Inversión = un tipo de gasto: "Gastado" incluye ambos (y pagos).
+          const gastado =
+            sumBy(movements, (m) => m.kind === "gasto") + invertido + pagos;
           return {
             abonado,
             invertido,
             gastado,
+            pagos,
             ahorrado: sumBy(movements, (m) => m.kind === "ahorro"),
             abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
             // DISPONIBLE = abonado - gastado (gasto + inversión) - ahorro +
@@ -1074,12 +1177,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const description = norm(b.description);
-      const r = await exec(
-        `INSERT INTO purchased_packages_movements
-           (id_purchased_package, kind, amount, description)
-         VALUES (?, ?, ?, ?)`,
-        [purchasedPackageId, kind, amount, description || null]
-      );
+      const userId = Number(b.userId || 0) || null;
+      const r = await insertMovementSafe({
+        purchasedPackageId,
+        kind,
+        amount,
+        description,
+        userId,
+      });
       await logActivity({
         userId: me.sub,
         module: "clientes",
@@ -1088,7 +1193,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         entity: "movimiento",
         entityId: r.insertId,
         description: "Movimiento registrado exitosamente",
-        details: { id: r.insertId, purchasedPackageId, kind, amount, description },
+        details: { id: r.insertId, purchasedPackageId, kind, amount, description, userId },
         req,
       });
       created(res, "Movimiento registrado exitosamente", {
@@ -1096,6 +1201,122 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         kind,
         amount,
         item: { id: r.insertId, kind, amount, purchasedPackageId },
+      });
+      return;
+    }
+
+    // ---- Repartir pago: divide un monto entre colaboradores y empleados ----
+    // Dos modos:
+    //   * 'iguales'   → el total se parte en partes iguales (el último
+    //                   absorbe los centavos sobrantes).
+    //   * 'numeracion'→ cada destinatario recibe el monto que se escribió.
+    // Cada parte se guarda como un movimiento aparte con kind 'pago' y el
+    // usuario asignado, para poder ver a quién se le pagó y cuánto.
+    if (actionName === "repartir-pago") {
+      const purchasedPackageId = Number(b.purchasedPackageId || 0);
+      if (!purchasedPackageId) {
+        fail(res, 400, "Indica el paquete comprado", "El pago debe pertenecer a un paquete del cliente");
+        return;
+      }
+      const exists = await q(
+        `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
+        [purchasedPackageId]
+      );
+      if (!exists.length) {
+        fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
+        return;
+      }
+
+      // Destinatarios permitidos (colaborador o empleado, activos).
+      const allowed = new Map<number, string>();
+      for (const u of await loadRecipients()) {
+        allowed.set(Number(u.id), String(u.name || "").trim());
+      }
+      if (!allowed.size) {
+        fail(res, 400, "No hay colaboradores ni empleados activos", "Da de alta al menos uno para poder repartir");
+        return;
+      }
+
+      const mode = norm(b.mode).toLowerCase();
+      const description = norm(b.description);
+      const round2 = (n: number) => Math.round(n * 100) / 100;
+      const parts: { userId: number; amount: number }[] = [];
+
+      if (mode === "iguales") {
+        const total = asAmount(b.total);
+        if (total === null) {
+          fail(res, 400, "El monto debe ser mayor a 0", "Escribe el total a repartir");
+          return;
+        }
+        const ids = (Array.isArray(b.userIds) ? b.userIds : [])
+          .map((v) => Number(v))
+          .filter((id) => id > 0);
+        const unique = [...new Set(ids)].filter((id) => allowed.has(id));
+        if (!unique.length) {
+          fail(res, 400, "Selecciona a quién repartir", "Marca al menos un colaborador o empleado");
+          return;
+        }
+        const base = round2(total / unique.length);
+        let acumulado = 0;
+        unique.forEach((id, i) => {
+          const amount =
+            i === unique.length - 1 ? round2(total - acumulado) : base;
+          acumulado = round2(acumulado + amount);
+          parts.push({ userId: id, amount });
+        });
+      } else if (mode === "numeracion") {
+        const raw = Array.isArray(b.parts) ? b.parts : [];
+        for (const p of raw) {
+          const row = (p || {}) as Record<string, unknown>;
+          const id = Number(row.userId || 0);
+          if (!id || !allowed.has(id)) continue;
+          const amount = asAmount(row.amount);
+          if (amount === null) continue;
+          parts.push({ userId: id, amount });
+        }
+        if (!parts.length) {
+          fail(res, 400, "Escribe al menos un monto", "Cada destinatario necesita un monto mayor a 0");
+          return;
+        }
+      } else {
+        fail(res, 400, "Modo de reparto inválido", "Usa 'iguales' o 'numeracion'");
+        return;
+      }
+
+      const totalPagado = round2(parts.reduce((s, p) => s + p.amount, 0));
+      const payments: Row[] = [];
+      for (const part of parts) {
+        const who = allowed.get(part.userId) || "usuario";
+        const r = await insertMovementSafe({
+          purchasedPackageId,
+          kind: "pago",
+          amount: part.amount,
+          description: description || `Pago a ${who}`,
+          userId: part.userId,
+        });
+        payments.push({
+          id: r.insertId,
+          userId: part.userId,
+          userName: who,
+          amount: part.amount,
+        });
+      }
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "create",
+        entity: "pago",
+        entityId: purchasedPackageId,
+        description: "Pago repartido exitosamente",
+        details: { purchasedPackageId, mode, total: totalPagado, parts },
+        req,
+      });
+      created(res, "Pago repartido exitosamente", {
+        mode,
+        total: totalPagado,
+        count: payments.length,
+        payments,
       });
       return;
     }
