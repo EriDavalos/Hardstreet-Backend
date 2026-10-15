@@ -3,7 +3,10 @@ import { withCors } from "../../../lib/cors";
 import { q } from "../../../lib/db";
 import { requireAnyPermission, requirePermission } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
-import { normalizeDrivePath } from "../../../lib/drive-paths";
+import {
+  normalizeSharePath,
+  isLocalPath,
+} from "../../../lib/drive-paths";
 import {
   shareCandidates,
   sharePathWith,
@@ -108,7 +111,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // GET: MIS compartidos, los recibidos, o el detalle de UNA carpeta.
       // ------------------------------------------------------------
       case "GET": {
-        const folder = normalizeDrivePath(norm(req.query.folder));
+        const folder = normalizeSharePath(norm(req.query.folder));
 
         if (folder) {
           const mine = (await sharesByOwner(me.sub, folder)).filter(
@@ -117,6 +120,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return ok(res, "Carpeta compartida", {
             item: {
               path: folder,
+              local: isLocalPath(folder),
               targets: mine.map((s) => ({
                 id: s.targetId,
                 name: s.targetName,
@@ -151,7 +155,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // ------------------------------------------------------------
       case "POST": {
         const b = (req.body || {}) as Record<string, unknown>;
-        const path = normalizeDrivePath(norm(b.path));
+        const path = normalizeSharePath(norm(b.path));
         const userIds = userIdsOf(b.userIds);
         if (!path) {
           fail(res, 400, "Falta la carpeta", "Elige la carpeta que quieres compartir");
@@ -206,7 +210,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // ------------------------------------------------------------
       case "DELETE": {
         const b = (req.body || {}) as Record<string, unknown>;
-        const path = normalizeDrivePath(norm(b.path) || norm(req.query.path));
+        const path = normalizeSharePath(norm(b.path) || norm(req.query.path));
         let userIds = userIdsOf(b.userIds);
         if (!userIds.length) {
           userIds = userIdsOf(

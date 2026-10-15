@@ -7,6 +7,7 @@ import {
   normalizeDrivePath,
   packageDrivePathsByIds,
   userDrivePaths,
+  isLocalPath,
 } from "../../../lib/drive-paths";
 import { sharesByTarget } from "../../../lib/user-shares";
 
@@ -88,7 +89,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     // Carpetas que OTROS USUARIOS me compartieron desde "Archivos
     // compartidos" (user_drive_shares): también se ven en mi Drive, junto a
     // las de mis paquetes. El nombre del que comparte es el de la carpeta.
+    //
+    // SOLO las que viven DENTRO del Drive del servidor: las carpetas LOCALES
+    // (rutas absolutas de la computadora del que comparte) no son una ruta del
+    // Drive; ésas se abren desde el módulo "Archivos compartidos" con los
+    // endpoints /api/local/*, así que no se montan aquí.
     for (const folder of await sharesByTarget(Number(session.sub))) {
+      if (folder.local || isLocalPath(folder.path)) continue;
       const clean = normalizeDrivePath(folder.path);
       if (clean === "") continue;
       if (paths.some((p) => p.path === clean)) continue;

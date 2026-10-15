@@ -21,7 +21,11 @@
 // ==================================================================
 
 import { q, exec } from "./db";
-import { normalizeDrivePath, drivePathsOverlap } from "./drive-paths";
+import {
+  normalizeSharePath,
+  pathsOverlap,
+  isLocalPath,
+} from "./drive-paths";
 
 /** Una carpeta compartida con su dueño y con quién la recibe. */
 export interface UserShare {
@@ -31,16 +35,24 @@ export interface UserShare {
   targetId: number;
   targetName: string;
   path: string;
+  /** ¿Es una CARPETA LOCAL de la computadora del dueño? */
+  local: boolean;
   created: string | null;
 }
 
 /** Nombres de los usuarios que comparten una carpeta con [viewerId]. */
 export interface SharedFolder {
+  /** Id del compartido (el primero de esa carpeta): lo usa la app para abrir
+   * una carpeta LOCAL con los endpoints /api/local/* del servidor del drive. */
+  shareId: number;
   path: string;
+  /** ¿Es una CARPETA LOCAL de la computadora del que comparte? */
+  local: boolean;
   owners: { id: number; name: string }[];
 }
 
-const clean = (v: unknown) => normalizeDrivePath(v);
+/** Normaliza una ruta del Drive o una ruta LOCAL absoluta. */
+const clean = (v: unknown) => normalizeSharePath(v);
 
 /** Nombre visible de un usuario ("Nombre Apellido"), o su correo. */
 async function userNames(ids: number[]): Promise<Map<number, string>> {
@@ -98,6 +110,7 @@ export async function sharesByOwner(
       targetId: Number(r.id_target),
       targetName: names.get(Number(r.id_target)) ?? "",
       path: clean(r.path),
+      local: isLocalPath(clean(r.path)),
       created: r.created ?? null,
     }));
   } catch {
@@ -110,8 +123,8 @@ export async function sharesByOwner(
 export async function sharesByTarget(targetId: number): Promise<SharedFolder[]> {
   if (!targetId) return [];
   try {
-    const rows = await q<{ id_owner: number; path: string }>(
-      `SELECT id_owner, path FROM user_drive_shares
+    const rows = await q<{ id: number; id_owner: number; path: string }>(
+      `SELECT id, id_owner, path FROM user_drive_shares
         WHERE active = 1 AND id_target = ?
         ORDER BY path ASC, id ASC`,
       [targetId]
@@ -121,7 +134,12 @@ export async function sharesByTarget(targetId: number): Promise<SharedFolder[]> 
     for (const r of rows) {
       const p = clean(r.path);
       if (!p) continue;
-      const entry = byPath.get(p) ?? { path: p, owners: [] };
+      const entry = byPath.get(p) ?? {
+        shareId: Number(r.id),
+        path: p,
+        local: isLocalPath(p),
+        owners: [],
+      };
       const ownerId = Number(r.id_owner);
       if (!entry.owners.some((o) => o.id === ownerId)) {
         entry.owners.push({ id: ownerId, name: names.get(ownerId) ?? "" });
@@ -143,7 +161,7 @@ export async function targetConflict(
   const target = clean(path);
   if (!target || !targetId) return null;
   for (const f of await sharesByTarget(targetId)) {
-    if (drivePathsOverlap(target, f.path)) return f.path;
+    if (pathsOverlap(target, f.path)) return f.path;
   }
   return null;
 }
@@ -156,7 +174,7 @@ export async function ownerConflict(
   const target = clean(path);
   if (!target || !ownerId) return null;
   for (const s of await sharesByOwner(ownerId)) {
-    if (drivePathsOverlap(target, s.path)) return s.path;
+    if (pathsOverlap(target, s.path)) return s.path;
   }
   return null;
 }

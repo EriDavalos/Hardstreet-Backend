@@ -31,6 +31,62 @@ export function normalizeDrivePath(path: unknown): string {
     .join("/");
 }
 
+/**
+ * ¿[path] es una ruta LOCAL absoluta de la computadora del usuario?
+ * ("C:\\Fotos", "D:/Eventos", "/home/ana/fotos", "\\\\NAS\\shares").
+ *
+ * El módulo "Archivos compartidos" permite compartir una CARPETA LOCAL: esas
+ * rutas NO viven dentro del Drive del servidor, así que se normalizan distinto
+ * (conservando su raíz) y se sirven con los endpoints /api/local/*.
+ */
+export function isLocalPath(path: unknown): boolean {
+  const s = String(path ?? "").trim();
+  if (!s) return false;
+  return /^[A-Za-z]:[\\/]/.test(s) || s.startsWith("/") || s.startsWith("\\\\");
+}
+
+/**
+ * Normaliza una ruta LOCAL conservando su raíz: separador '/', sin '.' ni
+ * '..' y sin barras repetidas. `C:\\Fotos\\` → `C:/Fotos`; `/home/ana//x` →
+ * `/home/ana/x`. Devuelve '' si no queda nada.
+ */
+export function normalizeLocalPath(path: unknown): string {
+  const s = String(path ?? "").trim().replace(/\\/g, "/");
+  if (!s) return "";
+  const drive = /^([A-Za-z]):/.exec(s);
+  const rest = s.replace(/^([A-Za-z]:)?\/+/, "");
+  const parts = rest
+    .split("/")
+    .map((x) => x.trim())
+    .filter((x) => x && x !== "." && x !== "..");
+  const joined = parts.join("/");
+  if (drive) return joined ? `${drive[1].toUpperCase()}:/${joined}` : `${drive[1].toUpperCase()}:/`;
+  return joined ? `/${joined}` : "/";
+}
+
+/** Normaliza una ruta que puede ser del Drive o local. */
+export function normalizeSharePath(path: unknown): string {
+  return isLocalPath(path) ? normalizeLocalPath(path) : normalizeDrivePath(path);
+}
+
+/** ¿Dos rutas LOCALES son la misma o una contiene a la otra? (sin distinguir
+ * mayúsculas: Windows no las distingue). */
+export function localPathsOverlap(a: string, b: string): boolean {
+  const x = normalizeLocalPath(a).toLowerCase();
+  const y = normalizeLocalPath(b).toLowerCase();
+  if (!x || !y) return false;
+  if (x === y) return true;
+  const xs = x.endsWith("/") ? x : `${x}/`;
+  const ys = y.endsWith("/") ? y : `${y}/`;
+  return xs.startsWith(ys) || ys.startsWith(xs);
+}
+
+/** ¿Se solapan dos rutas cualesquiera (del Drive o locales)? */
+export function pathsOverlap(a: string, b: string): boolean {
+  if (isLocalPath(a) && isLocalPath(b)) return localPathsOverlap(a, b);
+  return drivePathsOverlap(a, b);
+}
+
 /** ¿[a] y [b] son la misma carpeta o una está dentro de la otra? */
 export function drivePathsOverlap(a: string, b: string): boolean {
   const x = normalizeDrivePath(a);
