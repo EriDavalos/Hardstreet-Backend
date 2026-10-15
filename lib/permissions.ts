@@ -112,6 +112,67 @@ export async function requirePermission(
 }
 
 /**
+ * Sesión válida con su rol (o null, habiendo respondido 401).
+ * Rutas que reparten el mismo endpoint entre VARIOS módulos (el diseño del
+ * sitio lo leen "Paquetes" y "Sitio web") necesitan resolver la sesión una vez
+ * y probar varios permisos sin responder todavía.
+ */
+async function authenticate(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<{ sub: number; role: string; roleId: number } | null> {
+  const apikey = req.headers["apikey"];
+  if (apikey && !req.headers.authorization) {
+    req.headers.authorization = `Bearer ${String(apikey).trim()}`;
+  }
+
+  const session = await getSession(req);
+  if (!session) {
+    fail(res, 401, "No autenticado", "Inicia sesión para continuar");
+    return null;
+  }
+
+  const roleId = await userRoleId(session.sub);
+  if (!roleId) {
+    fail(res, 401, "Sesión inválida", "Tu usuario ya no existe o está inactivo");
+    return null;
+  }
+
+  return { sub: session.sub, role: session.role, roleId };
+}
+
+/**
+ * Exige UNO de VARIOS permisos: basta con cumplir cualquiera (admin siempre
+ * pasa). Si ninguno se cumple, responde 403 y devuelve null.
+ */
+export async function requireAnyOfPermissions(
+  req: NextApiRequest,
+  res: NextApiResponse,
+  checks: { module: string; action: PermissionAction }[]
+): Promise<{ sub: number; role: string } | null> {
+  const me = await authenticate(req, res);
+  if (!me) return null;
+  if (await userIsAdmin(me.roleId)) return { sub: me.sub, role: ADMIN_ROLE };
+
+  for (const check of checks) {
+    if (await roleCan(me.roleId, check.module, check.action)) {
+      return { sub: me.sub, role: me.role };
+    }
+  }
+
+  const missing = checks
+    .map((c) => `"${c.action}" en "${c.module}"`)
+    .join(" o ");
+  fail(
+    res,
+    403,
+    "No tienes permiso para realizar esta acción",
+    `A tu rol le falta el permiso ${missing}`
+  );
+  return null;
+}
+
+/**
  * Igual que [requirePermission] pero solo exige que el usuario exista y
  * tenga AL MENOS un permiso sobre el módulo (para "ver el módulo").
  */
