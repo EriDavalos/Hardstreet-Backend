@@ -8,6 +8,7 @@ import {
   packageDrivePathsByIds,
   userDrivePaths,
 } from "../../../lib/drive-paths";
+import { sharesByTarget } from "../../../lib/user-shares";
 
 // ==================================================================
 // Carpetas COMPARTIDAS con el usuario logueado  ->  /api/my/drive
@@ -82,6 +83,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (clean === "") continue;
       if (paths.some((p) => p.path === clean)) continue;
       paths.push({ packageId: 0, packageName: "Compartido contigo", path: clean });
+    }
+
+    // Carpetas que OTROS USUARIOS me compartieron desde "Archivos
+    // compartidos" (user_drive_shares): también se ven en mi Drive, junto a
+    // las de mis paquetes. El nombre del que comparte es el de la carpeta.
+    for (const folder of await sharesByTarget(Number(session.sub))) {
+      const clean = normalizeDrivePath(folder.path);
+      if (clean === "") continue;
+      if (paths.some((p) => p.path === clean)) continue;
+      const who = folder.owners.map((o) => o.name).filter(Boolean).join(", ");
+      paths.push({
+        packageId: 0,
+        packageName: who ? `Compartido por ${who}` : "Compartido contigo",
+        path: clean,
+      });
     }
 
     const role = String(session.role || "");
