@@ -190,6 +190,10 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
           ),
           shareFolder: share?.folder ?? "",
           shareLink: share?.link ?? "",
+          // Qué opciones le salen al cliente para ESTE servicio (las enciende
+          // el estudio: elegir fotos y abrir carpeta).
+          pickPhotos: share?.pickPhotos ?? false,
+          showFolder: share?.showFolder ?? true,
           items: share?.items ?? 0,
         };
       });

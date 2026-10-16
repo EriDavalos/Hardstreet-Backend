@@ -99,6 +99,17 @@ function asKind(raw: unknown): MovementKind | null {
     : null;
 }
 
+/**
+ * Interruptor que llega del panel (`true`/`1`/`"1"`). Si no viene, [fallback]:
+ * así un panel viejo que no manda la opción no la apaga sin querer.
+ */
+function asOption(raw: unknown, fallback: boolean): boolean {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw === "boolean") return raw;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n === 1 : fallback;
+}
+
 /** Recalcula purchased_packages.paid sumando los abonos activos. */
 async function recomputePaid(
   conn: PoolConnection,
@@ -452,9 +463,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             icon: String(s.service_icon || ""),
             url: String(s.service_url || ""),
             // Opciones de compartir del SERVICIO (carpeta y liga propias del
-            // servicio del paquete) y cuántos elementos marcó el cliente.
+            // servicio del paquete), QUÉ le sale al cliente (elegir fotos y
+            // abrir carpeta) y cuántos elementos marcó.
             shareFolder: share?.folder ?? "",
             shareLink: share?.link ?? "",
+            pickPhotos: share?.pickPhotos ?? false,
+            showFolder: share?.showFolder ?? true,
             items: share?.items ?? 0,
             description: String(s.description || ""),
             status: String(s.status_name || "Pendiente"),
@@ -916,6 +930,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     // liga (si las hay). Junto con la selección que marca el cliente forman
     // las opciones de compartir del servicio (migración
     // purchased_packages_services_shares).
+    //
+    // `pickPhotos` y `showFolder` deciden QUÉ le sale al cliente en «Mi
+    // paquete»: elegir fotos (antes salía en TODOS los servicios) y abrir la
+    // carpeta. Los enciende el estudio servicio por servicio.
     if (actionName === "actualizar-servicio-share") {
       const serviceId = Number(b.serviceId || 0);
       if (!serviceId) {
@@ -924,6 +942,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       const folder = norm(b.folder);
       const link = norm(b.link);
+      const pickPhotos = asOption(b.pickPhotos, false);
+      const showFolder = asOption(b.showFolder, true);
       const exists = await q(
         `SELECT id FROM purchased_packages_services
           WHERE id = ? AND active = 1`,
@@ -934,7 +954,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       try {
-        await saveServiceShare(serviceId, folder, link);
+        await saveServiceShare(serviceId, folder, link, pickPhotos, showFolder);
       } catch {
         fail(
           res,
@@ -952,11 +972,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         entity: "servicio-paquete-share",
         entityId: serviceId,
         description: "Opciones de compartir del servicio actualizadas exitosamente",
-        details: { serviceId, folder, link },
+        details: { serviceId, folder, link, pickPhotos, showFolder },
         req,
       });
       ok(res, "Opciones de compartir actualizadas exitosamente", {
-        item: { serviceId, folder, link },
+        item: { serviceId, folder, link, pickPhotos, showFolder },
       });
       return;
     }
