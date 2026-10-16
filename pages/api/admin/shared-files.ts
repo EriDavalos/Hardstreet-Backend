@@ -176,6 +176,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           );
           return;
         }
+        // NADA se guardó: decirlo. Antes esta respuesta salía como "Sin
+        // cambios" (201) y el panel daba la carpeta por compartida, pero el
+        // otro usuario recibía "no existe o ya no está compartida".
+        if (out.shared === 0 && out.already === 0) {
+          fail(
+            res,
+            out.errors.length ? 500 : 409,
+            "La carpeta no quedó compartida",
+            out.errors[0] ||
+              "No se guardó ningún destinatario: revisa que los usuarios sigan activos"
+          );
+          return;
+        }
 
         const parts: string[] = [];
         if (out.shared) {
@@ -199,9 +212,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               : `${out.conflicts.length} omitidos por solaparse`
           );
         }
+        if (out.errors.length) {
+          // Algunos quedaron y otros no: se dice, para que no haya sorpresas
+          // (el destinatario que falló no vería la carpeta).
+          parts.push(
+            out.errors.length === 1
+              ? `1 no se pudo guardar (${out.errors[0]})`
+              : `${out.errors.length} no se pudieron guardar`
+          );
+        }
         return created(res, parts.join(" · ") || "Sin cambios", {
           item: { path, shared: out.shared, already: out.already },
           conflicts: out.conflicts,
+          errors: out.errors,
         });
       }
 

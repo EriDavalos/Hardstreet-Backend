@@ -31,13 +31,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     return;
   }
 
-  // Caché corta en el borde: el diseño cambia muy de vez en cuando y la
-  // portada se pide mucho. `stale-while-revalidate` evita que un visitante
-  // espere por él.
-  res.setHeader(
-    "Cache-Control",
-    "public, max-age=30, s-maxage=60, stale-while-revalidate=300"
-  );
+  // SIN caché: el panel guarda y la web tiene que mostrar el cambio AL
+  // INSTANTE (es lo que promete el módulo "Sitio web"). Antes esto se cacheaba
+  // (max-age=30 en el navegador, s-maxage=60 + stale-while-revalidate=300 en el
+  // borde) y un guardado tardaba hasta minutos en aparecer: al recargar la
+  // página se seguía viendo el contenido viejo, como si el panel no hubiera
+  // guardado. La consulta es una sola fila: no vale la pena cachearla.
+  res.setHeader("Cache-Control", "no-store, max-age=0, must-revalidate");
+  res.setHeader("Pragma", "no-cache");
 
   try {
     const rows = await q<Row>(

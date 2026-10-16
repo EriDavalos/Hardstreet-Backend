@@ -191,27 +191,61 @@ export async function alreadySharedWith(
   return mine.some((s) => s.targetId === targetId);
 }
 
+/** Resultado de compartir: cuántos quedaron, cuántos ya estaban y qué falló. */
+export interface ShareOutcome {
+  shared: number;
+  already: number;
+  conflicts: string[];
+  /**
+   * Motivos por los que NO se pudo guardar un destinatario (tabla sin migrar,
+   * usuario inexistente, la base rechazó la fila…).
+   *
+   * Sin esto, un INSERT que falla se reportaba como "Sin cambios" y el panel
+   * decía que la carpeta quedó compartida cuando en realidad NADIE recibió
+   * nada: el otro usuario veía "no existe o ya no está compartida".
+   */
+  errors: string[];
+}
+
+/** Traduce un error de guardado a algo que se pueda leer en el panel. */
+function saveErrorReason(e: unknown): string {
+  const err = e as { code?: string; message?: string };
+  const code = String(err?.code || "");
+  if (code === "ER_NO_SUCH_TABLE" || code === "ER_BAD_FIELD_ERROR") {
+    return `${code}: falta aplicar la migración de user_drive_shares`;
+  }
+  if (code === "ER_NO_REFERENCED_ROW_2") {
+    return "ER_NO_REFERENCED_ROW_2: el usuario destinatario ya no existe";
+  }
+  return `${code || "error"}: ${err?.message || "no se pudo guardar el compartido"}`;
+}
+
 /**
- * Comparte [path] con [targetIds]. Devuelve cuántos quedaron y los que ya
- * estaban (para poder decirlo en el mensaje).
+ * Comparte [path] con [targetIds]. Devuelve cuántos quedaron, los que ya
+ * estaban (para poder decirlo en el mensaje) y los que FALLARON.
  */
 export async function sharePathWith(
   ownerId: number,
   targetIds: number[],
   path: string
-): Promise<{ shared: number; already: number; conflicts: string[] }> {
+): Promise<ShareOutcome> {
   const p = clean(path);
-  if (!ownerId || !p) return { shared: 0, already: 0, conflicts: [] };
+  if (!ownerId || !p) {
+    return { shared: 0, already: 0, conflicts: [], errors: [] };
+  }
 
   // Nadie se comparte a sí mismo.
   const targets = [...new Set(targetIds.map((n) => Number(n)))].filter(
     (n) => n > 0 && n !== ownerId
   );
-  if (!targets.length) return { shared: 0, already: 0, conflicts: [] };
+  if (!targets.length) {
+    return { shared: 0, already: 0, conflicts: [], errors: [] };
+  }
 
   let shared = 0;
   let already = 0;
   const conflicts: string[] = [];
+  const errors: string[] = [];
   for (const target of targets) {
     try {
       // Ya tiene (él) una carpeta que se solapa: no se le agrega nada.
@@ -231,11 +265,13 @@ export async function sharePathWith(
         [ownerId, target, p]
       );
       shared++;
-    } catch {
-      // Sin migración (o usuario inexistente): se ignora ese destinatario.
+    } catch (e) {
+      // Se guarda el MOTIVO (en vez de ignorarlo): quien comparte tiene que
+      // saber que ese destinatario no quedó, y por qué.
+      errors.push(saveErrorReason(e));
     }
   }
-  return { shared, already, conflicts };
+  return { shared, already, conflicts, errors };
 }
 
 /** Deja de compartir [path] con [targetIds] (baja lógica). */
