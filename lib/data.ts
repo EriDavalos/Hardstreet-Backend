@@ -14,10 +14,19 @@ import {
 
 // ---------- Catalogo: categorias ----------
 export async function getCategories(): Promise<PackageCategory[]> {
-  const rows = await q<PackageCategoryRow>(
-    `SELECT id, name, icon FROM packages_categories WHERE active = 1 ORDER BY id`
-  );
-  return rows.map(mapPackageCategory);
+  try {
+    const rows = await q<PackageCategoryRow>(
+      `SELECT id, name, icon, url_image FROM packages_categories WHERE active = 1 ORDER BY id`
+    );
+    return rows.map(mapPackageCategory);
+  } catch {
+    // Migración 2026-10-16_categorias_imagen.sql aún no aplicada: el catálogo
+    // sigue funcionando (sin la foto de la categoría).
+    const rows = await q<PackageCategoryRow>(
+      `SELECT id, name, icon FROM packages_categories WHERE active = 1 ORDER BY id`
+    );
+    return rows.map(mapPackageCategory);
+  }
 }
 
 // ---------- Catalogo: tiers ----------

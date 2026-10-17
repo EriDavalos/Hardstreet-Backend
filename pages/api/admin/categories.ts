@@ -8,8 +8,8 @@ import { logActivity } from "../../../lib/activity";
 // ==================================================================
 // Catálogo de CATEGORÍAS de paquetes (parte del módulo "Paquetes")
 //   -> /api/admin/categories
-//   GET            lista las categorías activas (id, name, icon)
-//   POST           crea categoría { name, icon? }
+//   GET            lista las categorías activas (id, name, icon, urlImage)
+//   POST           crea categoría { name, icon?, urlImage? }
 //   PUT/PATCH      actualiza { id, ...campos }
 //   DELETE         baja lógica (?id=N) — active = 0
 //
@@ -28,6 +28,7 @@ type Row = {
   id: number;
   name: string | null;
   icon: string | null;
+  url_image?: string | null;
 };
 
 function map(r: Row) {
@@ -35,6 +36,9 @@ function map(r: Row) {
     id: Number(r.id),
     name: r.name || "",
     icon: r.icon || "",
+    // Foto que representa la categoría en la galería del panel (puede venir
+    // del Drive o de un enlace). Vacía = todavía no tiene.
+    urlImage: r.url_image || "",
   };
 }
 
@@ -57,12 +61,24 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   try {
     if (req.method === "GET") {
-      const rows = await q<Row>(
-        `SELECT id, name, icon
-           FROM packages_categories
-          WHERE active = 1
-          ORDER BY id ASC`
-      );
+      // La foto es opcional: si la migración de la columna todavía no se
+      // aplicó, se listan las categorías igual (sin foto).
+      let rows: Row[];
+      try {
+        rows = await q<Row>(
+          `SELECT id, name, icon, url_image
+             FROM packages_categories
+            WHERE active = 1
+            ORDER BY id ASC`
+        );
+      } catch {
+        rows = await q<Row>(
+          `SELECT id, name, icon
+             FROM packages_categories
+            WHERE active = 1
+            ORDER BY id ASC`
+        );
+      }
       res.status(200).json({ categories: rows.map(map) });
       return;
     }
@@ -127,6 +143,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const b = (req.body || {}) as Record<string, unknown>;
     const name = norm(b.name);
     const icon = norm(b.icon);
+    // Acepta las dos formas (`urlImage` es como la manda el panel).
+    const urlImage = norm(b.urlImage) || norm(b.url_image);
 
     if (req.method === "POST") {
       if (!name) {
@@ -151,10 +169,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const r = await exec(
-        `INSERT INTO packages_categories (name, icon) VALUES (?, ?)`,
-        [name, icon || null]
+        `INSERT INTO packages_categories (name, icon, url_image) VALUES (?, ?, ?)`,
+        [name, icon || null, urlImage || null]
       );
-      const item = { id: Number(r.insertId), name, icon };
+      const item = { id: Number(r.insertId), name, icon, urlImage };
       await logActivity({
         userId: me.sub,
         module: "packages",
@@ -195,6 +213,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       fields.push("`icon` = ?");
       params.push(icon || null);
     }
+    if (b.urlImage !== undefined || b.url_image !== undefined) {
+      fields.push("`url_image` = ?");
+      params.push(urlImage || null);
+    }
     if (!fields.length) {
       fail(res, 400, "Nada que actualizar", "No enviaste ningún campo de la categoría");
       return;
@@ -212,7 +234,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       );
       return;
     }
-    const item = { id, name, icon };
+    const item = { id, name, icon, urlImage };
     await logActivity({
       userId: me.sub,
       module: "packages",

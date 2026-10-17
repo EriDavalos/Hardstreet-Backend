@@ -15,7 +15,10 @@ export interface ServiceRow {
   url?: string | null;
 }
 export interface TierRow { id: number; name: string | null; tier: number | null; }
-export interface PackageCategoryRow { id: number; name: string | null; icon: string | null; }
+export interface PackageCategoryRow {
+  id: number; name: string | null; icon: string | null;
+  url_image?: string | null;
+}
 export interface StatusRow { id: number; name: string | null; }
 export interface PackageRow {
   id: number; name: string | null; subtitle: string | null; description: string | null;
@@ -44,7 +47,10 @@ export interface RoleRow { id: number; name: string | null; }
 
 // ---------- Model types (camelCase, para el frontend) ----------
 export interface Tier { id: number; name: string; tier: number; }
-export interface PackageCategory { id: number; name: string; icon: string; }
+export interface PackageCategory {
+  id: number; name: string; icon: string;
+  urlImage: string;   // foto que representa la categoría (galería del panel)
+}
 export interface Status { id: number; name: string; }
 export interface Service {
   id: number;
@@ -118,7 +124,12 @@ export function mapTier(r: TierRow): Tier {
 }
 
 export function mapPackageCategory(r: PackageCategoryRow): PackageCategory {
-  return { id: r.id, name: str(r.name), icon: str(r.icon) };
+  return {
+    id: r.id,
+    name: str(r.name),
+    icon: str(r.icon),
+    urlImage: str(r.url_image),
+  };
 }
 
 export function mapStatus(r: StatusRow): Status {
@@ -151,7 +162,7 @@ export function mapPackage(
     tier: tier ? mapTier(tier) : { id: 0, name: "Basic", tier: 3 },
     packageCategory: category
       ? mapPackageCategory(category)
-      : { id: 0, name: "General", icon: "" },
+      : { id: 0, name: "General", icon: "", urlImage: "" },
     isExtern: Number(r.is_extern) === 1,
     urlImage: str(r.url_image),
     services: services.map(mapService),
@@ -193,7 +204,7 @@ export function mapPurchasedPackage(
       id: 0, name: "", subtitle: "", description: "",
       price: num(r.price), currency: str(r.currency) || "MXN",
       tier: { id: 0, name: "Basic", tier: 3 },
-      packageCategory: { id: 0, name: "General", icon: "" },
+      packageCategory: { id: 0, name: "General", icon: "", urlImage: "" },
       isExtern: false, urlImage: "", services: [],
     },
     services,
