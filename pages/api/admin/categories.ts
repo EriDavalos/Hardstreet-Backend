@@ -6,7 +6,7 @@ import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
-// Catálogo de CATEGORÍAS de paquetes (parte del módulo "Paquetes")
+// Catálogo de CATEGORÍAS de paquetes (módulo "Categorías")
 //   -> /api/admin/categories
 //   GET            lista las categorías activas (id, name, icon, urlImage)
 //   POST           crea categoría { name, icon?, urlImage? }
@@ -17,12 +17,38 @@ import { logActivity } from "../../../lib/activity";
 // para filtrarlos (`packages_categories`). El panel las lee por
 // /api/categories (público, solo lectura); aquí es donde se administran.
 //
+// PERMISOS: módulo "Categorías" con ver/crear/editar/eliminar (migración
+// 2026-10-16_categorias_permisos.sql). Antes se pedía el permiso de Paquetes.
+//
+// BORRAR una categoría NO deja paquetes huérfanos: los suyos pasan a
+// "General" (se crea si no existe). Esa es la categoría de destino y por eso
+// no se puede eliminar.
+//
 // El `icon` es opcional y hoy está RESERVADO: el panel y la web dibujan el
 // icono de una categoría a partir de su NOMBRE (Boda 💍, XV Años 👑…), así que
 // una categoría creada solo con el nombre ya se ve bien en los dos lados.
 // ==================================================================
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+
+/// Categoría que recibe los paquetes de una categoría eliminada.
+const GENERAL_CATEGORY = "General";
+
+/** Id de "General", creándola si aún no existe (idempotente). */
+async function ensureGeneralCategory(): Promise<number> {
+  const found = await q<{ id: number }>(
+    `SELECT id FROM packages_categories
+      WHERE active = 1 AND LOWER(name) = LOWER(?)
+      LIMIT 1`,
+    [GENERAL_CATEGORY]
+  );
+  if (found.length) return Number(found[0].id);
+  const r = await exec(
+    `INSERT INTO packages_categories (name) VALUES (?)`,
+    [GENERAL_CATEGORY]
+  );
+  return Number(r.insertId);
+}
 
 type Row = {
   id: number;
@@ -56,7 +82,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  const me = await requirePermission(req, res, "Paquetes", action);
+  const me = await requirePermission(req, res, "Categorías", action);
   if (!me) return;
 
   try {
@@ -94,24 +120,39 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
         return;
       }
-      // Una categoría con paquetes NO se da de baja: dejaría paquetes sin
-      // categoría sin que nadie se entere.
-      const used = await q<{ n: number }>(
-        `SELECT COUNT(*) AS n
-           FROM packages
-          WHERE id_package_category = ? AND active = 1`,
+      const row = await q<{ id: number; name: string | null }>(
+        `SELECT id, name FROM packages_categories WHERE id = ? AND active = 1 LIMIT 1`,
         [id]
       );
-      const total = Number(used[0]?.n || 0);
-      if (total > 0) {
+      if (!row.length) {
         fail(
           res,
-          409,
-          "La categoría tiene paquetes",
-          `Tiene ${total} paquete(s): cámbialos de categoría antes de eliminarla`
+          404,
+          "Categoría no encontrada",
+          `No hay una categoría activa con id ${id}`
         );
         return;
       }
+      // "General" es el destino de los paquetes cuando se borra su categoría:
+      // borrarla dejaría a los demás sin dónde caer.
+      if (GENERAL_CATEGORY.toLowerCase() === String(row[0].name || "").trim().toLowerCase()) {
+        fail(
+          res,
+          409,
+          "Esa categoría no se puede eliminar",
+          `"${GENERAL_CATEGORY}" es donde caen los paquetes cuando se elimina su categoría`
+        );
+        return;
+      }
+      // Los paquetes de la categoría NO se quedan sin categoría: pasan a
+      // "General" (que se crea si todavía no existe).
+      const generalId = await ensureGeneralCategory();
+      const moved = await exec(
+        `UPDATE packages
+            SET id_package_category = ?
+          WHERE id_package_category = ? AND active = 1`,
+        [generalId, id]
+      );
       const r = await exec(
         `UPDATE packages_categories SET active = 0 WHERE id = ?`,
         [id]
@@ -125,18 +166,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
         return;
       }
+      const movedCount = Number(moved.affectedRows || 0);
       await logActivity({
         userId: me.sub,
-        module: "packages",
-        moduleName: "Paquetes",
+        module: "categories",
+        moduleName: "Categorías",
         action: "delete",
         entity: "categoría",
         entityId: id,
         description: "Categoría eliminada exitosamente",
-        details: { id },
+        details: { id, name: row[0].name || "", movedToGeneral: movedCount },
         req,
       });
-      ok(res, "Categoría eliminada exitosamente", { item: { id } });
+      ok(res, "Categoría eliminada exitosamente", {
+        item: { id, movedToGeneral: movedCount, generalId },
+      });
       return;
     }
 
