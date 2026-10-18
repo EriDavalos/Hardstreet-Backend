@@ -4,6 +4,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // Catálogo de SERVICIOS (módulo "Servicios") -> /api/admin/services
@@ -57,13 +58,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   try {
     if (req.method === "GET") {
+      // Paginado como el resto de los módulos: ?page=1&limit=30.
+      const p = readPaging(req);
+      const countRows = await q<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM services WHERE active = 1`
+      );
       let rows: Row[];
       try {
         rows = await q<Row>(
           `SELECT id, name, description, icon, url
              FROM services
             WHERE active = 1
-            ORDER BY id ASC`
+            ORDER BY id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
       } catch {
         // Migración 2026-10-13_services_url.sql aún no aplicada.
@@ -71,10 +78,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `SELECT id, name, description, icon
              FROM services
             WHERE active = 1
-            ORDER BY id ASC`
+            ORDER BY id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
       }
-      res.status(200).json({ services: rows.map(map) });
+      res.status(200).json({
+        services: rows.map(map),
+        ...pageMeta(countRows[0]?.n, p),
+      });
       return;
     }
 

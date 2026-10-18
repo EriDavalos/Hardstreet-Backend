@@ -4,6 +4,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // Agendas de eventos por paquete comprado  ->  /api/admin/agendas
@@ -90,6 +91,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           params.push(to);
         }
 
+        // Paginado: ?page=1&limit=30 además de los filtros de arriba.
+        const p = readPaging(req);
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM schedules a WHERE ${where.join(" AND ")}`,
+          params
+        );
         const rows = await q<{
           id: number;
           id_purchased_package: number | null;
@@ -120,11 +127,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              LEFT JOIN purchased_packages pp ON pp.id = a.id_purchased_package
              LEFT JOIN services s ON s.id = a.id_service
             WHERE ${where.join(" AND ")}
-            ORDER BY a.event_date ASC, a.id ASC`,
+            ORDER BY a.event_date ASC, a.id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
           params
         );
 
         res.status(200).json({
+          ...pageMeta(countRows[0]?.n, p),
           agendas: rows.map((r) => ({
             id: r.id,
             purchasedPackageId: r.id_purchased_package,

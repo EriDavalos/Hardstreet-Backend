@@ -5,6 +5,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { q, exec, transaccion } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // Catálogo de PAQUETES (solo con permiso sobre el módulo "paquetes")
@@ -152,6 +153,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     switch (req.method) {
       case "GET": {
+        // Paginado: ?page=1&limit=30 (o ?all=1 para desplegables/totales).
+        const p = readPaging(req);
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM packages WHERE active = 1`
+        );
         const rows = await q<{
           id: number;
           name: string | null;
@@ -175,16 +181,23 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              LEFT JOIN tiers t ON t.id = p.id_tier
              LEFT JOIN packages_categories pc ON pc.id = p.id_package_category
             WHERE p.active = 1
-            ORDER BY p.id ASC`
+            ORDER BY p.id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
-        const svcRows = await q<{ id_package: number; id: number; name: string | null }>(
-          `SELECT ps.id_package, s.id, s.name
-             FROM packages_services ps
-             JOIN services s ON s.id = ps.id_service AND s.active = 1
-            WHERE ps.active = 1
-            ORDER BY ps.id ASC`
-        );
+        // Solo los servicios de los paquetes de ESTA página.
+        const pageIds = rows.map((r) => r.id);
+        const svcRows = pageIds.length
+          ? await q<{ id_package: number; id: number; name: string | null }>(
+              `SELECT ps.id_package, s.id, s.name
+                 FROM packages_services ps
+                 JOIN services s ON s.id = ps.id_service AND s.active = 1
+                WHERE ps.active = 1 AND ps.id_package IN (?)
+                ORDER BY ps.id ASC`,
+              [pageIds]
+            )
+          : [];
         res.status(200).json({
+          ...pageMeta(countRows[0]?.n, p),
           packages: rows.map((p) => ({
             id: p.id,
             name: p.name || "",

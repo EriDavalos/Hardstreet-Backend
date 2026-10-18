@@ -7,6 +7,7 @@ import { q, exec } from "../../../lib/db";
 import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // Clientes (solo rol Admin)  ->  /api/admin/clients
@@ -75,6 +76,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     switch (req.method) {
       case "GET": {
+        // Paginado: ?page=1&limit=30 (30 de fábrica).
+        const p = readPaging(req);
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM users u
+            WHERE u.active = 1 AND u.id_role = ?`,
+          [roleId]
+        );
         const rows = await q<UserRow & { role_name: string | null; packages_count: number }>(
           `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name,
                   (SELECT COUNT(*) FROM users_packages up
@@ -83,7 +91,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              FROM users u
              LEFT JOIN roles r ON r.id = u.id_role
             WHERE u.active = 1 AND u.id_role = ?
-            ORDER BY u.id ASC`,
+            ORDER BY u.id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
           [roleId]
         );
         res.status(200).json({
@@ -91,6 +100,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             ...mapUser(u, { id: u.id_role || 0, name: u.role_name }),
             packagesCount: Number(u.packages_count || 0),
           })),
+          ...pageMeta(countRows[0]?.n, p),
         });
         return;
       }

@@ -6,6 +6,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // CRUD de usuarios (solo rol Admin)  ->  /api/admin/users
@@ -57,23 +58,31 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       case "GET": {
         // EXCLUYE clientes: los usuarios con rol "Cliente"/"Client" viven en
         // el módulo Clientes (/api/admin/clients), no aquí.
-        const rows = await q<UserRow & { role_name: string | null }>(
-          `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
-             FROM users u
-             LEFT JOIN roles r ON r.id = u.id_role
-            WHERE u.active = 1
+        // Paginado: ?page=1&limit=30.
+        const p = readPaging(req);
+        const where = `u.active = 1
               AND u.id NOT IN (
                 SELECT u2.id FROM users u2
                 JOIN roles r2 ON r2.id = u2.id_role AND r2.active = 1
                  WHERE LOWER(r2.name) IN ('cliente', 'client')
-              )
-            ORDER BY u.id ASC`
+              )`;
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM users u WHERE ${where}`
+        );
+        const rows = await q<UserRow & { role_name: string | null }>(
+          `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
+             FROM users u
+             LEFT JOIN roles r ON r.id = u.id_role
+            WHERE ${where}
+            ORDER BY u.id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
         res.status(200).json({
           users: rows.map((u) => ({
             ...mapUser(u, { id: u.id_role || 0, name: u.role_name }),
             roleId: u.id_role || null,
           })),
+          ...pageMeta(countRows[0]?.n, p),
         });
         return;
       }

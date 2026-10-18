@@ -4,6 +4,7 @@ import { q, exec, transaccion } from "../../../lib/db";
 import { requirePermission } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // CRUD de roles + asignacion de permisos (solo rol Admin)
@@ -106,14 +107,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     switch (req.method) {
       case "GET": {
+        // Paginado: ?page=1&limit=30. Los permisos se piden SOLO de los roles
+        // que van en esta página (antes se traían todos y se filtraban aquí).
+        const p = readPaging(req);
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM roles WHERE active = 1`
+        );
         const roles = await q<{ id: number; name: string | null }>(
-          `SELECT id, name FROM roles WHERE active = 1 ORDER BY id ASC`
+          `SELECT id, name FROM roles WHERE active = 1 ORDER BY id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
-        const perms = await q<{ id_role: number; id_modules: number; id_permission: number }>(
-          `SELECT id_role, id_modules, id_permission
-             FROM permissions_roles
-            WHERE active = 1 AND id_role IN (SELECT id FROM roles WHERE active = 1)`
-        );
+        const ids = roles.map((r) => r.id);
+        const perms = ids.length
+          ? await q<{ id_role: number; id_modules: number; id_permission: number }>(
+              `SELECT id_role, id_modules, id_permission
+                 FROM permissions_roles
+                WHERE active = 1 AND id_role IN (?)`,
+              [ids]
+            )
+          : [];
         res.status(200).json({
           roles: roles.map((r) => ({
             id: r.id,
@@ -122,6 +134,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               .filter((p) => p.id_role === r.id)
               .map((p) => ({ moduleId: p.id_modules, permissionId: p.id_permission })),
           })),
+          ...pageMeta(countRows[0]?.n, p),
         });
         return;
       }

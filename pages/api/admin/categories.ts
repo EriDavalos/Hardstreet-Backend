@@ -4,6 +4,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { readPaging, pageMeta } from "../../../lib/pagination";
 
 // ==================================================================
 // Catálogo de CATEGORÍAS de paquetes (módulo "Categorías")
@@ -87,6 +88,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   try {
     if (req.method === "GET") {
+      // Paginado: ?page=1&limit=30 (igual que los demás módulos).
+      const p = readPaging(req);
+      const countRows = await q<{ n: number }>(
+        `SELECT COUNT(*) AS n FROM packages_categories WHERE active = 1`
+      );
       // La foto es opcional: si la migración de la columna todavía no se
       // aplicó, se listan las categorías igual (sin foto).
       let rows: Row[];
@@ -95,17 +101,22 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `SELECT id, name, icon, url_image
              FROM packages_categories
             WHERE active = 1
-            ORDER BY id ASC`
+            ORDER BY id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
       } catch {
         rows = await q<Row>(
           `SELECT id, name, icon
              FROM packages_categories
             WHERE active = 1
-            ORDER BY id ASC`
+            ORDER BY id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`
         );
       }
-      res.status(200).json({ categories: rows.map(map) });
+      res.status(200).json({
+        categories: rows.map(map),
+        ...pageMeta(countRows[0]?.n, p),
+      });
       return;
     }
 
