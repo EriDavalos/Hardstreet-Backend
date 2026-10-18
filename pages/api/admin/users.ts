@@ -2,7 +2,11 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import bcrypt from "bcryptjs";
 import { withCors } from "../../../lib/cors";
 import { q, exec } from "../../../lib/db";
-import { requirePermission } from "../../../lib/permissions";
+import {
+  requirePermission,
+  userIsAdmin,
+  userRoleId,
+} from "../../../lib/permissions";
 import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
@@ -53,35 +57,104 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "usuarios", action);
   if (!me) return;
 
+  // REGLA DEL ROL MÁS ALTO: la cuenta Admin no se toca ni se ve desde otros
+  // roles. Solo un Admin puede listarla, editarla o eliminarla.
+  const requesterIsAdmin = await userIsAdmin(await userRoleId(me.sub));
+
+  /** ¿El usuario [id] es una cuenta con rol Admin? */
+  async function targetIsAdmin(id: number): Promise<boolean> {
+    return userIsAdmin(await userRoleId(id));
+  }
+
   try {
     switch (req.method) {
       case "GET": {
         // EXCLUYE clientes: los usuarios con rol "Cliente"/"Client" viven en
         // el módulo Clientes (/api/admin/clients), no aquí.
-        // Paginado: ?page=1&limit=30.
+        //
+        // PAGINADO EN EL SERVIDOR: la app manda ?page=1&limit=30 y recibe SOLO
+        // esa página + `total`/`pages`. El buscador (`q`) y el filtro por rol
+        // (`role`) también se resuelven aquí, así el panel no se trae la tabla
+        // completa para filtrar en memoria.
         const p = readPaging(req);
-        const where = `u.active = 1
-              AND u.id NOT IN (
-                SELECT u2.id FROM users u2
-                JOIN roles r2 ON r2.id = u2.id_role AND r2.active = 1
-                 WHERE LOWER(r2.name) IN ('cliente', 'client')
-              )`;
+        const search = norm(req.query.q);
+        const roleName = norm(req.query.role);
+
+        // Condiciones comunes (sin el filtro de rol): alimentan los chips.
+        const base: string[] = [
+          "u.active = 1",
+          `u.id NOT IN (
+             SELECT u2.id FROM users u2
+             JOIN roles r2 ON r2.id = u2.id_role AND r2.active = 1
+              WHERE LOWER(r2.name) IN ('cliente', 'client')
+           )`,
+        ];
+        const baseParams: unknown[] = [];
+        // Los Admin quedan OCULTOS para quien no sea Admin.
+        if (!requesterIsAdmin) {
+          base.push("(r.name IS NULL OR LOWER(r.name) <> 'admin')");
+        }
+        if (search) {
+          const like = `%${search}%`;
+          base.push(
+            "(u.name LIKE ? OR u.lastname LIKE ? OR u.email LIKE ? OR r.name LIKE ?)"
+          );
+          baseParams.push(like, like, like, like);
+        }
+
+        // El filtro elegido se suma DESPUÉS de los conteos de los chips.
+        const where = [...base];
+        const params = [...baseParams];
+        if (roleName) {
+          where.push("LOWER(r.name) = LOWER(?)");
+          params.push(roleName);
+        }
+        const sqlWhere = where.join(" AND ");
+
         const countRows = await q<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM users u WHERE ${where}`
+          `SELECT COUNT(*) AS n FROM users u
+             LEFT JOIN roles r ON r.id = u.id_role
+            WHERE ${sqlWhere}`,
+          params
+        );
+        const baseCount = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM users u
+             LEFT JOIN roles r ON r.id = u.id_role
+            WHERE ${base.join(" AND ")}`,
+          baseParams
         );
         const rows = await q<UserRow & { role_name: string | null }>(
           `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name
              FROM users u
              LEFT JOIN roles r ON r.id = u.id_role
-            WHERE ${where}
+            WHERE ${sqlWhere}
             ORDER BY u.id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          params
         );
+        // Conteo por rol para los chips del filtro (respeta el buscador).
+        const facetRows = await q<{ name: string | null; n: number }>(
+          `SELECT r.name AS name, COUNT(*) AS n
+             FROM users u
+             LEFT JOIN roles r ON r.id = u.id_role
+            WHERE ${base.join(" AND ")}
+            GROUP BY r.name
+            ORDER BY r.name ASC`,
+          baseParams
+        );
+        const roleCounts: Record<string, number> = {};
+        for (const f of facetRows) {
+          const key = (f.name || "").toString().trim();
+          if (!key) continue;
+          roleCounts[key] = Number(f.n || 0);
+        }
         res.status(200).json({
           users: rows.map((u) => ({
             ...mapUser(u, { id: u.id_role || 0, name: u.role_name }),
             roleId: u.id_role || null,
           })),
+          roleCounts,
+          allTotal: Number(baseCount[0]?.n || 0),
           ...pageMeta(countRows[0]?.n, p),
         });
         return;
@@ -104,6 +177,23 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             "Completa los tres campos para crear al usuario"
           );
           return;
+        }
+        // Crear directamente una cuenta Admin también es exclusivo del Admin:
+        // si no, cualquier rol podría saltarse la regla del rol más alto.
+        if (!requesterIsAdmin && id_role) {
+          const adminRole = await q<{ id: number }>(
+            `SELECT id FROM roles WHERE id = ? AND LOWER(name) = 'admin' AND active = 1 LIMIT 1`,
+            [id_role]
+          );
+          if (adminRole.length) {
+            fail(
+              res,
+              403,
+              "Solo un administrador puede crear otro administrador",
+              "El rol Admin es el más alto y no se asigna desde otro rol"
+            );
+            return;
+          }
         }
         const dup = await q(`SELECT id FROM users WHERE LOWER(email) = ? AND active = 1`, [email]);
         if (dup.length) {
@@ -139,6 +229,35 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (!id) {
           fail(res, 400, "Falta el id del usuario", "Indica qué usuario quieres modificar");
           return;
+        }
+        // Nadie edita una cuenta Admin salvo otro Admin (ni puede ascender a
+        // nadie a Admin si no lo es).
+        if (!requesterIsAdmin && (await targetIsAdmin(id))) {
+          fail(
+            res,
+            403,
+            "Solo un administrador puede modificar al administrador",
+            "La cuenta Admin es el rol más alto del sistema"
+          );
+          return;
+        }
+        if (!requesterIsAdmin && b.id_role !== undefined) {
+          const wanted = Number(b.id_role || 0);
+          if (wanted) {
+            const adminRole = await q<{ id: number }>(
+              `SELECT id FROM roles WHERE id = ? AND LOWER(name) = 'admin' AND active = 1 LIMIT 1`,
+              [wanted]
+            );
+            if (adminRole.length) {
+              fail(
+                res,
+                403,
+                "Solo un administrador puede dar el rol Admin",
+                "El rol Admin es el más alto y no se asigna desde otro rol"
+              );
+              return;
+            }
+          }
         }
         const fields: string[] = [];
         const params: unknown[] = [];
@@ -215,6 +334,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (id === me.sub) {
           fail(res, 400, "No puedes eliminar tu propia cuenta", "Estás intentando borrar tu sesión actual");
           return;
+        }
+        if (await targetIsAdmin(id)) {
+          if (!requesterIsAdmin) {
+            fail(
+              res,
+              403,
+              "Solo un administrador puede eliminar al administrador",
+              "La cuenta Admin es el rol más alto del sistema"
+            );
+            return;
+          }
+          // Ni siquiera un Admin puede quedarse sin ningún Admin activo.
+          const admins = await q<{ n: number }>(
+            `SELECT COUNT(*) AS n
+               FROM users u
+               JOIN roles r ON r.id = u.id_role AND r.active = 1
+              WHERE u.active = 1 AND LOWER(r.name) = 'admin'`
+          );
+          if (Number(admins[0]?.n || 0) <= 1) {
+            fail(
+              res,
+              400,
+              "No puedes eliminar al último administrador",
+              "Crea o asigna otro Admin antes de borrar esta cuenta"
+            );
+            return;
+          }
         }
         const r = await exec(`UPDATE users SET active = 0 WHERE id = ?`, [id]);
         if (!r.affectedRows) {

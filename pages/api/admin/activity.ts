@@ -68,53 +68,62 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   if (!(await requirePermission(req, res, "activity", "read"))) return;
 
   try {
-    const where: string[] = ["1 = 1"];
-    const params: unknown[] = [];
+    // Condiciones BASE (buscador, usuario, fechas, entidad): las compartes el
+    // listado y los conteos de los chips.
+    const base: string[] = ["1 = 1"];
+    const baseParams: unknown[] = [];
 
     const module = norm(req.query.module);
-    if (module) {
-      where.push("LOWER(a.`module`) = LOWER(?)");
-      params.push(module);
-    }
     const action = norm(req.query.action).toLowerCase();
-    if (action) {
-      where.push("LOWER(a.`action`) = ?");
-      params.push(action);
-    }
     const entity = norm(req.query.entity);
     if (entity) {
-      where.push("LOWER(a.entity) = LOWER(?)");
-      params.push(entity);
+      base.push("LOWER(a.entity) = LOWER(?)");
+      baseParams.push(entity);
     }
     const userId = Number(req.query.userId || 0);
     if (userId) {
-      where.push("a.id_user = ?");
-      params.push(userId);
+      base.push("a.id_user = ?");
+      baseParams.push(userId);
     }
     const from = norm(req.query.from);
     if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
-      where.push("DATE(a.created) >= ?");
-      params.push(from);
+      base.push("DATE(a.created) >= ?");
+      baseParams.push(from);
     }
     const to = norm(req.query.to);
     if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-      where.push("DATE(a.created) <= ?");
-      params.push(to);
+      base.push("DATE(a.created) <= ?");
+      baseParams.push(to);
     }
     const search = norm(req.query.q);
     if (search) {
       const like = `%${search}%`;
-      where.push(
+      base.push(
         "(a.description LIKE ? OR a.user_name LIKE ? OR a.entity LIKE ? OR a.module_name LIKE ?)"
       );
-      params.push(like, like, like, like);
+      baseParams.push(like, like, like, like);
     }
 
     const limit = Math.min(
       Math.max(Number(req.query.limit || 50) || 50, 1),
       MAX_LIMIT
     );
-    const offset = Math.max(Number(req.query.offset || 0) || 0, 0);
+    // `page` manda; se conserva `offset` para clientes viejos.
+    const rawPage = Math.max(Number(req.query.page || 0) || 0, 0);
+    const offset = rawPage
+      ? (rawPage - 1) * limit
+      : Math.max(Number(req.query.offset || 0) || 0, 0);
+
+    const where = [...base];
+    const params = [...baseParams];
+    if (module) {
+      where.push("LOWER(a.`module`) = LOWER(?)");
+      params.push(module);
+    }
+    if (action) {
+      where.push("LOWER(a.`action`) = ?");
+      params.push(action);
+    }
     const sqlWhere = where.join(" AND ");
 
     const rows = await q<Row>(
@@ -132,12 +141,50 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       `SELECT COUNT(*) AS n FROM activity_log a WHERE ${sqlWhere}`,
       params
     );
+    const total = Number(countRows[0]?.n || 0);
+
+    // Conteos para los chips: por MÓDULO (sin aplicar el filtro de módulo) y
+    // por ACCIÓN (sin aplicar el de acción). Así el panel no necesita bajar la
+    // bitácora completa para pintar los contadores.
+    const moduleRows = await q<{ name: string | null; n: number }>(
+      `SELECT a.module_name AS name, COUNT(*) AS n
+         FROM activity_log a
+        WHERE ${base.join(" AND ")}
+        GROUP BY a.module_name
+        ORDER BY a.module_name ASC`,
+      baseParams
+    );
+    const actionBase = [...base];
+    const actionParams = [...baseParams];
+    if (module) {
+      actionBase.push("LOWER(a.`module`) = LOWER(?)");
+      actionParams.push(module);
+    }
+    const actionRows = await q<{ name: string | null; n: number }>(
+      `SELECT a.\`action\` AS name, COUNT(*) AS n
+         FROM activity_log a
+        WHERE ${actionBase.join(" AND ")}
+        GROUP BY a.\`action\``,
+      actionParams
+    );
+    const toMap = (list: { name: string | null; n: number }[]) => {
+      const out: Record<string, number> = {};
+      for (const r of list) {
+        const key = (r.name || "").toString().trim();
+        if (key) out[key] = Number(r.n || 0);
+      }
+      return out;
+    };
 
     ok(res, "Bitácora cargada", {
       entries: rows.map(mapActivity),
-      total: Number(countRows[0]?.n || 0),
+      total,
       limit,
       offset,
+      page: Math.floor(offset / limit) + 1,
+      pages: Math.max(1, Math.ceil(total / limit)),
+      moduleCounts: toMap(moduleRows),
+      actionCounts: toMap(actionRows),
     });
   } catch (e) {
     console.error("[admin/activity]", e);

@@ -58,33 +58,78 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   try {
     if (req.method === "GET") {
-      // Paginado como el resto de los módulos: ?page=1&limit=30.
+      // PAGINADO EN EL SERVIDOR: ?page=1&limit=30 + buscador (`q`) y filtro
+      // por liga de Drive (`link` = con | sin). La app recibe solo la página
+      // y el total, no el catálogo entero.
       const p = readPaging(req);
-      const countRows = await q<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM services WHERE active = 1`
-      );
+      const search = norm(req.query.q);
+      const linkFilter = norm(req.query.link).toLowerCase();
+
+      const hasLink = "TRIM(COALESCE(url, '')) <> ''";
+      const base: string[] = ["active = 1"];
+      const baseParams: unknown[] = [];
+      if (search) {
+        base.push("(name LIKE ? OR description LIKE ?)");
+        const like = `%${search}%`;
+        baseParams.push(like, like);
+      }
+      const where = [...base];
+      const params = [...baseParams];
+      if (linkFilter === "con") where.push(hasLink);
+      if (linkFilter === "sin") where.push(`NOT (${hasLink})`);
+      const sqlWhere = where.join(" AND ");
+
+      let facets: { con: number; all: number } = { con: 0, all: 0 };
       let rows: Row[];
+      let total = 0;
       try {
+        const facetRows = await q<{ con: number; all: number }>(
+          `SELECT SUM(CASE WHEN ${hasLink} THEN 1 ELSE 0 END) AS con,
+                  COUNT(*) AS \`all\`
+             FROM services
+            WHERE ${base.join(" AND ")}`,
+          baseParams
+        );
+        facets = {
+          con: Number(facetRows[0]?.con || 0),
+          all: Number(facetRows[0]?.all || 0),
+        };
         rows = await q<Row>(
           `SELECT id, name, description, icon, url
              FROM services
-            WHERE active = 1
+            WHERE ${sqlWhere}
             ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          params
         );
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM services WHERE ${sqlWhere}`,
+          params
+        );
+        total = Number(countRows[0]?.n || 0);
       } catch {
-        // Migración 2026-10-13_services_url.sql aún no aplicada.
+        // Migración 2026-10-13_services_url.sql aún no aplicada: sin columna
+        // `url` no hay liga que filtrar, así que se ignora ese filtro.
+        const plainWhere = base.join(" AND ");
         rows = await q<Row>(
           `SELECT id, name, description, icon
              FROM services
-            WHERE active = 1
+            WHERE ${plainWhere}
             ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          baseParams
         );
+        const countRows = await q<{ n: number }>(
+          `SELECT COUNT(*) AS n FROM services WHERE ${plainWhere}`,
+          baseParams
+        );
+        total = Number(countRows[0]?.n || 0);
+        facets = { con: 0, all: total };
       }
       res.status(200).json({
         services: rows.map(map),
-        ...pageMeta(countRows[0]?.n, p),
+        linkCounts: { with: facets.con, without: facets.all - facets.con, all: facets.all },
+        ...pageMeta(total, p),
       });
       return;
     }

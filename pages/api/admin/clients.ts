@@ -76,30 +76,73 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     switch (req.method) {
       case "GET": {
-        // Paginado: ?page=1&limit=30 (30 de fábrica).
+        // PAGINADO EN EL SERVIDOR: ?page=1&limit=30 + buscador (`q`) y filtro
+        // por paquetes (`packages` = con | sin). La app recibe solo la página
+        // y el total, no el directorio entero.
         const p = readPaging(req);
+        const search = norm(req.query.q);
+        const pkgFilter = norm(req.query.packages).toLowerCase();
+
+        // Cuenta los paquetes ACTIVOS del cliente (misma regla que la app).
+        const pkgs =
+          "(SELECT COUNT(*) FROM users_packages up" +
+          " JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1" +
+          " WHERE up.id_user = u.id AND up.active = 1)";
+
+        const base: string[] = ["u.active = 1", "u.id_role = ?"];
+        const baseParams: unknown[] = [roleId];
+        if (search) {
+          const like = `%${search}%`;
+          base.push(
+            "(u.name LIKE ? OR u.lastname LIKE ? OR u.email LIKE ? OR u.number LIKE ?)"
+          );
+          baseParams.push(like, like, like, like);
+        }
+
+        const where = [...base];
+        const params = [...baseParams];
+        if (pkgFilter === "con") where.push(`${pkgs} > 0`);
+        if (pkgFilter === "sin") where.push(`${pkgs} = 0`);
+        const sqlWhere = where.join(" AND ");
+        const baseWhere = base.join(" AND ");
+
         const countRows = await q<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM users u
-            WHERE u.active = 1 AND u.id_role = ?`,
-          [roleId]
+          `SELECT COUNT(*) AS n FROM users u WHERE ${sqlWhere}`,
+          params
+        );
+        // Conteos para los chips + paquetes asignados (stat del módulo).
+        const facetRows = await q<{ con: number; total: number; assigned: number }>(
+          `SELECT
+              SUM(CASE WHEN ${pkgs} > 0 THEN 1 ELSE 0 END) AS con,
+              COUNT(*) AS total,
+              (SELECT COUNT(*) FROM users_packages up
+                 JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
+                 JOIN users u2 ON u2.id = up.id_user AND u2.active = 1 AND u2.id_role = ?
+                WHERE up.active = 1) AS assigned
+             FROM users u
+            WHERE ${baseWhere}`,
+          [roleId, ...baseParams]
         );
         const rows = await q<UserRow & { role_name: string | null; packages_count: number }>(
           `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name,
-                  (SELECT COUNT(*) FROM users_packages up
-                    JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
-                   WHERE up.id_user = u.id AND up.active = 1) AS packages_count
+                  ${pkgs} AS packages_count
              FROM users u
              LEFT JOIN roles r ON r.id = u.id_role
-            WHERE u.active = 1 AND u.id_role = ?
+            WHERE ${sqlWhere}
             ORDER BY u.id ASC
             LIMIT ${p.limit} OFFSET ${p.offset}`,
-          [roleId]
+          params
         );
+        const facet = facetRows[0];
+        const withPkgs = Number(facet?.con || 0);
+        const allBase = Number(facet?.total || 0);
         res.status(200).json({
           clients: rows.map((u) => ({
             ...mapUser(u, { id: u.id_role || 0, name: u.role_name }),
             packagesCount: Number(u.packages_count || 0),
           })),
+          pkgCounts: { with: withPkgs, without: allBase - withPkgs, all: allBase },
+          assignedPackages: Number(facet?.assigned || 0),
           ...pageMeta(countRows[0]?.n, p),
         });
         return;
