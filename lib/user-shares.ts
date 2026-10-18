@@ -27,6 +27,82 @@ import {
   isLocalPath,
 } from "./drive-paths";
 
+/**
+ * Qué puede hacer un DESTINATARIO en una carpeta compartida.
+ *
+ * Los decide quien COMPARTE (no el rol): la misma persona puede editar una
+ * carpeta y solo ver otra. El dueño siempre puede todo.
+ */
+export interface SharePermissions {
+  /** Ver el contenido. */
+  view: boolean;
+  /** Editar: renombrar, mover y eliminar. */
+  edit: boolean;
+  /** Crear: subir archivos y carpetas. */
+  create: boolean;
+  /** Descargar archivos y carpetas (ZIP). */
+  download: boolean;
+}
+
+/** Permisos de un compartido NUEVO: ver y descargar (como era antes). */
+export const SHARE_PERMISSIONS_DEFAULT: SharePermissions = {
+  view: true,
+  edit: false,
+  create: false,
+  download: true,
+};
+
+/** ¿[v] es un "sí"? (acepta true, 1, "1", "true"). */
+function yes(v: unknown, fallback: boolean): boolean {
+  if (v === undefined || v === null || v === "") return fallback;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  const s = String(v).trim().toLowerCase();
+  if (s === "1" || s === "true" || s === "si" || s === "sí") return true;
+  if (s === "0" || s === "false" || s === "no") return false;
+  return fallback;
+}
+
+/** Normaliza permisos que llegan de la API (objeto, booleanos o 0/1). */
+export function normalizePermissions(
+  raw: unknown,
+  fallback: SharePermissions = SHARE_PERMISSIONS_DEFAULT
+): SharePermissions {
+  const m = (raw && typeof raw === "object" ? raw : {}) as Record<
+    string,
+    unknown
+  >;
+  return {
+    view: yes(m.view ?? m.ver, fallback.view),
+    edit: yes(m.edit ?? m.editar, fallback.edit),
+    create: yes(m.create ?? m.crear, fallback.create),
+    download: yes(m.download ?? m.descargar, fallback.download),
+  };
+}
+
+/** ¿[a] y [b] conceden LO MISMO? */
+export function samePermissions(
+  a: SharePermissions,
+  b: SharePermissions
+): boolean {
+  return (
+    a.view === b.view &&
+    a.edit === b.edit &&
+    a.create === b.create &&
+    a.download === b.download
+  );
+}
+
+/** Permisos guardados en una fila (columnas ausentes = compartido viejo). */
+export function permissionsOfRow(row: Record<string, unknown>): SharePermissions {
+  return {
+    view: yes(row.can_view, true),
+    edit: yes(row.can_edit, false),
+    create: yes(row.can_create, false),
+    download: yes(row.can_download, true),
+  };
+}
+
 /** Una carpeta compartida con su dueño y con quién la recibe. */
 export interface UserShare {
   id: number;
@@ -37,6 +113,8 @@ export interface UserShare {
   path: string;
   /** ¿Es una CARPETA LOCAL de la computadora del dueño? */
   local: boolean;
+  /** Lo que puede hacer el destinatario (el dueño siempre puede todo). */
+  permissions: SharePermissions;
   created: string | null;
 }
 
@@ -49,6 +127,12 @@ export interface SharedFolder {
   /** ¿Es una CARPETA LOCAL de la computadora del que comparte? */
   local: boolean;
   owners: { id: number; name: string }[];
+  /**
+   * Lo que YO puedo hacer, sumando a todos los dueños: si uno me dio
+   * "Editar" y otro solo "Ver", la carpeta se puede editar (es el mismo
+   * contenido).
+   */
+  permissions: SharePermissions;
 }
 
 /** Normaliza una ruta del Drive o una ruta LOCAL absoluta. */
@@ -85,20 +169,30 @@ export async function sharesByOwner(
   if (!ownerId) return [];
   const target = clean(path);
   try {
-    const rows = await q<{
-      id: number;
-      id_owner: number;
-      id_target: number;
-      path: string;
-      created: string | null;
-    }>(
-      `SELECT id, id_owner, id_target, path, created
-         FROM user_drive_shares
-        WHERE active = 1 AND id_owner = ?
-          ${target ? "AND path = ?" : ""}
-        ORDER BY path ASC, id ASC`,
-      target ? [ownerId, target] : [ownerId]
-    );
+    // Las columnas de permisos pueden no existir todavía (migración
+    // pendiente): en ese caso se consulta como antes y todo queda en
+    // "ver y descargar", que es el comportamiento de siempre.
+    let rows: Record<string, unknown>[];
+    try {
+      rows = await q<Record<string, unknown>>(
+        `SELECT id, id_owner, id_target, path, created,
+                can_view, can_edit, can_create, can_download
+           FROM user_drive_shares
+          WHERE active = 1 AND id_owner = ?
+            ${target ? "AND path = ?" : ""}
+          ORDER BY path ASC, id ASC`,
+        target ? [ownerId, target] : [ownerId]
+      );
+    } catch {
+      rows = await q<Record<string, unknown>>(
+        `SELECT id, id_owner, id_target, path, created
+           FROM user_drive_shares
+          WHERE active = 1 AND id_owner = ?
+            ${target ? "AND path = ?" : ""}
+          ORDER BY path ASC, id ASC`,
+        target ? [ownerId, target] : [ownerId]
+      );
+    }
     const names = await userNames([
       ...rows.map((r) => Number(r.id_owner)),
       ...rows.map((r) => Number(r.id_target)),
@@ -111,7 +205,8 @@ export async function sharesByOwner(
       targetName: names.get(Number(r.id_target)) ?? "",
       path: clean(r.path),
       local: isLocalPath(clean(r.path)),
-      created: r.created ?? null,
+      permissions: permissionsOfRow(r),
+      created: (r.created as string | null) ?? null,
     }));
   } catch {
     // Migración pendiente: sin compartidos.
@@ -123,27 +218,48 @@ export async function sharesByOwner(
 export async function sharesByTarget(targetId: number): Promise<SharedFolder[]> {
   if (!targetId) return [];
   try {
-    const rows = await q<{ id: number; id_owner: number; path: string }>(
-      `SELECT id, id_owner, path FROM user_drive_shares
-        WHERE active = 1 AND id_target = ?
-        ORDER BY path ASC, id ASC`,
-      [targetId]
-    );
+    let rows: Record<string, unknown>[];
+    try {
+      rows = await q<Record<string, unknown>>(
+        `SELECT id, id_owner, path, can_view, can_edit, can_create, can_download
+           FROM user_drive_shares
+          WHERE active = 1 AND id_target = ?
+          ORDER BY path ASC, id ASC`,
+        [targetId]
+      );
+    } catch {
+      rows = await q<Record<string, unknown>>(
+        `SELECT id, id_owner, path FROM user_drive_shares
+          WHERE active = 1 AND id_target = ?
+          ORDER BY path ASC, id ASC`,
+        [targetId]
+      );
+    }
     const names = await userNames(rows.map((r) => Number(r.id_owner)));
     const byPath = new Map<string, SharedFolder>();
     for (const r of rows) {
       const p = clean(r.path);
       if (!p) continue;
+      const perms = permissionsOfRow(r);
       const entry = byPath.get(p) ?? {
         shareId: Number(r.id),
         path: p,
         local: isLocalPath(p),
         owners: [],
+        permissions: { ...perms },
       };
       const ownerId = Number(r.id_owner);
       if (!entry.owners.some((o) => o.id === ownerId)) {
         entry.owners.push({ id: ownerId, name: names.get(ownerId) ?? "" });
       }
+      // Union: si CUALQUIER dueño me dio un permiso, lo tengo (es el mismo
+      // contenido y no se puede partir en dos).
+      entry.permissions = {
+        view: entry.permissions.view || perms.view,
+        edit: entry.permissions.edit || perms.edit,
+        create: entry.permissions.create || perms.create,
+        download: entry.permissions.download || perms.download,
+      };
       byPath.set(p, entry);
     }
     return [...byPath.values()];
@@ -195,6 +311,8 @@ export async function alreadySharedWith(
 export interface ShareOutcome {
   shared: number;
   already: number;
+  /** Ya la tenían, pero se le cambiaron los permisos. */
+  updated: number;
   conflicts: string[];
   /**
    * Motivos por los que NO se pudo guardar un destinatario (tabla sin migrar,
@@ -227,11 +345,16 @@ function saveErrorReason(e: unknown): string {
 export async function sharePathWith(
   ownerId: number,
   targetIds: number[],
-  path: string
+  path: string,
+  /** Permisos para TODOS, o uno por destinatario. */
+  permissions:
+    | SharePermissions
+    | Map<number, SharePermissions>
+    | Record<number, SharePermissions> = SHARE_PERMISSIONS_DEFAULT
 ): Promise<ShareOutcome> {
   const p = clean(path);
   if (!ownerId || !p) {
-    return { shared: 0, already: 0, conflicts: [], errors: [] };
+    return { shared: 0, already: 0, updated: 0, conflicts: [], errors: [] };
   }
 
   // Nadie se comparte a sí mismo.
@@ -239,11 +362,28 @@ export async function sharePathWith(
     (n) => n > 0 && n !== ownerId
   );
   if (!targets.length) {
-    return { shared: 0, already: 0, conflicts: [], errors: [] };
+    return { shared: 0, already: 0, updated: 0, conflicts: [], errors: [] };
+  }
+
+  /** Permisos que tocan a [target]. */
+  const permsFor = (target: number): SharePermissions => {
+    if (permissions instanceof Map) {
+      return permissions.get(target) ?? SHARE_PERMISSIONS_DEFAULT;
+    }
+    if ("view" in permissions) return permissions as SharePermissions;
+    const rec = permissions as Record<number, SharePermissions>;
+    return rec[target] ?? SHARE_PERMISSIONS_DEFAULT;
+  };
+
+  // Lo que ya está compartido, para actualizar permisos sin duplicar.
+  const existing = new Map<number, UserShare>();
+  for (const s of await sharesByOwner(ownerId, p)) {
+    existing.set(s.targetId, s);
   }
 
   let shared = 0;
   let already = 0;
+  let updated = 0;
   const conflicts: string[] = [];
   const errors: string[] = [];
   for (const target of targets) {
@@ -254,15 +394,49 @@ export async function sharePathWith(
         conflicts.push(clash);
         continue;
       }
-      if (await alreadySharedWith(ownerId, target, p)) {
-        already++;
+      const perm = normalizePermissions(permsFor(target));
+      const had = existing.get(target);
+      if (had) {
+        if (samePermissions(had.permissions, perm)) {
+          already++;
+          continue;
+        }
+        // Ya la tenía: solo se CAMBIAN sus permisos (nunca se duplica).
+        const res = await exec(
+          `UPDATE user_drive_shares
+              SET can_view = ?, can_edit = ?, can_create = ?,
+                  can_download = ?, active = 1, updated = NOW()
+            WHERE active = 1 AND id_owner = ? AND id_target = ? AND path = ?`,
+          [
+            perm.view ? 1 : 0,
+            perm.edit ? 1 : 0,
+            perm.create ? 1 : 0,
+            perm.download ? 1 : 0,
+            ownerId,
+            target,
+            p,
+          ]
+        );
+        if (res.affectedRows > 0) updated++;
+        else already++;
         continue;
       }
       await exec(
-        `INSERT INTO user_drive_shares (id_owner, id_target, path)
-         VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE active = 1, updated = NOW()`,
-        [ownerId, target, p]
+        `INSERT INTO user_drive_shares
+           (id_owner, id_target, path, can_view, can_edit, can_create, can_download)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE active = 1, updated = NOW(),
+           can_view = VALUES(can_view), can_edit = VALUES(can_edit),
+           can_create = VALUES(can_create), can_download = VALUES(can_download)`,
+        [
+          ownerId,
+          target,
+          p,
+          perm.view ? 1 : 0,
+          perm.edit ? 1 : 0,
+          perm.create ? 1 : 0,
+          perm.download ? 1 : 0,
+        ]
       );
       shared++;
     } catch (e) {
@@ -271,7 +445,7 @@ export async function sharePathWith(
       errors.push(saveErrorReason(e));
     }
   }
-  return { shared, already, conflicts, errors };
+  return { shared, already, updated, conflicts, errors };
 }
 
 /** Deja de compartir [path] con [targetIds] (baja lógica). */

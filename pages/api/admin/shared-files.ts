@@ -8,6 +8,9 @@ import {
   isLocalPath,
 } from "../../../lib/drive-paths";
 import {
+  SHARE_PERMISSIONS_DEFAULT,
+  SharePermissions,
+  normalizePermissions,
   shareCandidates,
   sharePathWith,
   sharesByOwner,
@@ -40,6 +43,35 @@ const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 function userIdsOf(raw: unknown): number[] {
   const list = Array.isArray(raw) ? raw : [];
   return [...new Set(list.map((v) => Number(v)).filter((n) => n > 0))];
+}
+
+/**
+ * Permisos por destinatario del cuerpo de la petición.
+ *
+ * Formatos aceptados (el panel manda `access`):
+ *   * `access: [{ userId, view, edit, create, download }, ...]`
+ *   * `userIds: [..]` + `permissions: { view, edit, create, download }`
+ *     (los mismos permisos para todos).
+ */
+function accessOf(body: Record<string, unknown>): {
+  userIds: number[];
+  perms: Map<number, SharePermissions>;
+} {
+  const perms = new Map<number, SharePermissions>();
+  const access = Array.isArray(body.access) ? body.access : [];
+  for (const raw of access) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = raw as Record<string, unknown>;
+    const id = Number(entry.userId ?? entry.id ?? 0);
+    if (!(id > 0)) continue;
+    perms.set(id, normalizePermissions(entry));
+  }
+  const ids = userIdsOf(body.userIds);
+  const shared = normalizePermissions(body.permissions, SHARE_PERMISSIONS_DEFAULT);
+  for (const id of ids) {
+    if (!perms.has(id)) perms.set(id, shared);
+  }
+  return { userIds: [...perms.keys()], perms };
 }
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
@@ -125,6 +157,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                 id: s.targetId,
                 name: s.targetName,
                 shareId: s.id,
+                // Lo que este usuario PODRÁ hacer en la carpeta: lo decide
+                // quien comparte (no su rol).
+                permissions: s.permissions,
               })),
             },
             candidates: await shareCandidates(me.sub),
@@ -156,7 +191,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       case "POST": {
         const b = (req.body || {}) as Record<string, unknown>;
         const path = normalizeSharePath(norm(b.path));
-        const userIds = userIdsOf(b.userIds);
+        const { userIds, perms } = accessOf(b);
         if (!path) {
           fail(res, 400, "Falta la carpeta", "Elige la carpeta que quieres compartir");
           return;
@@ -166,8 +201,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
 
-        const out = await sharePathWith(me.sub, userIds, path);
-        if (out.shared === 0 && out.already === 0 && out.conflicts.length) {
+        const out = await sharePathWith(me.sub, userIds, path, perms);
+        if (
+          out.shared === 0 &&
+          out.already === 0 &&
+          out.updated === 0 &&
+          out.conflicts.length
+        ) {
           fail(
             res,
             409,
@@ -179,7 +219,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // NADA se guardó: decirlo. Antes esta respuesta salía como "Sin
         // cambios" (201) y el panel daba la carpeta por compartida, pero el
         // otro usuario recibía "no existe o ya no está compartida".
-        if (out.shared === 0 && out.already === 0) {
+        if (out.shared === 0 && out.already === 0 && out.updated === 0) {
           fail(
             res,
             out.errors.length ? 500 : 409,
@@ -196,6 +236,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             out.shared === 1
               ? "Compartida con 1 usuario"
               : `Compartida con ${out.shared} usuarios`
+          );
+        }
+        if (out.updated) {
+          parts.push(
+            out.updated === 1
+              ? "Permisos actualizados para 1 usuario"
+              : `Permisos actualizados para ${out.updated} usuarios`
           );
         }
         if (out.already) {
@@ -222,7 +269,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           );
         }
         return created(res, parts.join(" · ") || "Sin cambios", {
-          item: { path, shared: out.shared, already: out.already },
+          item: {
+            path,
+            shared: out.shared,
+            already: out.already,
+            updated: out.updated,
+          },
           conflicts: out.conflicts,
           errors: out.errors,
         });
