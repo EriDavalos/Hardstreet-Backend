@@ -116,26 +116,34 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
 
   const ppIds = ppRows.map((r) => r.id);
 
-  // Servicios comprados + su servicio base + estatus
-  // (`s.url` = carpeta del Drive afiliada al servicio; si la BD aún no tiene
-  //  la columna 2026-10-13_services_url.sql, se repite sin ella).
+  // Servicios comprados + su servicio base + estatus.
+  // `s.url` = carpeta del Drive afiliada; `photos_max`/`allow_folder` = los
+  // parámetros especiales del servicio. Cada migración se prueba por separado
+  // para que un backend nuevo funcione contra una BD sin migrar.
   type SvcRow = PurchasedPackageServiceRow & {
     svc_name: string | null; svc_description: string | null;
     svc_icon: string | null; status_name: string | null; svc_url?: string | null;
+    svc_photos_max?: number | null; svc_allow_folder?: number | null;
   };
   const svcSelect = `SELECT pps.id, pps.description, pps.delivery_date, pps.id_purchased_package, pps.id_status, pps.id_service,
             s.name AS svc_name, s.description AS svc_description, s.icon AS svc_icon,
-            st.name AS status_name{URL}
+            st.name AS status_name{EXTRA}
        FROM purchased_packages_services pps
        LEFT JOIN services s ON s.id = pps.id_service
        LEFT JOIN status st ON st.id = pps.id_status
       WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
       ORDER BY pps.id ASC`;
+  const svcUrl = ", s.url AS svc_url";
+  const svcCaps = ", s.url AS svc_url, s.photos_max AS svc_photos_max, s.allow_folder AS svc_allow_folder";
   let svcRows: SvcRow[];
   try {
-    svcRows = await q<SvcRow>(svcSelect.replace("{URL}", ", s.url AS svc_url"), [ppIds]);
+    svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcCaps), [ppIds]);
   } catch {
-    svcRows = await q<SvcRow>(svcSelect.replace("{URL}", ""), [ppIds]);
+    try {
+      svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcUrl), [ppIds]);
+    } catch {
+      svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", ""), [ppIds]);
+    }
   }
 
   // Paquetes principales (para heredar datos) + estatus global de la compra
@@ -193,7 +201,20 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
           ...mapPurchasedPackageService(
             s,
             s.svc_name
-              ? { id: s.id_service || 0, name: s.svc_name, description: s.svc_description || "", icon: s.svc_icon || "", url: s.svc_url || "" }
+              ? {
+                  id: s.id_service || 0,
+                  name: s.svc_name,
+                  description: s.svc_description || "",
+                  icon: s.svc_icon || "",
+                  url: s.svc_url || "",
+                  photos_max: Math.max(0, Number(s.svc_photos_max) || 0),
+                  allow_folder:
+                    s.svc_allow_folder === null || s.svc_allow_folder === undefined
+                      ? 1
+                      : Number(s.svc_allow_folder) === 1
+                        ? 1
+                        : 0,
+                }
               : null,
             s.status_name ? { id: s.id_status || 0, name: s.status_name } : null
           ),

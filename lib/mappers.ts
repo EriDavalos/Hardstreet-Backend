@@ -13,6 +13,10 @@ export interface ServiceRow {
   icon: string | null;
   /** Liga base del Drive afiliada al servicio (opcional). */
   url?: string | null;
+  /** Máximo de fotos que el cliente puede elegir (0 = no ofrece). */
+  photos_max?: number | null;
+  /** ¿Se le puede compartir una carpeta del Drive? */
+  allow_folder?: number | null;
 }
 export interface TierRow { id: number; name: string | null; tier: number | null; }
 export interface PackageCategoryRow {
@@ -58,6 +62,10 @@ export interface Service {
   description: string;
   icon: string;
   url: string;
+  /** Máximo de fotos que el cliente puede elegir (0 = no ofrece). */
+  photosMax: number;
+  /** ¿Se le puede compartir una carpeta del Drive? */
+  allowFolder: boolean;
 }
 
 export interface Package {
@@ -143,6 +151,11 @@ export function mapService(r: ServiceRow): Service {
     description: str(r.description),
     icon: str(r.icon),
     url: str(r.url),
+    photosMax: Math.max(0, Number(r.photos_max) || 0),
+    // Sin la migración, la carpeta sigue disponible (comportamiento de antes).
+    allowFolder: r.allow_folder === null || r.allow_folder === undefined
+      ? true
+      : Number(r.allow_folder) === 1,
   };
 }
 
@@ -181,7 +194,15 @@ export function mapPurchasedPackageService(
     status: status ? mapStatus(status) : { id: 0, name: "Pendiente" },
     service: service
       ? mapService(service)
-      : { id: 0, name: "", description: "", icon: "", url: "" },
+      : {
+          id: 0,
+          name: "",
+          description: "",
+          icon: "",
+          url: "",
+          photosMax: 0,
+          allowFolder: true,
+        },
   };
 }
 

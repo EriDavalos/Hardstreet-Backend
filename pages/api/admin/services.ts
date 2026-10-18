@@ -27,6 +27,8 @@ type Row = {
   description: string | null;
   icon: string | null;
   url: string | null;
+  photos_max?: number | null;
+  allow_folder?: number | null;
 };
 
 function map(r: Row) {
@@ -36,7 +38,21 @@ function map(r: Row) {
     description: r.description || "",
     icon: r.icon || "",
     url: r.url || "",
+    // Parámetros especiales del servicio (migración 2026-10-18). Sin ella
+    // quedan apagados y la carpeta disponible, como antes.
+    photosMax: Math.max(0, Number(r.photos_max) || 0),
+    allowFolder:
+      r.allow_folder === null || r.allow_folder === undefined
+        ? true
+        : Number(r.allow_folder) === 1,
   };
+}
+
+/** 0…5000 fotos (0 = el servicio no ofrece elegir fotos). */
+function photosMaxOf(v: unknown): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(5000, Math.round(n));
 }
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
@@ -94,14 +110,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           con: Number(facetRows[0]?.con || 0),
           all: Number(facetRows[0]?.all || 0),
         };
-        rows = await q<Row>(
-          `SELECT id, name, description, icon, url
-             FROM services
-            WHERE ${sqlWhere}
-            ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`,
-          params
-        );
+        try {
+          rows = await q<Row>(
+            `SELECT id, name, description, icon, url, photos_max, allow_folder
+               FROM services
+              WHERE ${sqlWhere}
+              ORDER BY id ASC
+              LIMIT ${p.limit} OFFSET ${p.offset}`,
+            params
+          );
+        } catch {
+          // Migración de los parámetros pendiente: catálogo como antes.
+          rows = await q<Row>(
+            `SELECT id, name, description, icon, url
+               FROM services
+              WHERE ${sqlWhere}
+              ORDER BY id ASC
+              LIMIT ${p.limit} OFFSET ${p.offset}`,
+            params
+          );
+        }
         const countRows = await q<{ n: number }>(
           `SELECT COUNT(*) AS n FROM services WHERE ${sqlWhere}`,
           params
@@ -165,18 +193,46 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const description = norm(b.description);
     const icon = norm(b.icon);
     const url = norm(b.url);
+    const photosMax = b.photosMax === undefined ? 0 : photosMaxOf(b.photosMax);
+    // Sin la migración no existe la columna: la carpeta sigue disponible.
+    const allowFolder =
+      b.allowFolder === undefined ? true : Boolean(b.allowFolder);
 
     if (req.method === "POST") {
       if (!name) {
         fail(res, 400, "Escribe el nombre del servicio", "El nombre no puede ir vacío");
         return;
       }
-      const r = await exec(
-        `INSERT INTO services (name, description, icon, url)
-         VALUES (?, ?, ?, ?)`,
-        [name, description || null, icon || null, url || null]
-      );
-      const item = { id: Number(r.insertId), name, description, icon, url };
+      let r: { insertId: number; affectedRows: number };
+      try {
+        r = await exec(
+          `INSERT INTO services (name, description, icon, url, photos_max, allow_folder)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [
+            name,
+            description || null,
+            icon || null,
+            url || null,
+            photosMax,
+            allowFolder ? 1 : 0,
+          ]
+        );
+      } catch {
+        r = await exec(
+          `INSERT INTO services (name, description, icon, url)
+           VALUES (?, ?, ?, ?)`,
+          [name, description || null, icon || null, url || null]
+        );
+      }
+      const item = {
+        id: Number(r.insertId),
+        name,
+        description,
+        icon,
+        url,
+        photosMax,
+        allowFolder,
+      };
       await logActivity({
         userId: me.sub,
         module: "services",
@@ -220,19 +276,44 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       fields.push("`url` = ?");
       params.push(url || null);
     }
-    if (!fields.length) {
+    // Parámetros especiales: si la migración no está aplicada, la UPDATE con
+    // estas columnas falla y se reintenta sin ellas (no se pierde el resto).
+    const extraFields: string[] = [];
+    const extraParams: unknown[] = [];
+    if (b.photosMax !== undefined) {
+      extraFields.push("`photos_max` = ?");
+      extraParams.push(photosMax);
+    }
+    if (b.allowFolder !== undefined) {
+      extraFields.push("`allow_folder` = ?");
+      extraParams.push(allowFolder ? 1 : 0);
+    }
+    if (!fields.length && !extraFields.length) {
       fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del servicio");
       return;
     }
-    const r = await exec(
-      `UPDATE services SET ${fields.join(", ")} WHERE id = ?`,
-      [...params, id]
-    );
+    const allFields = [...fields, ...extraFields];
+    const allParams = [...params, ...extraParams];
+    let r: { insertId: number; affectedRows: number };
+    try {
+      r = await exec(
+        `UPDATE services SET ${allFields.join(", ")} WHERE id = ?`,
+        [...allParams, id]
+      );
+    } catch (e) {
+      // Sin la migración, una actualización que sólo toca los parámetros no
+      // tiene nada que guardar; con campos de siempre se reintenta sin ellos.
+      if (!fields.length) throw e;
+      r = await exec(
+        `UPDATE services SET ${fields.join(", ")} WHERE id = ?`,
+        [...params, id]
+      );
+    }
     if (!r.affectedRows) {
       fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${id}`);
       return;
     }
-    const item = { id, name, description, icon, url };
+    const item = { id, name, description, icon, url, photosMax, allowFolder };
     await logActivity({
       userId: me.sub,
       module: "services",

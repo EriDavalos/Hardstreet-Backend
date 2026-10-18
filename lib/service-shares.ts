@@ -189,6 +189,33 @@ export async function saveServiceShare(
   }
 }
 
+/** La LISTA de elementos marcados para VARIOS servicios (consulta única). */
+export async function serviceItemsByIds(
+  purchasedPackageServiceIds: number[]
+): Promise<Map<number, string[]>> {
+  const ids = [...new Set(purchasedPackageServiceIds.filter((n) => Number(n) > 0))];
+  const out = new Map<number, string[]>();
+  for (const id of ids) out.set(id, []);
+  if (!ids.length) return out;
+  try {
+    const rows = await q<{ id_purchased_package_service: number; path: string }>(
+      `SELECT id_purchased_package_service, path
+         FROM purchased_packages_services_items
+        WHERE active = 1 AND id_purchased_package_service IN (?)
+        ORDER BY id ASC`,
+      [ids]
+    );
+    for (const r of rows) {
+      const list = out.get(Number(r.id_purchased_package_service));
+      const p = normalizeDrivePath(r.path);
+      if (list && p && !list.includes(p)) list.push(p);
+    }
+  } catch {
+    // Migración pendiente: sin selección.
+  }
+  return out;
+}
+
 /** La LISTA de elementos que el cliente marcó para UN servicio. */
 export async function serviceItems(
   purchasedPackageServiceId: number

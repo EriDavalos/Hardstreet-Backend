@@ -3,8 +3,12 @@ import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 import { userIsAdmin, userRoleId } from "../../../lib/permissions";
-import { normalizeDrivePath, drivePathsOverlap, packageDrivePathsByIds } from "../../../lib/drive-paths";
-import { serviceItems, replaceServiceItems } from "../../../lib/service-shares";
+import { normalizeDrivePath } from "../../../lib/drive-paths";
+import {
+  serviceItems,
+  serviceShare,
+  replaceServiceItems,
+} from "../../../lib/service-shares";
 
 // ==================================================================
 // SELECCIÓN de elementos/fotos de UN servicio del paquete -> /api/my/service-items
@@ -19,9 +23,10 @@ import { serviceItems, replaceServiceItems } from "../../../lib/service-shares";
 // Reglas:
 //   * el servicio tiene que pertenecer a un paquete ACTIVO del usuario (el
 //     equipo del estudio, con rol Admin, puede tocar cualquiera);
-//   * las rutas deben caer dentro de las carpetas COMPARTIDAS con el cliente
-//     (no se puede marcar de una carpeta que no ve); si el usuario no tiene
-//     ninguna carpeta compartida (p. ej. un admin), no se restringe.
+//   * «Elegir fotos» lo enciende el estudio y SOLO si el servicio del catálogo
+//     tiene un máximo (> 0) y se compartió su carpeta;
+//   * el cliente elige DENTRO de la carpeta compartida de ESE servicio (no ve
+//     el resto del Drive) y como máximo `photos_max` fotos.
 //
 // Sin la migración aplicada la lectura devuelve [] en vez de fallar.
 // ==================================================================
@@ -48,24 +53,47 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
 
+      // Qué ofrece ESTE servicio: su carpeta compartida y su máximo de fotos.
+      const info = await servicePickInfo(serviceId);
+      if (!info.pickPhotos) {
+        res.status(400).json({
+          error: "Elegir fotos no está disponible para este servicio",
+        });
+        return;
+      }
+      if (!info.folder) {
+        res.status(400).json({
+          error: "El servicio todavía no tiene una carpeta compartida",
+        });
+        return;
+      }
+      // `max = 0` en configuraciones viejas significa «sin máximo»: se sigue
+      // permitiendo (la carpeta compartida sí es obligatoria).
       const rawPaths = Array.isArray(b.paths) ? b.paths : [];
       const paths = rawPaths
         .map((p) => normalizeDrivePath(p))
-        .filter((p) => p !== "");
+        .filter((p) => p !== "")
+        .filter((p, i, all) => all.indexOf(p) === i);
 
-      // Las rutas se marcan DENTRO de lo compartido (si hay algo compartido).
-      const roots = await sharedRoots(session.sub, isAdmin);
-      if (roots.length) {
-        const fuera = paths.filter(
-          (p) => !roots.some((r) => drivePathsOverlap(p, r))
-        );
-        if (fuera.length) {
-          res.status(400).json({
-            error: "Solo puedes elegir elementos de tus carpetas compartidas",
-            invalid: fuera.slice(0, 5),
-          });
-          return;
-        }
+      if (info.max > 0 && paths.length > info.max) {
+        res.status(400).json({
+          error: `Puedes elegir como máximo ${info.max} ${info.max === 1 ? 'foto' : 'fotos'}`,
+          max: info.max,
+        });
+        return;
+      }
+
+      // Solo lo que está DENTRO de la carpeta compartida del servicio.
+      const folder = normalizeDrivePath(info.folder);
+      const fuera = paths.filter(
+        (p) => p !== folder && !p.startsWith(`${folder}/`)
+      );
+      if (fuera.length) {
+        res.status(400).json({
+          error: "Solo puedes elegir fotos de la carpeta compartida del servicio",
+          invalid: fuera.slice(0, 5),
+        });
+        return;
       }
 
       const saved = await replaceServiceItems(serviceId, paths);
@@ -89,7 +117,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       res.status(404).json({ error: "Ese servicio no pertenece a tus paquetes" });
       return;
     }
-    res.status(200).json({ serviceId, items: await serviceItems(serviceId) });
+    const info = await servicePickInfo(serviceId);
+    res.status(200).json({
+      serviceId,
+      items: await serviceItems(serviceId),
+      // Lo que el cliente necesita para el módulo de selección.
+      folder: info.folder,
+      max: info.max,
+      pickPhotos: info.pickPhotos,
+    });
   } catch (e) {
     console.error("[my/service-items]", e);
     res.status(500).json({ error: "Error interno del servidor" });
@@ -114,25 +150,29 @@ async function ownsService(
   return rows.length > 0;
 }
 
-/** Carpetas compartidas con el usuario (vacío = sin restricción). */
-async function sharedRoots(userId: number, isAdmin: boolean): Promise<string[]> {
-  if (isAdmin) return [];
+/**
+ * Lo que ofrece el servicio para la selección: carpeta compartida, máximo de
+ * fotos del catálogo y si el estudio encendió «Elegir fotos».
+ */
+async function servicePickInfo(serviceId: number): Promise<{
+  folder: string;
+  max: number;
+  pickPhotos: boolean;
+}> {
+  const share = await serviceShare(serviceId);
+  let max = 0;
   try {
-    const rows = await q<{ id: number }>(
-      `SELECT DISTINCT pp.id
-         FROM users_packages up
-         JOIN purchased_packages pp
-           ON pp.id = up.id_purchased_package AND pp.active = 1
-        WHERE up.id_user = ? AND up.active = 1`,
-      [userId]
+    const rows = await q<{ photos_max: number | null }>(
+      `SELECT s.photos_max
+         FROM purchased_packages_services pps
+         JOIN services s ON s.id = pps.id_service
+        WHERE pps.id = ? AND pps.active = 1`,
+      [serviceId]
     );
-    const folders = await packageDrivePathsByIds(rows.map((r) => Number(r.id)));
-    const out: string[] = [];
-    for (const list of folders.values()) {
-      for (const p of list) if (!out.includes(p)) out.push(p);
-    }
-    return out;
+    max = Math.max(0, Number(rows[0]?.photos_max) || 0);
   } catch {
-    return [];
+    // Migración pendiente: sin máximo no se puede elegir.
+    max = 0;
   }
+  return { folder: share.folder, max, pickPhotos: share.pickPhotos };
 }

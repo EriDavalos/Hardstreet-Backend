@@ -15,8 +15,10 @@ import {
 } from "../../../lib/drive-paths";
 import {
   saveServiceShare,
+  serviceItemsByIds,
   serviceSharesByIds,
 } from "../../../lib/service-shares";
+import { notifyPackageUsers } from "../../../lib/notifications";
 
 // ==================================================================
 // ADMINISTRACIÓN DEL PAQUETE DEL CLIENTE -> /api/admin/package-progress
@@ -310,39 +312,47 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
 
+      // `photos_max`/`allow_folder` son los parámetros especiales del
+      // catálogo; se prueban aparte de `url` para tolerar bases sin migrar.
+      const svcBase = `SELECT pps.id, pps.id_service, pps.description, pps.id_status,
+                  st.name AS status_name,
+                  DATE_FORMAT(pps.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at,
+                  s.name AS service_name, s.icon AS service_icon{EXTRA}
+             FROM purchased_packages_services pps
+             LEFT JOIN services s ON s.id = pps.id_service
+             LEFT JOIN status st ON st.id = pps.id_status
+            WHERE pps.id_purchased_package = ? AND pps.active = 1
+            ORDER BY pps.id ASC`;
       let services: Row[];
       try {
         services = await q<Row>(
-          `SELECT pps.id, pps.id_service, pps.description, pps.id_status,
-                  st.name AS status_name,
-                  DATE_FORMAT(pps.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at,
-                  s.name AS service_name, s.icon AS service_icon, s.url AS service_url
-             FROM purchased_packages_services pps
-             LEFT JOIN services s ON s.id = pps.id_service
-             LEFT JOIN status st ON st.id = pps.id_status
-            WHERE pps.id_purchased_package = ? AND pps.active = 1
-            ORDER BY pps.id ASC`,
+          svcBase.replace(
+            "{EXTRA}",
+            ", s.url AS service_url, s.photos_max, s.allow_folder"
+          ),
           [purchasedPackageId]
         );
       } catch {
-        // Migración 2026-10-13_services_url.sql aún no aplicada: sin ligas.
-        services = await q<Row>(
-          `SELECT pps.id, pps.id_service, pps.description, pps.id_status,
-                  st.name AS status_name,
-                  DATE_FORMAT(pps.finished_at, '%Y-%m-%dT%H:%i:%s') AS finished_at,
-                  s.name AS service_name, s.icon AS service_icon
-             FROM purchased_packages_services pps
-             LEFT JOIN services s ON s.id = pps.id_service
-             LEFT JOIN status st ON st.id = pps.id_status
-            WHERE pps.id_purchased_package = ? AND pps.active = 1
-            ORDER BY pps.id ASC`,
-          [purchasedPackageId]
-        );
+        try {
+          services = await q<Row>(
+            svcBase.replace("{EXTRA}", ", s.url AS service_url"),
+            [purchasedPackageId]
+          );
+        } catch {
+          services = await q<Row>(
+            svcBase.replace("{EXTRA}", ""),
+            [purchasedPackageId]
+          );
+        }
       }
 
       // Opciones de compartir por SERVICIO (carpeta, liga y elementos que
       // marcó el cliente). Sin migración quedan vacías.
       const shares = await serviceSharesByIds(services.map((s) => Number(s.id)));
+      // Las rutas elegidas por el cliente, para que el estudio las vea.
+      const selectedItems = await serviceItemsByIds(
+        services.map((s) => Number(s.id))
+      );
 
       // Movimientos = abonos (payments) + movimientos propios. Si la
       // migración aún no se aplicó, el modal sigue funcionando sin ellos.
@@ -470,6 +480,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             pickPhotos: share?.pickPhotos ?? false,
             showFolder: share?.showFolder ?? true,
             items: share?.items ?? 0,
+            // Rutas elegidas (para el visor del estudio).
+            itemPaths: selectedItems.get(Number(s.id)) ?? [],
+            // Parámetros especiales del catálogo: máximo de fotos y si el
+            // servicio permite carpeta. Sin migración: sin fotos, con carpeta.
+            photosMax: Math.max(0, Number(s.photos_max) || 0),
+            allowFolder:
+              s.allow_folder === null || s.allow_folder === undefined
+                ? true
+                : Number(s.allow_folder) === 1,
             description: String(s.description || ""),
             status: String(s.status_name || "Pendiente"),
             statusId: Number(s.id_status || 0),
@@ -873,6 +892,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const done = actionName === "completar-servicio";
+      let notified = 0;
+      if (done) {
+        // Aviso automático al cliente: su servicio terminó.
+        try {
+          const ctx = await q<Row>(
+            `SELECT pps.id_purchased_package, s.name AS service_name
+               FROM purchased_packages_services pps
+               LEFT JOIN services s ON s.id = pps.id_service
+              WHERE pps.id = ?`,
+            [serviceId]
+          );
+          const row = ctx[0];
+          const pkgId = Number(row?.id_purchased_package || 0);
+          const serviceName = String(row?.service_name || "Tu servicio");
+          if (pkgId) {
+            notified = await notifyPackageUsers({
+              purchasedPackageId: pkgId,
+              serviceId,
+              kind: "servicio-terminado",
+              title: "Servicio terminado",
+              body: `«${serviceName}» de tu paquete ya está terminado.`,
+            });
+          }
+        } catch {
+          // El aviso es un extra: completar el servicio manda.
+        }
+      }
       const message = done
         ? "Servicio marcado como terminado exitosamente"
         : "Servicio actualizado exitosamente";
@@ -887,7 +933,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         details: { serviceId, done, ...b },
         req,
       });
-      ok(res, message, { item: { serviceId, done } });
+      ok(res, message, { item: { serviceId, done, notified } });
       return;
     }
 
@@ -942,16 +988,59 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       const folder = norm(b.folder);
       const link = norm(b.link);
-      const pickPhotos = asOption(b.pickPhotos, false);
-      const showFolder = asOption(b.showFolder, true);
-      const exists = await q(
-        `SELECT id FROM purchased_packages_services
-          WHERE id = ? AND active = 1`,
+      let pickPhotos = asOption(b.pickPhotos, false);
+      let showFolder = asOption(b.showFolder, true);
+
+      // Qué permite el SERVICIO del catálogo: máximo de fotos y si usa
+      // carpeta del Drive. Sin la migración: sin fotos y con carpeta (como
+      // antes de los parámetros especiales).
+      const service = await q<Row>(
+        `SELECT pps.id, pps.id_purchased_package, s.name AS service_name,
+                s.photos_max, s.allow_folder
+           FROM purchased_packages_services pps
+           LEFT JOIN services s ON s.id = pps.id_service
+          WHERE pps.id = ? AND pps.active = 1`,
         [serviceId]
+      ).catch(async () =>
+        q<Row>(
+          `SELECT pps.id, pps.id_purchased_package, s.name AS service_name
+             FROM purchased_packages_services pps
+             LEFT JOIN services s ON s.id = pps.id_service
+            WHERE pps.id = ? AND pps.active = 1`,
+          [serviceId]
+        )
       );
-      if (!exists.length) {
+      if (!service.length) {
         fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${serviceId}`);
         return;
+      }
+      const photosMax = Math.max(0, Number(service[0].photos_max) || 0);
+      const allowFolder =
+        service[0].allow_folder === null || service[0].allow_folder === undefined
+          ? true
+          : Number(service[0].allow_folder) === 1;
+
+      // «Abrir carpeta» necesita que el servicio use carpeta.
+      if (!allowFolder) showFolder = false;
+      if (pickPhotos) {
+        if (photosMax <= 0) {
+          fail(
+            res,
+            400,
+            "Este servicio no ofrece elegir fotos",
+            "Actívalo en el módulo Servicios (parámetros especiales) y vuelve a intentarlo."
+          );
+          return;
+        }
+        if (!folder) {
+          fail(
+            res,
+            400,
+            "Comparte primero una carpeta",
+            "El cliente elige las fotos DENTRO de la carpeta compartida del servicio."
+          );
+          return;
+        }
       }
       try {
         await saveServiceShare(serviceId, folder, link, pickPhotos, showFolder);
@@ -976,8 +1065,55 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         req,
       });
       ok(res, "Opciones de compartir actualizadas exitosamente", {
-        item: { serviceId, folder, link, pickPhotos, showFolder },
+        item: {
+          serviceId,
+          folder,
+          link,
+          pickPhotos,
+          showFolder,
+          photosMax,
+          allowFolder,
+        },
       });
+      return;
+    }
+
+    // ---- Avisar al CLIENTE (selección disponible, aviso del estudio…) ----
+    if (actionName === "notificar-cliente") {
+      const purchasedPackageId = Number(b.purchasedPackageId || 0);
+      if (!purchasedPackageId) {
+        fail(res, 400, "Falta el paquete", "Indica el paquete del cliente al que quieres avisar");
+        return;
+      }
+      const title = norm(b.title);
+      if (!title) {
+        fail(res, 400, "Escribe el aviso", "El aviso necesita un título");
+        return;
+      }
+      const serviceId = Number(b.serviceId || 0) || null;
+      const sent = await notifyPackageUsers({
+        purchasedPackageId,
+        serviceId,
+        kind: norm(b.kind) || "paquete",
+        title,
+        body: norm(b.body),
+      });
+      await logActivity({
+        userId: me.sub,
+        module: "clientes",
+        moduleName: "Clientes",
+        action: "update",
+        entity: "aviso-cliente",
+        entityId: purchasedPackageId,
+        description: "Aviso enviado al cliente exitosamente",
+        details: { purchasedPackageId, serviceId, title, sent },
+        req,
+      });
+      ok(
+        res,
+        sent > 0 ? "Aviso enviado al cliente" : "El paquete no tiene clientes activos",
+        { sent, item: { purchasedPackageId, serviceId, title } }
+      );
       return;
     }
 
