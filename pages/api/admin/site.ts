@@ -39,6 +39,86 @@ async function readRow(): Promise<{ design: unknown; landing: unknown }> {
   return rows[0] || { design: null, landing: null };
 }
 
+// Tope del HTML propio de una sección (100 KB es de sobra para una sección;
+// el tope evita que un pegado enorme infle el documento que baja la web).
+const MAX_SECTION_HTML = 100_000;
+
+/** Atributos que pueden llevar una URL (donde no vale `javascript:`). */
+const URL_ATTRS = new Set([
+  "href",
+  "xlink:href",
+  "src",
+  "action",
+  "formaction",
+]);
+
+/** HTML de una sección: sin <script> y con tope. null si queda vacío. */
+function cleanHtml(v: unknown): string | null {
+  if (typeof v !== "string") return null;
+  // El sitio lo pinta con innerHTML: un <script> pegado no se ejecuta al
+  // asignarlo, pero se quita igual para que el documento no cargue código.
+  // Tampoco pasan los manejadores en línea (`onclick`, `onerror`…) ni los
+  // enlaces `javascript:`, que sí se ejecutarían dentro de la página pública.
+  const code = v
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    // Los atributos se limpian SÓLO dentro de las etiquetas: si se aplicara al
+    // texto entero, un párrafo como "Reserva online = 50%" perdería su texto.
+    .replace(/<[a-z][^>]*>/gi, (tag) =>
+      // Atributo por atributo (con su valor entre comillas de una pieza): así
+      // no se toca lo que vaya DENTRO de un valor.
+      tag.replace(
+        // `[\s/]+`: `<svg/onload=…>` también trae un atributo `onload`.
+        /[\s/]+([a-z_:][-a-z0-9_:.]*)(\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?/gi,
+        (match, name: string, _assignment?: string, value?: string) => {
+          const attr = name.toLowerCase();
+          if (attr.startsWith("on")) return "";
+          // `srcdoc` mete una página entera (con scripts) dentro de la
+          // sección: no se permite.
+          if (attr === "srcdoc") return "";
+          if (URL_ATTRS.has(attr)) {
+            const raw = (value || "").replace(/^["']|["']$/g, "").trim();
+            if (/^javascript:/i.test(raw)) return "";
+          }
+          return match;
+        }
+      )
+    )
+    .trim();
+  if (!code) return null;
+  return code.slice(0, MAX_SECTION_HTML);
+}
+
+/**
+ * Limpia el HTML propio del documento de la portada:
+ *   html: { "hero": "<...>", "gallery-2": "<...>" }
+ *   extraSections[i].html
+ */
+function sanitizeLanding(doc: Doc): Doc {
+  const out: Doc = { ...doc };
+  const raw = out.html;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    const html: Record<string, string> = {};
+    for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+      const code = cleanHtml(value);
+      if (code) html[key] = code;
+    }
+    out.html = html;
+  }
+  if (Array.isArray(out.extraSections)) {
+    out.extraSections = out.extraSections.map((e) => {
+      if (!e || typeof e !== "object" || Array.isArray(e)) return e;
+      const copy = { ...(e as Doc) };
+      if (copy.html !== undefined) {
+        const code = cleanHtml(copy.html);
+        if (code) copy.html = code;
+        else delete copy.html;
+      }
+      return copy;
+    });
+  }
+  return out;
+}
+
 /** Guarda los documentos que vengan (la fila se crea si no existía). */
 async function writeRow(patch: { design?: string; landing?: string }) {
   const fields: string[] = [];
@@ -105,7 +185,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
     await writeRow({
       ...(design ? { design: JSON.stringify(design) } : {}),
-      ...(landing ? { landing: JSON.stringify(landing) } : {}),
+      ...(landing ? { landing: JSON.stringify(sanitizeLanding(landing)) } : {}),
     });
 
     const row = await readRow();
