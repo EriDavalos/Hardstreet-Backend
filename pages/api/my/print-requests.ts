@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
+import { notifyPrintRequest } from "../../../lib/admin-notifications";
 import { userIsAdmin, userRoleId } from "../../../lib/permissions";
 import { serviceShare } from "../../../lib/service-shares";
 import {
@@ -115,6 +116,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       userId: session.sub,
       paths: photos,
     });
+    // El equipo (administradores y colaboradores con permiso de Impresiones)
+    // recibe el aviso en su campanita. Si falla, el envío ya quedó hecho.
+    await notifyTeam(requestId, serviceId, session.sub, photos.length);
     res.status(200).json({
       serviceId,
       requestId,
@@ -130,6 +134,45 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       .json({ error: (e as Error)?.message || "Error interno del servidor" });
   }
 });
+
+/** Avisa al equipo del envío (nunca rompe la respuesta al cliente). */
+async function notifyTeam(
+  requestId: number,
+  serviceId: number,
+  userId: number,
+  photos: number
+): Promise<void> {
+  try {
+    const rows = await q<{
+      serviceName: string | null;
+      packageName: string | null;
+      clientName: string | null;
+    }>(
+      `SELECT s.name AS serviceName,
+              pp.name AS packageName,
+              TRIM(CONCAT(COALESCE(u.name, ''), ' ', COALESCE(u.lastname, '')))
+                AS clientName
+         FROM purchased_packages_services pps
+         JOIN purchased_packages pp ON pp.id = pps.id_purchased_package
+         LEFT JOIN services s ON s.id = pps.id_service
+         LEFT JOIN users u ON u.id = ?
+        WHERE pps.id = ?
+        LIMIT 1`,
+      [userId, serviceId]
+    );
+    const r = rows[0];
+    await notifyPrintRequest({
+      requestId,
+      serviceId,
+      clientName: String(r?.clientName || "").trim(),
+      serviceName: String(r?.serviceName || "").trim(),
+      packageName: String(r?.packageName || "").trim(),
+      photos,
+    });
+  } catch (e) {
+    console.error("[my/print-requests notify]", e);
+  }
+}
 
 /** Fotos del envío (solo lectura para el cliente). */
 async function sentPhotos(requestId: number): Promise<string[]> {

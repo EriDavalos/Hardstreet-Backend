@@ -3,6 +3,10 @@ import { withCors } from "../../lib/cors";
 import { requireUser } from "../../lib/auth";
 import { q, exec } from "../../lib/db";
 import { ensureRemindersForUser } from "../../lib/reminders";
+import {
+  listAdminNotifications,
+  markAdminNotificationsRead,
+} from "../../lib/admin-notifications";
 
 // ==================================================================
 // Avisos del usuario  ->  /api/reminders
@@ -12,6 +16,12 @@ import { ensureRemindersForUser } from "../../lib/reminders";
 //
 // El usuario siempre es el de la sesión (nunca se confía en un id del
 // cliente para elegir a quién pertenece un aviso).
+//
+// La lista mezcla DOS fuentes para que haya una sola campanita:
+//   * `source: "event"`  recordatorios de agendas (falta 1 semana / 1 día).
+//   * `source: "print"`  avisos del equipo: un cliente envió fotos a
+//                        impresión (solo los reciben admins y colaboradores
+//                        con permiso de Impresiones).
 //
 // Autogeneración perezosa: además del cron diario (que es quien genera
 // los avisos por defecto), este GET crea los avisos vencidos del día si
@@ -24,6 +34,8 @@ import { ensureRemindersForUser } from "../../lib/reminders";
 // solo para no repetir la consulta en cada refresco del panel).
 const lastEnsure = new Map<number, number>();
 const ENSURE_INTERVAL_MS = 60 * 60 * 1000; // 1 hora
+
+type BellItem = Record<string, unknown>;
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const session = await requireUser(req, res);
@@ -72,15 +84,43 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [session.sub]
       );
 
-      const unread = rows.filter((r) => !Number(r.isRead)).length;
-      res.status(200).json({ reminders: rows, unread });
+      const items: BellItem[] = rows.map((r) => ({ ...r, source: "event" }));
+
+      // Avisos del EQUIPO (envíos a impresión). Si la migración no está,
+      // la lista llega vacía y no pasa nada.
+      for (const n of await listAdminNotifications(session.sub)) {
+        items.push({
+          id: n.id,
+          scheduleId: null,
+          kind: n.kind,
+          title: n.title,
+          body: n.body,
+          // La campanita pinta la fecha con `eventDate`: para estos avisos es
+          // el momento en que se envió.
+          eventDate: n.created,
+          isRead: n.isRead ? 1 : 0,
+          created: n.created,
+          source: "print",
+          printRequestId: n.printRequestId,
+          serviceId: n.serviceId,
+        });
+      }
+
+      // Más recientes primero (los dos orígenes ya vienen ordenados).
+      items.sort((a, b) =>
+        String(b.created ?? "").localeCompare(String(a.created ?? ""))
+      );
+
+      const unread = items.filter((i) => !Number(i.isRead)).length;
+      res.status(200).json({ reminders: items, unread });
       return;
     }
 
     if (req.method === "PUT") {
-      // La app manda Put { id } o { all: true }.
+      // La app manda Put { id, source } o { all: true }.
       const all = Boolean(req.body?.all);
       const id = Number(req.body?.id || 0);
+      const source = String(req.body?.source || "event").toLowerCase();
 
       if (all) {
         await exec(
@@ -88,12 +128,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             WHERE id_user = ? AND active = 1 AND is_read = 0`,
           [session.sub]
         );
+        await markAdminNotificationsRead(session.sub);
       } else if (id > 0) {
-        await exec(
-          `UPDATE reminders SET is_read = 1
-            WHERE id = ? AND id_user = ? AND active = 1`,
-          [id, session.sub]
-        );
+        if (source === "print") {
+          await markAdminNotificationsRead(session.sub, [id]);
+        } else {
+          await exec(
+            `UPDATE reminders SET is_read = 1
+              WHERE id = ? AND id_user = ? AND active = 1`,
+            [id, session.sub]
+          );
+        }
       } else {
         res.status(400).json({ error: "Falta id o all" });
         return;
@@ -105,7 +150,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           WHERE id_user = ? AND active = 1 AND is_read = 0`,
         [session.sub]
       );
-      res.status(200).json({ ok: true, unread: Number(rows[0]?.unread || 0) });
+      let unread = Number(rows[0]?.unread || 0);
+      const printUnread = (await listAdminNotifications(session.sub, 100)).filter(
+        (n) => !n.isRead
+      );
+      unread += printUnread.length;
+      res.status(200).json({ ok: true, unread });
       return;
     }
 
