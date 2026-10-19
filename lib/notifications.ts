@@ -41,6 +41,14 @@ type NotifyInput = {
 const MAX_TITLE = 200;
 const MAX_BODY = 500;
 
+/**
+ * Ventana de idempotencia: dos avisos IDÉNTICOS (mismo paquete, servicio,
+ * tipo, título y cuerpo) dentro de estos minutos son el MISMO aviso. Cubre el
+ * doble toque en «Avisar al cliente», un reintento del panel o una petición
+ * repetida por la red, aunque el cliente ya lo haya leído.
+ */
+const DEDUPE_WINDOW_MS = 10 * 60 * 1000;
+
 const text = (v: unknown, max: number) =>
   String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max);
 
@@ -76,14 +84,53 @@ export async function notifyPackageUsers(input: NotifyInput): Promise<number> {
     if (!ids.length) return 0;
 
     const serviceId = Number(input.serviceId) || null;
+    const kind = kindOf(input.kind);
+
+    // NO DUPLICAR: si el cliente ya tiene ese MISMO aviso sin leer, o se le
+    // creó hace menos de [DEDUPE_WINDOW_MS] (aunque ya lo haya leído), se
+    // omite. Así pulsar dos veces «Avisar al cliente», un reintento del panel
+    // o una petición repetida por la red no generan dos avisos.
+    let already: number[] = [];
+    try {
+      const serviceCond =
+        serviceId == null
+          ? "id_purchased_package_service IS NULL"
+          : "id_purchased_package_service = ?";
+      const holes = ids.map(() => "?").join(", ");
+      const rows = await q<{ id_user: number }>(
+        `SELECT id_user FROM package_notifications
+          WHERE active = 1
+            AND id_purchased_package = ?
+            AND ${serviceCond}
+            AND kind = ? AND title = ?
+            AND COALESCE(body, '') = ?
+            AND (is_read = 0 OR created >= (NOW() - INTERVAL 10 MINUTE))
+            AND id_user IN (${holes})`,
+        [
+          purchasedPackageId,
+          ...(serviceId == null ? [] : [serviceId]),
+          kind,
+          title,
+          body,
+          ...ids,
+        ]
+      );
+      already = rows.map((r) => Number(r.id_user));
+    } catch {
+      // Tabla/columna ausente (migración pendiente): se sigue como antes.
+      already = [];
+    }
+    const pending = ids.filter((id) => !already.includes(id));
+    if (!pending.length) return 0;
+
     const values: unknown[] = [];
-    const rows = ids.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
-    for (const id of ids) {
+    const rows = pending.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
+    for (const id of pending) {
       values.push(
         id,
         purchasedPackageId,
         serviceId,
-        kindOf(input.kind),
+        kind,
         title,
         body,
         new Date()
@@ -96,11 +143,44 @@ export async function notifyPackageUsers(input: NotifyInput): Promise<number> {
        VALUES ${rows}`,
       values
     );
-    return ids.length;
+    return pending.length;
   } catch {
     // Migración pendiente: el aviso no se guarda, pero la acción sí termina.
     return 0;
   }
+}
+
+/**
+ * Colapsa avisos repetidos que YA están en la base (los que pudo dejar una
+ * versión anterior del panel o un doble envío antes de la idempotencia).
+ *
+ * Se consideran el mismo aviso los que tienen idéntico paquete, servicio,
+ * tipo, título y cuerpo y se crearon con menos de [DEDUPE_WINDOW_MS] de
+ * diferencia. Llegan ordenados del más nuevo al más viejo: se conserva el
+ * primero y se descartan sus repetidos.
+ */
+function collapseRepeated(items: PackageNotification[]): PackageNotification[] {
+  const out: PackageNotification[] = [];
+  const lastOf = new Map<string, number>();
+  for (const item of items) {
+    const key = [
+      item.kind,
+      item.title,
+      item.body,
+      item.purchasedPackageId ?? "",
+      item.serviceId ?? "",
+    ].join("\u0001");
+    const when = Date.parse(item.created.replace(" ", "T"));
+    const prev = lastOf.get(key);
+    const same =
+      prev !== undefined &&
+      Number.isFinite(when) &&
+      Math.abs(prev - when) < DEDUPE_WINDOW_MS;
+    if (same) continue;
+    lastOf.set(key, Number.isFinite(when) ? when : 0);
+    out.push(item);
+  }
+  return out;
 }
 
 /** Los avisos de UN usuario (más nuevos primero), con cuántos sin leer. */
@@ -151,7 +231,9 @@ export async function listUserNotifications(
           : Number(r.id_purchased_package_service),
       serviceName: String(r.service_name || ""),
     }));
-    return { items, unread: items.filter((i) => !i.isRead).length };
+    // Una sola tarjeta por aviso, aunque la base tenga copias repetidas.
+    const unique = collapseRepeated(items);
+    return { items: unique, unread: unique.filter((i) => !i.isRead).length };
   } catch {
     return { items: [], unread: 0 };
   }
