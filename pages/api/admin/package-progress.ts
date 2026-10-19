@@ -18,6 +18,7 @@ import {
   serviceItemsByIds,
   serviceSharesByIds,
 } from "../../../lib/service-shares";
+import { servicePrintStates } from "../../../lib/print-requests";
 import { notifyPackageUsers } from "../../../lib/notifications";
 
 // ==================================================================
@@ -363,6 +364,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const selectedItems = await serviceItemsByIds(
         services.map((s) => Number(s.id))
       );
+      // Envío a impresión de cada servicio (para que el cliente vea que sus
+      // fotos ya viajaron y que ya no puede cambiarlas).
+      const printStates = await servicePrintStates(
+        services.map((s) => Number(s.id))
+      );
 
       // Movimientos = abonos (payments) + movimientos propios. Si la
       // migración aún no se aplicó, el modal sigue funcionando sin ellos.
@@ -492,6 +498,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             items: share?.items ?? 0,
             // Rutas elegidas (para el visor del estudio).
             itemPaths: selectedItems.get(Number(s.id)) ?? [],
+            // Envío a impresión activo: "" (sin enviar) | sent | finished.
+            printStatus: printStates.get(Number(s.id))?.status ?? "",
+            printRequestId: printStates.get(Number(s.id))?.id ?? null,
+            printFormatId: printStates.get(Number(s.id))?.formatId ?? null,
+            printBorder: printStates.get(Number(s.id))?.border ?? 0,
+            sentToPrint: printStates.has(Number(s.id)),
             // Parámetros especiales del catálogo: máximo de fotos y si el
             // servicio permite carpeta. Sin migración: sin fotos, con carpeta.
             photosMax: Math.max(0, Number(s.photos_max) || 0),

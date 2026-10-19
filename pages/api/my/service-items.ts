@@ -9,6 +9,7 @@ import {
   serviceShare,
   replaceServiceItems,
 } from "../../../lib/service-shares";
+import { servicePrintLocked } from "../../../lib/print-requests";
 
 // ==================================================================
 // SELECCIÓN de elementos/fotos de UN servicio del paquete -> /api/my/service-items
@@ -50,6 +51,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const allowed = await ownsService(session.sub, serviceId, isAdmin);
       if (!allowed) {
         res.status(404).json({ error: "Ese servicio no pertenece a tus paquetes" });
+        return;
+      }
+
+      // Enviado a impresión = selección BLOQUEADA: solo se puede ver hasta
+      // que el estudio reabra el envío desde el módulo de impresiones.
+      const locked = await servicePrintLocked(serviceId);
+      if (locked) {
+        res.status(409).json({
+          error:
+            locked.status === "finished"
+              ? "Estas fotos ya se imprimieron. Pídele al estudio que reabra el envío."
+              : "Ya enviaste estas fotos a impresión. Pídele al estudio que reabra el envío para cambiarlas.",
+          printStatus: locked.status,
+          requestId: locked.id,
+        });
         return;
       }
 
@@ -118,6 +134,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
     const info = await servicePickInfo(serviceId);
+    const print = await servicePrintLocked(serviceId);
     res.status(200).json({
       serviceId,
       items: await serviceItems(serviceId),
@@ -125,6 +142,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       folder: info.folder,
       max: info.max,
       pickPhotos: info.pickPhotos,
+      // Envío a impresión activo (si lo hay): el cliente VE sus fotos pero no
+      // las puede cambiar hasta que el estudio lo reabra.
+      printStatus: print?.status ?? "",
+      printRequestId: print?.id ?? null,
+      sent: print !== null,
     });
   } catch (e) {
     console.error("[my/service-items]", e);
