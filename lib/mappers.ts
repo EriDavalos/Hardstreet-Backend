@@ -17,6 +17,8 @@ export interface ServiceRow {
   photos_max?: number | null;
   /** ¿Se le puede compartir una carpeta del Drive? */
   allow_folder?: number | null;
+  /** ¿El servicio lleva ubicación? (se elige en cada paquete) */
+  use_location?: number | null;
 }
 export interface TierRow { id: number; name: string | null; tier: number | null; }
 export interface PackageCategoryRow {
@@ -66,6 +68,8 @@ export interface Service {
   photosMax: number;
   /** ¿Se le puede compartir una carpeta del Drive? */
   allowFolder: boolean;
+  /** ¿Lleva UBICACIÓN? (cuál, se elige en cada paquete) */
+  useLocation: boolean;
 }
 
 export interface Package {
@@ -88,6 +92,8 @@ export interface PurchasedPackageService {
   deliveryDate: number | null; // dias de entrega
   status: Status;
   service: Service;
+  /** Ubicación de ESTE servicio en el paquete ("" = sin ubicación). */
+  location: string;
 }
 
 export interface PurchasedPackage {
@@ -156,6 +162,7 @@ export function mapService(r: ServiceRow): Service {
     allowFolder: r.allow_folder === null || r.allow_folder === undefined
       ? true
       : Number(r.allow_folder) === 1,
+    useLocation: Number(r.use_location) === 1,
   };
 }
 
@@ -202,7 +209,10 @@ export function mapPurchasedPackageService(
           url: "",
           photosMax: 0,
           allowFolder: true,
+          useLocation: false,
         },
+    // Sin la migración de ubicaciones: vacía (y no se muestra nada).
+    location: str((r as any).location),
   };
 }
 

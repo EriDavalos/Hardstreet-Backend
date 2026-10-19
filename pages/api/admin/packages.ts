@@ -48,30 +48,66 @@ async function resolveServiceIds(
   return ids;
 }
 
+/**
+ * Los servicios del paquete con SU ubicación.
+ *
+ * El módulo Servicios solo dice si el servicio LLEVA ubicación
+ * (`use_location`); cuál es, se elige aquí, paquete por paquete. Un servicio
+ * sin ubicaciones activadas se guarda con "" (no se pregunta).
+ */
+function serviceItems(
+  ids: number[],
+  rawLocations: unknown
+): { id: number; location: string }[] {
+  const map =
+    rawLocations && typeof rawLocations === "object"
+      ? (rawLocations as Record<string, unknown>)
+      : {};
+  return ids.map((id) => ({ id, location: norm(map[String(id)]) }));
+}
+
 async function replaceServices(
   conn: import("mysql2/promise").PoolConnection,
   packageId: number,
-  serviceIds: number[]
+  items: { id: number; location: string }[]
 ) {
   await conn.query(
     `UPDATE packages_services SET active = 0 WHERE id_package = ?`,
     [packageId]
   );
-  for (const sid of serviceIds) {
+  for (const it of items) {
     const [rows]: any[] = await conn.query(
       `SELECT id FROM packages_services
         WHERE id_package = ? AND id_service = ? LIMIT 1`,
-      [packageId, sid]
+      [packageId, it.id]
     );
     if ((rows as any[]).length) {
-      await conn.query(`UPDATE packages_services SET active = 1 WHERE id = ?`, [
-        (rows as any[])[0].id,
-      ]);
+      const rowId = (rows as any[])[0].id;
+      // Con la migración de ubicaciones se guarda también cuál es; sin ella,
+      // el resto del paquete se guarda igual (no se pierde nada).
+      await conn
+        .query(
+          `UPDATE packages_services SET active = 1, location = ? WHERE id = ?`,
+          [it.location || null, rowId]
+        )
+        .catch(() =>
+          conn.query(`UPDATE packages_services SET active = 1 WHERE id = ?`, [
+            rowId,
+          ])
+        );
     } else {
-      await conn.query(
-        `INSERT INTO packages_services (id_package, id_service) VALUES (?, ?)`,
-        [packageId, sid]
-      );
+      await conn
+        .query(
+          `INSERT INTO packages_services (id_package, id_service, location)
+           VALUES (?, ?, ?)`,
+          [packageId, it.id, it.location || null]
+        )
+        .catch(() =>
+          conn.query(
+            `INSERT INTO packages_services (id_package, id_service) VALUES (?, ?)`,
+            [packageId, it.id]
+          )
+        );
     }
   }
 }
@@ -106,13 +142,26 @@ async function packageModel(id: number) {
   );
   if (!rows.length) return { id };
   const p = rows[0];
-  const svcRows = await q<{ id: number; name: string | null }>(
-    `SELECT s.id, s.name
+  const svcRows = await q<{
+    id: number;
+    name: string | null;
+    location?: string | null;
+  }>(
+    `SELECT s.id, s.name, ps.location
        FROM packages_services ps
        JOIN services s ON s.id = ps.id_service AND s.active = 1
       WHERE ps.active = 1 AND ps.id_package = ?
       ORDER BY ps.id ASC`,
     [id]
+  ).catch(() =>
+    q<{ id: number; name: string | null }>(
+      `SELECT s.id, s.name
+         FROM packages_services ps
+         JOIN services s ON s.id = ps.id_service AND s.active = 1
+        WHERE ps.active = 1 AND ps.id_package = ?
+        ORDER BY ps.id ASC`,
+      [id]
+    )
   );
   return {
     id: p.id,
@@ -130,6 +179,10 @@ async function packageModel(id: number) {
     urlImage: p.url_image || "",
     serviceIds: svcRows.map((s) => Number(s.id)),
     serviceNames: svcRows.map((s) => s.name || ""),
+    // Ubicación de CADA servicio en este paquete (id del servicio → texto).
+    serviceLocations: Object.fromEntries(
+      svcRows.map((s) => [String(Number(s.id)), (s as any).location || ""])
+    ),
   };
 }
 
@@ -187,13 +240,27 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // Solo los servicios de los paquetes de ESTA página.
         const pageIds = rows.map((r) => r.id);
         const svcRows = pageIds.length
-          ? await q<{ id_package: number; id: number; name: string | null }>(
-              `SELECT ps.id_package, s.id, s.name
+          ? await q<{
+              id_package: number;
+              id: number;
+              name: string | null;
+              location?: string | null;
+            }>(
+              `SELECT ps.id_package, s.id, s.name, ps.location
                  FROM packages_services ps
                  JOIN services s ON s.id = ps.id_service AND s.active = 1
                 WHERE ps.active = 1 AND ps.id_package IN (?)
                 ORDER BY ps.id ASC`,
               [pageIds]
+            ).catch(() =>
+              q<{ id_package: number; id: number; name: string | null }>(
+                `SELECT ps.id_package, s.id, s.name
+                   FROM packages_services ps
+                   JOIN services s ON s.id = ps.id_service AND s.active = 1
+                  WHERE ps.active = 1 AND ps.id_package IN (?)
+                  ORDER BY ps.id ASC`,
+                [pageIds]
+              )
             )
           : [];
         res.status(200).json({
@@ -216,6 +283,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             serviceNames: svcRows
               .filter((s) => s.id_package === p.id)
               .map((s) => s.name || ""),
+            serviceLocations: Object.fromEntries(
+              svcRows
+                .filter((s) => s.id_package === p.id)
+                .map((s) => [String(Number(s.id)), (s as any).location || ""])
+            ),
           })),
         });
         return;
@@ -268,7 +340,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           ]
         );
         if (serviceIds && serviceIds.length) {
-          await transaccion((conn) => replaceServices(conn, r.insertId, serviceIds));
+          await transaccion((conn) =>
+            replaceServices(
+              conn,
+              r.insertId,
+              serviceItems(serviceIds, b.serviceLocations)
+            )
+          );
         }
         const item = await packageModel(r.insertId);
         await logActivity({
@@ -362,7 +440,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const serviceIds = await resolveServiceIds(res, b.serviceIds);
         if (serviceIds === null) return;
         if (serviceIds !== undefined) {
-          await transaccion((conn) => replaceServices(conn, id, serviceIds));
+          await transaccion((conn) =>
+            replaceServices(
+              conn,
+              id,
+              serviceItems(serviceIds, b.serviceLocations)
+            )
+          );
         }
         const item = await packageModel(id);
         await logActivity({
