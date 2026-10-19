@@ -60,26 +60,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         try {
           pkgServices = await q(
             `SELECT pps.id, pps.id_purchased_package, pps.id_service, pps.description,
-                    pps.location, s.name AS service_name, s.url AS service_url,
-                    s.use_location AS service_use_location, st.name AS status_name
+                    s.name AS service_name, s.url AS service_url, st.name AS status_name
                FROM purchased_packages_services pps
                LEFT JOIN services s ON s.id = pps.id_service
                LEFT JOIN status st ON st.id = pps.id_status
               WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
               ORDER BY pps.id ASC`,
             [purchasedIds]
-          ).catch(() =>
-            // Sin la migración de ubicaciones: el listado sigue como antes.
-            q(
-              `SELECT pps.id, pps.id_purchased_package, pps.id_service, pps.description,
-                      s.name AS service_name, s.url AS service_url, st.name AS status_name
-                 FROM purchased_packages_services pps
-                 LEFT JOIN services s ON s.id = pps.id_service
-                 LEFT JOIN status st ON st.id = pps.id_status
-                WHERE pps.active = 1 AND pps.id_purchased_package IN (?)
-                ORDER BY pps.id ASC`,
-              [purchasedIds]
-            )
           );
         } catch {
           // Migración 2026-10-13_services_url.sql aún no aplicada: sin ligas.
@@ -274,40 +261,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [p.name, p.subtitle, p.description, price, p.currency || "MXN", paid, p.id, p.id_package_category, p.id_tier]
         );
         const ppId = Number(ppRes.insertId);
-        // Copia los servicios del paquete a la compra (como el seed), con la
-        // UBICACIÓN que el paquete tenga para cada uno: el cliente la ve en
-        // "Mi paquete" y el estudio en el administrador del paquete.
-        let svcRows: any[] = [];
-        try {
-          const [rows]: any[] = await conn.query(
-            `SELECT id_service, location
-               FROM packages_services WHERE id_package = ? AND active = 1`,
-            [p.id]
-          );
-          svcRows = rows;
-        } catch {
-          // Sin la migración de ubicaciones: se copian los servicios igual.
-          const [rows]: any[] = await conn.query(
-            `SELECT id_service FROM packages_services WHERE id_package = ? AND active = 1`,
-            [p.id]
-          );
-          svcRows = rows;
-        }
+        // Copia los servicios del paquete a la compra (como el seed).
+        const [svcRows]: any[] = await conn.query(
+          `SELECT id_service FROM packages_services WHERE id_package = ? AND active = 1`,
+          [p.id]
+        );
         for (const s of svcRows) {
-          await conn
-            .query(
-              `INSERT INTO purchased_packages_services
-                 (id_purchased_package, id_status, id_service, location)
-               VALUES (?, 1, ?, ?)`,
-              [ppId, s.id_service, s.location || null]
-            )
-            .catch(() =>
-              conn.query(
-                `INSERT INTO purchased_packages_services (id_purchased_package, id_status, id_service)
-                 VALUES (?, 1, ?)`,
-                [ppId, s.id_service]
-              )
-            );
+          await conn.query(
+            `INSERT INTO purchased_packages_services (id_purchased_package, id_status, id_service)
+             VALUES (?, 1, ?)`,
+            [ppId, s.id_service]
+          );
         }
         const [linkRes]: any[] = await conn.query(
           `INSERT INTO users_packages (id_user, id_purchased_package) VALUES (?, ?)`,

@@ -9,18 +9,39 @@ import { readPaging, pageMeta } from "../../../lib/pagination";
 // ==================================================================
 // Agendas de eventos por paquete comprado  ->  /api/admin/agendas
 //   GET     ?userId=N | ?purchasedPackageId=N | ?from=YYYY-MM-DD&to=YYYY-MM-DD
-//           lista agendas (fecha/hora + servicio + cliente/paquete)
-//   POST    { purchasedPackageId, serviceId?, eventDate, description? }
-//   PUT     { id, serviceId?, eventDate?, description? }
+//           lista agendas (fecha/hora + servicio + cliente/paquete + lugar)
+//   POST    { purchasedPackageId, serviceId?, eventDate, description?,
+//             location?, lat?, lng? }
+//   PUT     { id, serviceId?, eventDate?, description?, location?, lat?, lng? }
 //   DELETE  ?id=N  baja lógica (active = 0)
 //
 // Tabla `schedules` (migración 2026-10-11: antes `agendas`).
+//
+// El LUGAR (migración 2026-10-19: `location` + `lat`/`lng`) es opcional y se
+// elige con el mapa del panel; sin la migración todo sigue funcionando (se
+// guarda la fecha y la nota, y el lugar simplemente no existe).
 // Permiso por acción sobre el módulo "schedules" (Admin pasa siempre).
 // Las agendas se crean desde el paquete comprado del cliente y se pueden
 // crear VARIAS por servicio.
 // ==================================================================
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+
+/** Una fila del listado de agendas (con el lugar, si la migración está puesta). */
+type AgendaRow = {
+  id: number;
+  id_purchased_package: number | null;
+  description: string | null;
+  event_date: string | null;
+  package_name: string | null;
+  service_id: number | null;
+  service_name: string | null;
+  client_id: number | null;
+  client_name: string | null;
+  location?: string | null;
+  lat?: string | number | null;
+  lng?: string | number | null;
+};
 
 /**
  * Normaliza una fecha/hora a "YYYY-MM-DD HH:MM:SS".
@@ -33,6 +54,22 @@ function normalizeDateTime(raw: unknown): string | null {
   let out = value.replace("T", " ");
   if (out.length === 16) out += ":00"; // sin segundos -> :00
   return out;
+}
+
+/** Coordenada válida (-90..90 / -180..180) o null si no viene o no cuadra. */
+function coordinate(raw: unknown, max: number): number | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || Math.abs(n) > max) return null;
+  return Number(n.toFixed(7));
+}
+
+/** El lugar de la agenda: nombre + coordenadas ("" / null = sin lugar). */
+function placeOf(b: Record<string, unknown>) {
+  const location = norm(b.location ?? b.place ?? b.lugar).slice(0, 255);
+  const lat = coordinate(b.lat ?? b.latitude, 90);
+  const lng = coordinate(b.lng ?? b.lon ?? b.longitude, 180);
+  return { location, lat, lng };
 }
 
 /** Valida que un servicio exista y esté activo. */
@@ -97,19 +134,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `SELECT COUNT(*) AS n FROM schedules a WHERE ${where.join(" AND ")}`,
           params
         );
-        const rows = await q<{
-          id: number;
-          id_purchased_package: number | null;
-          description: string | null;
-          event_date: string | null;
-          package_name: string | null;
-          service_id: number | null;
-          service_name: string | null;
-          client_id: number | null;
-          client_name: string | null;
-        }>(
+        // El LUGAR puede no existir todavía (migración pendiente): se pide con
+        // sus columnas y, si la base no las tiene, se pide sin ellas. Así el
+        // calendario sigue funcionando en una BD sin migrar.
+        const selectAgendas = (place: string) =>
           `SELECT a.id, a.id_purchased_package, a.description,
                   DATE_FORMAT(a.event_date, '%Y-%m-%dT%H:%i:%s') AS event_date,
+                  ${place}
                   pp.name AS package_name,
                   s.id AS service_id, s.name AS service_name,
                   (SELECT u2.id FROM users_packages up2
@@ -128,9 +159,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              LEFT JOIN services s ON s.id = a.id_service
             WHERE ${where.join(" AND ")}
             ORDER BY a.event_date ASC, a.id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`,
-          params
-        );
+            LIMIT ${p.limit} OFFSET ${p.offset}`;
+
+        let rows: AgendaRow[];
+        try {
+          rows = await q<AgendaRow>(selectAgendas("a.location, a.lat, a.lng,"), params);
+        } catch {
+          rows = await q<AgendaRow>(selectAgendas(""), params);
+        }
 
         res.status(200).json({
           ...pageMeta(countRows[0]?.n, p),
@@ -144,6 +180,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             serviceName: String(r.service_name || ""),
             eventDate: String(r.event_date || ""),
             description: String(r.description || ""),
+            // El LUGAR: nombre y coordenadas (null si la agenda no lo tiene).
+            location: String(r.location || ""),
+            lat: r.lat === null || r.lat === undefined ? null : Number(r.lat),
+            lng: r.lng === null || r.lng === undefined ? null : Number(r.lng),
           })),
         });
         return;
@@ -176,17 +216,42 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const description = norm(b.description);
-        const r = await exec(
-          `INSERT INTO schedules (id_purchased_package, id_service, event_date, description)
-           VALUES (?, ?, ?, ?)`,
-          [purchasedPackageId, serviceId, eventDate, description || null]
-        );
+        const { location, lat, lng } = placeOf(b);
+        // Con la migración del lugar se guarda también DÓNDE es; sin ella, la
+        // agenda se guarda igual (no se pierde la fecha ni la nota).
+        let r: { insertId: number; affectedRows: number };
+        try {
+          r = await exec(
+            `INSERT INTO schedules
+               (id_purchased_package, id_service, event_date, description,
+                location, lat, lng)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              purchasedPackageId,
+              serviceId,
+              eventDate,
+              description || null,
+              location || null,
+              lat,
+              lng,
+            ]
+          );
+        } catch {
+          r = await exec(
+            `INSERT INTO schedules (id_purchased_package, id_service, event_date, description)
+             VALUES (?, ?, ?, ?)`,
+            [purchasedPackageId, serviceId, eventDate, description || null]
+          );
+        }
         const item = {
           id: r.insertId,
           purchasedPackageId,
           serviceId,
           eventDate,
           description,
+          location,
+          lat,
+          lng,
         };
         await logActivity({
           userId: me.sub,
@@ -246,15 +311,41 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fields.push("`description` = ?");
           params.push(description || null);
         }
-        if (!fields.length) {
+        // LUGAR: se puede fijar, cambiar o quitar (location vacío = sin lugar).
+        const place = placeOf(b);
+        const extraFields: string[] = [];
+        const extraParams: unknown[] = [];
+        if (b.location !== undefined || b.place !== undefined) {
+          extraFields.push("`location` = ?");
+          extraParams.push(place.location || null);
+        }
+        if (b.lat !== undefined || b.latitude !== undefined) {
+          extraFields.push("`lat` = ?");
+          extraParams.push(place.lat);
+        }
+        if (b.lng !== undefined || b.lon !== undefined || b.longitude !== undefined) {
+          extraFields.push("`lng` = ?");
+          extraParams.push(place.lng);
+        }
+        if (!fields.length && !extraFields.length) {
           fail(res, 400, "Nada que actualizar", "No enviaste ningún campo de la agenda");
           return;
         }
 
-        await exec(
-          `UPDATE schedules SET ${fields.join(", ")} WHERE id = ?`,
-          [...params, id]
-        );
+        // Sin la migración del lugar, una actualización que solo toca el lugar
+        // no tiene nada que guardar: se dice en vez de fingir que se guardó.
+        try {
+          await exec(
+            `UPDATE schedules SET ${[...fields, ...extraFields].join(", ")} WHERE id = ?`,
+            [...params, ...extraParams, id]
+          );
+        } catch (e) {
+          if (!fields.length) throw e;
+          await exec(
+            `UPDATE schedules SET ${fields.join(", ")} WHERE id = ?`,
+            [...params, id]
+          );
+        }
         await logActivity({
           userId: me.sub,
           module: "schedules",
@@ -271,6 +362,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             id,
             eventDate: b.eventDate ?? b.datetime,
             description: b.description,
+            location: place.location,
+            lat: place.lat,
+            lng: place.lng,
           },
         });
         return;

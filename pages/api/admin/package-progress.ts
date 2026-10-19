@@ -328,8 +328,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         services = await q<Row>(
           svcBase.replace(
             "{EXTRA}",
-            ", s.url AS service_url, s.photos_max, s.allow_folder," +
-              " pps.location, s.use_location AS service_use_location"
+            ", s.url AS service_url, s.photos_max, s.allow_folder"
           ),
           [purchasedPackageId]
         );
@@ -500,10 +499,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               s.allow_folder === null || s.allow_folder === undefined
                 ? true
                 : Number(s.allow_folder) === 1,
-            // UBICACIÓN que el paquete tiene para este servicio (se elige en
-            // el administrador de paquetes; aquí solo se muestra).
-            location: String(s.location || ""),
-            useLocation: Number(s.service_use_location) === 1,
+            // Descripción que el paquete tiene para este servicio.
             description: String(s.description || ""),
             status: String(s.status_name || "Pendiente"),
             statusId: Number(s.id_status || 0),
