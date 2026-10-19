@@ -42,6 +42,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const rows = await q<{
       module: string | null;
       name: string | null;
+      description: string | null;
       pkey: string | null;
       morder: number | null;
       ckey: string | null;
@@ -53,7 +54,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // Se incluye la CATEGORÍA (o null si el módulo va suelto) y el orden
       // del módulo y de su categoría: el sidebar los usa para agrupar.
       // LEFT JOIN hacia el rol: los módulos SIN permiso salen con pkey NULL.
-      `SELECT m.\`module\` AS module, m.name, m.\`order\` AS morder,
+      `SELECT m.\`module\` AS module, m.name, m.description,
+              m.\`order\` AS morder,
               mc.\`key\` AS ckey, mc.description AS cname, mc.\`order\` AS corder,
               p.\`key\` AS pkey
          FROM modules m
@@ -73,6 +75,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       string,
       {
         name: string;
+        description: string;
         order: number | null;
         categoryKey: string | null;
         categoryName: string | null;
@@ -89,6 +92,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (!byModule.has(clave)) {
         byModule.set(clave, {
           name,
+          description: String(r.description || "").trim(),
           order: r.morder,
           categoryKey: r.ckey ? String(r.ckey).trim() : null,
           categoryName: r.cname ? String(r.cname).trim() : null,
@@ -103,6 +107,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       .map(([clave, v]) => ({
         key: clave,
         name: v.name,
+        description: v.description,
         order: v.order,
         categoryKey: v.categoryKey,
         categoryName: v.categoryName,

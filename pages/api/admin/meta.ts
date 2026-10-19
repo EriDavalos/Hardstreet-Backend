@@ -44,6 +44,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       id: number;
       module: string | null;
       name: string | null;
+      description: string | null;
       url: string | null;
       order: number | null;
       categoryId: number | null;
@@ -53,7 +54,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     }>(
       // Orden: módulos SUELTOS primero (COALESCE en 0), luego por categoría
       // (menor = arriba) y dentro por el `order` del módulo (menor = primero).
-      `SELECT m.id, m.\`module\`, m.name, m.url, m.\`order\`,
+      `SELECT m.id, m.\`module\`, m.name, m.description, m.url, m.\`order\`,
               mc.id AS categoryId, mc.\`key\` AS categoryKey,
               mc.description AS categoryName, mc.\`order\` AS categoryOrder
          FROM modules m
@@ -116,6 +117,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           id: m.id,
           key: String(m.module || "").toLowerCase().trim(),
           name: m.name,
+          description: m.description || "",
           url: m.url,
           order: m.order,
           categoryId: m.categoryId,
