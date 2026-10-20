@@ -182,7 +182,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   // Alcance por empresa: el catálogo de paquetes es de UNA empresa.
   const scope = await requestScope(req, me);
+  // Dos formas del MISMO filtro:
+  //   * `scopeSql`    → consultas donde `packages` va con alias `p` (y hay
+  //                     JOINs con tablas que TAMBIÉN tienen id_company).
+  //   * `scopePlain`  → el resto (COUNT, EXISTS, UPDATE y DELETE), donde la
+  //                     tabla `packages` va sola y no hay alias.
+  // Usar `p.id_company` sin el alias rompía el listado (SQL inválido) en
+  // cuanto se trabajaba con una empresa en vez de "todas".
   const scopeSql = scopeFilter(scope, "p.id_company");
+  const scopePlain = scopeFilter(scope);
   const companyId = scope.writeCompanyId;
 
   try {
@@ -192,8 +200,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const p = readPaging(req);
         const hasPublic = await hasPublicColumn();
         const countRows = await q<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM packages WHERE active = 1 AND ${scopeSql.sql}`,
-          scopeSql.params
+          `SELECT COUNT(*) AS n FROM packages WHERE active = 1 AND ${scopePlain.sql}`,
+          scopePlain.params
         );
         const rows = await q<{
           id: number;
@@ -367,8 +375,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const exists = await q(
-          `SELECT id FROM packages WHERE id = ? AND active = 1 AND ${scopeSql.sql}`,
-          [id, ...scopeSql.params]
+          `SELECT id FROM packages WHERE id = ? AND active = 1 AND ${scopePlain.sql}`,
+          [id, ...scopePlain.params]
         );
         if (!exists.length) {
           fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${id}`);
@@ -436,8 +444,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         if (fields.length) {
           await exec(
-            `UPDATE packages SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
-            [...params, id, ...scopeSql.params]
+            `UPDATE packages SET ${fields.join(", ")} WHERE id = ? AND ${scopePlain.sql}`,
+            [...params, id, ...scopePlain.params]
           );
         }
         // Servicios incluidos (reemplaza el set completo si vino el campo).
@@ -485,8 +493,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const r = await exec(
-          `UPDATE packages SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
-          [id, ...scopeSql.params]
+          `UPDATE packages SET active = 0 WHERE id = ? AND ${scopePlain.sql}`,
+          [id, ...scopePlain.params]
         );
         if (!r.affectedRows) {
           fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${id}`);

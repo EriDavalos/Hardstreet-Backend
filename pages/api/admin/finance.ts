@@ -95,6 +95,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const pkgScope = scopeFilterOn(scope, "pp");
   const movScope = scopeFilter(scope);
   const payScope = scopeFilter(scope);
+  // Las consultas de HISTORIAL unen `purchased_packages_movements` (alias m)
+  // y `purchased_packages_payments` (alias p) con `purchased_packages` (pp):
+  // las tres tablas tienen id_company, así que el filtro va CUALIFICADO o
+  // MySQL lo rechaza por ambiguo (y el historial salía vacío).
+  const movJoinScope = scopeFilterOn(scope, "m");
+  const payJoinScope = scopeFilterOn(scope, "p");
   const companyId = scope.writeCompanyId;
 
   try {
@@ -375,16 +381,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              LEFT JOIN purchased_packages pp ON pp.id = m.id_purchased_package${
                withUser ? " LEFT JOIN users u ON u.id = m.id_user" : ""
              }
-            WHERE m.active = 1 AND ${movScope.sql}
+            WHERE m.active = 1 AND ${movJoinScope.sql}
               AND (pp.id IS NULL OR pp.active = 1)
             ORDER BY m.created DESC, m.id DESC
             LIMIT 400`;
         try {
           let rows: Row[];
           try {
-            rows = await q<Row>(movementsQuery(true), movScope.params);
+            rows = await q<Row>(movementsQuery(true), movJoinScope.params);
           } catch {
-            rows = await q<Row>(movementsQuery(false), movScope.params);
+            rows = await q<Row>(movementsQuery(false), movJoinScope.params);
           }
           const pays = await q<Row>(
             `SELECT p.id, p.id_purchased_package AS package_id,
@@ -393,10 +399,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                     NULL AS user_id, NULL AS user_name
                FROM purchased_packages_payments p
                JOIN purchased_packages pp ON pp.id = p.id_purchased_package
-              WHERE p.active = 1 AND pp.active = 1 AND ${payScope.sql}
+              WHERE p.active = 1 AND pp.active = 1 AND ${payJoinScope.sql}
               ORDER BY p.created DESC, p.id DESC
               LIMIT 400`,
-            payScope.params
+            payJoinScope.params
           );
           movementRows = [...pays, ...rows].sort((a, b) =>
             String(b.created).localeCompare(String(a.created))

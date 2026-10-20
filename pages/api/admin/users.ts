@@ -73,6 +73,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const scopeSql = scopeFilterOn(scope, "u");
   const companyId = scope.writeCompanyId;
 
+  // La CUENTA Superadmin es del sistema, no de una empresa: el Superadmin la
+  // sigue viendo (y puede editarla) aunque esté trabajando con UNA empresa.
+  // Para cualquier otro rol el filtro no cambia.
+  const scopeUsersSql = requesterIsSuper
+    ? {
+        sql:
+          scope.companyId === null
+            ? "1 = 1"
+            : "(u.id_company = ? OR LOWER(r.name) = 'superadmin')",
+        params: scope.companyId === null ? [] : [scope.companyId],
+      }
+    : scopeSql;
+
   /** ¿El rol [roleId] es el Superadministrador? */
   async function roleIsSuper(roleId: number | null): Promise<boolean> {
     if (!roleId) return false;
@@ -117,8 +130,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
            )`,
         ];
         const baseParams: unknown[] = [];
-        base.push(scopeSql.sql);
-        baseParams.push(...scopeSql.params);
+        base.push(scopeUsersSql.sql);
+        baseParams.push(...scopeUsersSql.params);
         // Los Admin quedan OCULTOS para quien no sea Admin.
         if (!requesterIsAdmin) {
           base.push("(r.name IS NULL OR LOWER(r.name) <> 'admin')");

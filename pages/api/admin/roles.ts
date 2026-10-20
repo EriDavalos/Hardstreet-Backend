@@ -121,6 +121,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // Admin no puede crearlo, editarlo, borrarlo ni asignárselo a nadie.
   const isSuper = await userIsSuperAdmin(await userRoleId(me.sub));
 
+  // El rol Superadmin es del SISTEMA (`id_company` NULL): no pertenece a la
+  // empresa con la que se trabaja. El Superadministrador lo ve igual, también
+  // al editar su propia cuenta —sin esto, el combo de roles lo mostraba como
+  // "Sin rol" porque el filtro solo miraba la empresa activa.
+  const scopeOrSystem = isSuper
+    ? {
+        sql:
+          scope.companyId === null
+            ? "1 = 1"
+            : "(id_company = ? OR id_company IS NULL)",
+        params: scope.companyId === null ? [] : [scope.companyId],
+      }
+    : scopeSql;
+
   try {
     switch (req.method) {
       case "GET": {
@@ -130,14 +144,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const hidden = isSuper ? "" : "AND LOWER(name) <> 'superadmin'";
         const countRows = await q<{ n: number }>(
           `SELECT COUNT(*) AS n FROM roles
-            WHERE active = 1 ${hidden} AND ${scopeSql.sql}`,
-          scopeSql.params
+            WHERE active = 1 ${hidden} AND ${scopeOrSystem.sql}`,
+          scopeOrSystem.params
         );
         const roles = await q<{ id: number; name: string | null }>(
           `SELECT id, name FROM roles
-            WHERE active = 1 ${hidden} AND ${scopeSql.sql} ORDER BY id ASC
+            WHERE active = 1 ${hidden} AND ${scopeOrSystem.sql}
+            ORDER BY id ASC
             LIMIT ${p.limit} OFFSET ${p.offset}`,
-          scopeSql.params
+          scopeOrSystem.params
         );
         const ids = roles.map((r) => r.id);
         const perms = ids.length
@@ -223,10 +238,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const v = await validateRole(res, b, { withName: false, excludeId: id, companyId });
         if (!v.ok) return;
         if (v.name !== undefined) {
-          await exec(`UPDATE roles SET name = ? WHERE id = ? AND ${scopeSql.sql}`, [
+          await exec(`UPDATE roles SET name = ? WHERE id = ? AND ${scopeOrSystem.sql}`, [
             v.name,
             id,
-            ...scopeSql.params,
+            ...scopeOrSystem.params,
           ]);
         }
         if (v.permissions !== undefined) {
@@ -257,7 +272,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Falta el id del rol", "Indica qué rol quieres eliminar");
           return;
         }
-        if (!isSuper) {
+        // El rol Superadmin NO se elimina: es el nivel más alto del sistema y
+        // su cuenta quedaría sin rol. Se protege para TODOS (también para el
+        // propio Superadministrador).
+        {
           const target = await q<{ name: string | null }>(
             "SELECT name FROM roles WHERE id = ? LIMIT 1",
             [id]
@@ -265,9 +283,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           if (String(target[0]?.name || "").toLowerCase() === "superadmin") {
             fail(
               res,
-              403,
-              "Ese rol es del sistema",
-              "Solo el Superadministrador administra su propio rol"
+              409,
+              "El rol Superadmin no se puede eliminar",
+              "Es el rol más alto del sistema: edítalo, pero no lo borres"
             );
             return;
           }

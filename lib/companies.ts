@@ -102,8 +102,11 @@ export async function folderTaken(
   exceptId = 0
 ): Promise<Company | null> {
   if (!(await hasCompanies())) return null;
+  // Se miran TAMBIÉN las empresas desactivadas: sus archivos siguen en el
+  // disco y, si otra empresa ocupara su carpeta, al reactivarla vería los
+  // archivos de la nueva.
   const rows = await q<{ id: number; name: string; folder_path: string }>(
-    "SELECT id, name, folder_path FROM companies WHERE active = 1 AND id <> ?",
+    "SELECT id, name, folder_path FROM companies WHERE id <> ?",
     [exceptId]
   );
   for (const r of rows) {
