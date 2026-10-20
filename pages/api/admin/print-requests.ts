@@ -10,6 +10,7 @@ import {
   reopenPrintRequest,
   savePrintRequestConfig,
 } from "../../../lib/print-requests";
+import { requestScope } from "../../../lib/company-scope";
 
 // ==================================================================
 // IMPRESIONES -> /api/admin/print-requests
@@ -43,9 +44,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (!session) return;
 
     try {
+      // Alcance por empresa: los envíos de impresión de un estudio.
+      const scope = await requestScope(req, session);
       const [requests, formats] = await Promise.all([
-        printRequests(),
-        printFormats(),
+        printRequests(scope),
+        printFormats(scope),
       ]);
       ok(res, "Impresiones", { requests, formats });
     } catch (e) {
@@ -62,6 +65,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   const session = await requirePermission(req, res, "print", "update");
   if (!session) return;
+  const scope = await requestScope(req, session);
 
   const body = (req.body || {}) as Record<string, unknown>;
   const action = String(body.action || "").trim().toLowerCase();
@@ -79,6 +83,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         formatId: asNumber(body.formatId),
         border: asNumber(body.border),
         crops: body.crops,
+        scope,
       });
       await logActivity({
         userId: session.sub,
@@ -111,6 +116,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         formatId,
         border: asNumber(body.border),
         crops: body.crops,
+        scope,
       });
       await logActivity({
         userId: session.sub,
@@ -125,7 +131,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     }
 
     if (action === "reopen") {
-      const serviceId = await reopenPrintRequest(requestId);
+      const serviceId = await reopenPrintRequest(requestId, scope);
       await logActivity({
         userId: session.sub,
         module: "print",

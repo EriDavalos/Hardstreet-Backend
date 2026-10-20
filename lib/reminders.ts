@@ -2,8 +2,12 @@
 // HARD STREET BACKEND - Avisos de eventos (recordatorios)
 // ==================================================================
 // Genera avisos "falta 1 semana" (kind '7d') y "falta 1 día" (kind '1d')
-// para cada evento de `schedules`, dirigidos a los usuarios que ven el
-// módulo Agendas (rol Admin o permiso activo sobre el módulo).
+// para cada evento de `schedules`, dirigidos al PERSONAL que ve el módulo
+// Agendas (rol Admin o permiso activo sobre el módulo).
+//
+// Un CLIENTE nunca recibe el aviso de un evento ajeno (el texto lleva el
+// nombre del cliente y la nota): solo se le avisa de los eventos de SUS
+// paquetes, y esos avisos los genera su propia consulta a /api/reminders.
 //
 // Quién genera los avisos (dos vías, complementarias):
 //   1. El cron diario de Vercel  -> pages/api/cron/reminders.ts
@@ -15,6 +19,7 @@
 // ==================================================================
 
 import { q, exec } from "./db";
+import { clientPackageIds, viewerIsClient } from "./agenda-visibility";
 
 /** Cuentas regresivas configuradas. 7 = falta una semana; 1 = mañana. */
 export const REMINDER_DAYS = [7, 1] as const;
@@ -50,6 +55,8 @@ export interface DueSchedule {
   package_name: string | null;
   service_name: string | null;
   client_name: string | null;
+  /** Paquete comprado al que pertenece el evento (para filtrar por cliente). */
+  package_id: number | null;
 }
 
 /** Usuarios que reciben avisos: Admin o con permiso activo sobre Agendas. */
@@ -72,7 +79,15 @@ export async function eligibleUserIds(): Promise<number[]> {
           )
         )`
   );
-  return rows.map((r) => r.id);
+  // Un CLIENTE no recibe los avisos del estudio: su texto lleva el nombre
+  // del cliente y la nota del evento, y esos avisos son de OTROS clientes.
+  // Él sí recibe los de SUS eventos, pero por la vía perezosa
+  // ([ensureRemindersForUser]), que filtra por sus paquetes.
+  const out: number[] = [];
+  for (const id of rows.map((r) => r.id)) {
+    if (!(await viewerIsClient(id))) out.push(id);
+  }
+  return out;
 }
 
 /** ¿Este usuario en particular es elegible? (misma regla, un solo usuario) */
@@ -110,6 +125,7 @@ export async function dueSchedules(date: string): Promise<DueSchedule[]> {
     `SELECT a.id,
             DATE_FORMAT(a.event_date, '%Y-%m-%dT%H:%i:%s') AS event_date,
             a.description,
+            a.id_purchased_package AS package_id,
             pp.name AS package_name,
             s.name AS service_name,
             (SELECT TRIM(CONCAT(u2.name, ' ', COALESCE(u2.lastname, '')))
@@ -193,16 +209,48 @@ export async function ensureRemindersForToday(
   return { created, targets };
 }
 
+/** Apaga los avisos de [userId] que NO son de sus paquetes ([own]). */
+async function dropForeignReminders(
+  userId: number,
+  own: number[]
+): Promise<void> {
+  try {
+    // Sin paquetes propios no hay nada que conservar: se apagan todos.
+    const filter = own.length
+      ? "a.id_purchased_package IS NULL OR a.id_purchased_package NOT IN (?)"
+      : "1 = 1";
+    await exec(
+      `UPDATE reminders r
+         LEFT JOIN schedules a ON a.id = r.id_schedule
+          SET r.active = 0
+        WHERE r.id_user = ? AND r.active = 1
+          AND (${filter})`,
+      own.length ? [userId, own] : [userId]
+    );
+  } catch {
+    // Sin la tabla/migración: se sigue igual (solo se generan los propios).
+  }
+}
+
 /**
  * Autogeneración perezosa para UN usuario (la usa GET /api/reminders):
  * si el cron no corrió, el panel crea igual los avisos vencidos de hoy.
  */
 export async function ensureRemindersForUser(userId: number): Promise<number> {
   if (!(await userIsEligible(userId))) return 0;
+  // Si el usuario es CLIENTE, solo se le avisa de SUS eventos (los de sus
+  // paquetes). Los de los demás clientes son información del estudio.
+  const isClient = await viewerIsClient(userId);
+  const mine = isClient ? new Set(await clientPackageIds(userId)) : null;
+  // Un cliente pudo haber recibido avisos de eventos de OTROS clientes (se
+  // generaban para todo el que veía Agendas). Se apagan los que no son suyos
+  // para que la campanita deje de mostrar nombres ajenos.
+  if (mine) await dropForeignReminders(userId, [...mine]);
   const today = todayInTz();
   let created = 0;
   for (const days of REMINDER_DAYS) {
     for (const ev of await dueSchedules(addDays(today, days))) {
+      if (mine && !mine.has(Number(ev.package_id))) continue;
       created += await createReminders([userId], ev, `${days}d` as ReminderKind);
     }
   }

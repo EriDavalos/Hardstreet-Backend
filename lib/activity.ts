@@ -33,6 +33,8 @@ export interface ActivityInput {
   details?: unknown;
   /** Para guardar la IP de origen. */
   req?: NextApiRequest;
+  /** Empresa de la acción (si no viene, la del usuario que la ejecuta). */
+  companyId?: number | null;
 }
 
 /** IP de origen (detrás de proxy usa la primera de x-forwarded-for). */
@@ -50,40 +52,75 @@ export async function logActivity(input: ActivityInput): Promise<void> {
     const id = Number(input.userId || 0) || null;
     let userName: string | null = null;
     let roleName: string | null = null;
+    let companyId = Number(input.companyId || 0) || null;
     if (id) {
-      const rows = await q<{ name: string | null; lastname: string | null; role_name: string | null }>(
-        `SELECT u.name, u.lastname, r.name AS role_name
-           FROM users u
-           LEFT JOIN roles r ON r.id = u.id_role
-          WHERE u.id = ?
-          LIMIT 1`,
-        [id]
-      );
+      type Who = {
+        name: string | null;
+        lastname: string | null;
+        role_name: string | null;
+        id_company?: number | null;
+      };
+      let rows: Who[];
+      try {
+        rows = await q<Who>(
+          `SELECT u.name, u.lastname, r.name AS role_name, u.id_company
+             FROM users u
+             LEFT JOIN roles r ON r.id = u.id_role
+            WHERE u.id = ?
+            LIMIT 1`,
+          [id]
+        );
+      } catch {
+        // Migración de Empresas pendiente: se registra sin empresa.
+        rows = await q<Who>(
+          `SELECT u.name, u.lastname, r.name AS role_name
+             FROM users u
+             LEFT JOIN roles r ON r.id = u.id_role
+            WHERE u.id = ?
+            LIMIT 1`,
+          [id]
+        );
+      }
       if (rows.length) {
         userName =
           `${rows[0].name ?? ""} ${rows[0].lastname ?? ""}`.trim() || null;
         roleName = rows[0].role_name ?? null;
+        // Si el endpoint no dijo la empresa, se usa la del usuario (el
+        // Superadmin no tiene: escribe con la empresa de la petición).
+        companyId = companyId ?? (Number(rows[0].id_company || 0) || null);
       }
     }
-    await exec(
-      `INSERT INTO activity_log
-         (id_user, user_name, role_name, module, module_name, action,
-          entity, entity_id, description, details, ip)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        id,
-        userName,
-        roleName,
-        input.module ?? null,
-        input.moduleName ?? null,
-        input.action,
-        input.entity,
-        input.entityId ?? null,
-        input.description ?? null,
-        input.details === undefined ? null : JSON.stringify(input.details),
-        ipOf(input.req),
-      ]
-    );
+    const values = [
+      id,
+      userName,
+      roleName,
+      input.module ?? null,
+      input.moduleName ?? null,
+      input.action,
+      input.entity,
+      input.entityId ?? null,
+      input.description ?? null,
+      input.details === undefined ? null : JSON.stringify(input.details),
+      ipOf(input.req),
+    ];
+    try {
+      await exec(
+        `INSERT INTO activity_log
+           (id_user, user_name, role_name, module, module_name, action,
+            entity, entity_id, description, details, ip, id_company)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [...values, companyId]
+      );
+    } catch {
+      // Migración de Empresas pendiente: la bitácora funciona igual.
+      await exec(
+        `INSERT INTO activity_log
+           (id_user, user_name, role_name, module, module_name, action,
+            entity, entity_id, description, details, ip)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        values
+      );
+    }
   } catch (e) {
     // Sin migración aplicada la bitácora no existe: se avisa y se sigue.
     console.error("[activity]", e);

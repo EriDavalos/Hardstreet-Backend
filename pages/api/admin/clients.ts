@@ -8,6 +8,7 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
 
 // ==================================================================
 // Clientes (solo rol Admin)  ->  /api/admin/clients
@@ -20,11 +21,16 @@ import { readPaging, pageMeta } from "../../../lib/pagination";
 //          body { userId, packageId } asigna o quita un purchased_package
 // ==================================================================
 
-/** Id del rol Cliente (tolera 'Cliente' y el viejo 'Client'). */
-async function clientRoleId(): Promise<number | null> {
+/**
+ * Id del rol Cliente DE LA EMPRESA (cada empresa tiene sus propios roles).
+ * Si la empresa todavía no tiene el suyo se usa el primero que exista, para
+ * no dejar el módulo sin funcionar tras aplicar la migración.
+ */
+async function clientRoleId(companyId: number): Promise<number | null> {
   const rows = await q<{ id: number }>(
     `SELECT id FROM roles WHERE LOWER(name) IN ('cliente', 'client') AND active = 1
-      ORDER BY id ASC LIMIT 1`,
+      ORDER BY (id_company = ?) DESC, id ASC LIMIT 1`,
+    [companyId]
   );
   return rows[0]?.id ?? null;
 }
@@ -62,7 +68,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "clientes", action);
   if (!me) return;
 
-  const roleId = await clientRoleId();
+  // Alcance por empresa: el directorio de clientes es de UNA empresa.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilterOn(scope, "u");
+  const companyId = scope.writeCompanyId;
+
+  const roleId = await clientRoleId(companyId);
   if (!roleId) {
     fail(
       res,
@@ -89,8 +100,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           " JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1" +
           " WHERE up.id_user = u.id AND up.active = 1)";
 
-        const base: string[] = ["u.active = 1", "u.id_role = ?"];
-        const baseParams: unknown[] = [roleId];
+        const base: string[] = ["u.active = 1", "u.id_role = ?", scopeSql.sql];
+        const baseParams: unknown[] = [roleId, ...scopeSql.params];
         if (search) {
           const like = `%${search}%`;
           base.push(
@@ -111,6 +122,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           params
         );
         // Conteos para los chips + paquetes asignados (stat del módulo).
+        const assignedScope = scopeFilterOn(scope, "u2");
         const facetRows = await q<{ con: number; total: number; assigned: number }>(
           `SELECT
               SUM(CASE WHEN ${pkgs} > 0 THEN 1 ELSE 0 END) AS con,
@@ -118,10 +130,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               (SELECT COUNT(*) FROM users_packages up
                  JOIN purchased_packages pp ON pp.id = up.id_purchased_package AND pp.active = 1
                  JOIN users u2 ON u2.id = up.id_user AND u2.active = 1 AND u2.id_role = ?
-                WHERE up.active = 1) AS assigned
+                WHERE up.active = 1 AND ${assignedScope.sql}) AS assigned
              FROM users u
             WHERE ${baseWhere}`,
-          [roleId, ...baseParams]
+          [roleId, ...assignedScope.params, ...baseParams]
         );
         const rows = await q<UserRow & { role_name: string | null; packages_count: number }>(
           `SELECT u.id, u.name, u.lastname, u.number, u.email, u.id_role, r.name AS role_name,
@@ -171,9 +183,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         const hash = await bcrypt.hash(password, 10);
         const r = await exec(
-          `INSERT INTO users (name, lastname, number, email, password, id_role)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [name, lastname, number, email, hash, roleId]
+          `INSERT INTO users (name, lastname, number, email, password, id_role, id_company)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [name, lastname, number, email, hash, roleId, companyId]
         );
         const item = { id: r.insertId, name, lastname, number, email };
         await logActivity({
@@ -200,7 +212,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         // Solo clientes: evita editar admins desde este modulo
-        const isClient = await q(`SELECT id FROM users WHERE id = ? AND id_role = ? AND active = 1`, [id, roleId]);
+        const isClient = await q(
+          `SELECT id FROM users WHERE id = ? AND id_role = ? AND ${scopeSql.sql} AND active = 1`,
+          [id, roleId, ...scopeSql.params]
+        );
         if (!isClient.length) {
           fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${id}`);
           return;
@@ -238,7 +253,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del cliente");
           return;
         }
-        await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, [...params, id]);
+        await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`, [
+          ...params,
+          id,
+          ...scopeSql.params,
+        ]);
         const item = await clientModel(id);
         await logActivity({
           userId: me.sub,
@@ -262,8 +281,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const r = await exec(
-          `UPDATE users SET active = 0 WHERE id = ? AND id_role = ?`,
-          [id, roleId]
+          `UPDATE users SET active = 0 WHERE id = ? AND id_role = ? AND ${scopeSql.sql}`,
+          [id, roleId, ...scopeSql.params]
         );
         if (!r.affectedRows) {
           fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${id}`);

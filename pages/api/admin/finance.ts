@@ -4,6 +4,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { q, exec } from "../../../lib/db";
+import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-scope";
 
 // ==================================================================
 // FINANZAS DEL NEGOCIO -> /api/admin/finance
@@ -89,6 +90,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "Finanzas", action);
   if (!me) return;
 
+  // Alcance por empresa: cada estudio lleva sus propias cuentas.
+  const scope = await requestScope(req, me);
+  const pkgScope = scopeFilterOn(scope, "pp");
+  const movScope = scopeFilter(scope);
+  const payScope = scopeFilter(scope);
+  const companyId = scope.writeCompanyId;
+
   try {
     // ================================ GET ================================
     if (req.method === "GET") {
@@ -108,13 +116,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                     AND up2.active = 1 AND u2.active = 1
                   ORDER BY up2.id LIMIT 1) AS client_name
            FROM purchased_packages pp
-          WHERE pp.active = 1
+          WHERE pp.active = 1 AND ${pkgScope.sql}
             AND EXISTS (SELECT 1
                           FROM users_packages upx
                           JOIN users ux ON ux.id = upx.id_user
                          WHERE upx.id_purchased_package = pp.id
                            AND upx.active = 1 AND ux.active = 1)
-          ORDER BY pp.id DESC`
+          ORDER BY pp.id DESC`,
+        pkgScope.params
       );
 
       // Movimientos activos: total por paquete y por tipo.
@@ -124,8 +133,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         movements = await q<Row>(
           `SELECT id_purchased_package, kind, COALESCE(SUM(amount), 0) AS total
              FROM purchased_packages_movements
-            WHERE active = 1
-            GROUP BY id_purchased_package, kind`
+            WHERE active = 1 AND ${movScope.sql}
+            GROUP BY id_purchased_package, kind`,
+          movScope.params
         );
       } catch {
         // Migración de movimientos pendiente: el resto del módulo sigue.
@@ -301,9 +311,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `SELECT DATE_FORMAT(created, '%Y-%m') AS ym,
                   COALESCE(SUM(amount), 0) AS total
              FROM purchased_packages_payments
-            WHERE active = 1 AND created >= ?
+            WHERE active = 1 AND ${payScope.sql} AND created >= ?
             GROUP BY ym`,
-          [from]
+          [...payScope.params, from]
         );
         for (const r of rows) {
           const bucket = series.get(String(r.ym || ""));
@@ -317,9 +327,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `SELECT DATE_FORMAT(created, '%Y-%m') AS ym, kind,
                   COALESCE(SUM(amount), 0) AS total
              FROM purchased_packages_movements
-            WHERE active = 1 AND created >= ?
+            WHERE active = 1 AND ${movScope.sql} AND created >= ?
             GROUP BY ym, kind`,
-          [from]
+          [...movScope.params, from]
         );
         for (const r of rows) {
           const bucket = series.get(String(r.ym || ""));
@@ -365,15 +375,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              LEFT JOIN purchased_packages pp ON pp.id = m.id_purchased_package${
                withUser ? " LEFT JOIN users u ON u.id = m.id_user" : ""
              }
-            WHERE m.active = 1 AND (pp.id IS NULL OR pp.active = 1)
+            WHERE m.active = 1 AND ${movScope.sql}
+              AND (pp.id IS NULL OR pp.active = 1)
             ORDER BY m.created DESC, m.id DESC
             LIMIT 400`;
         try {
           let rows: Row[];
           try {
-            rows = await q<Row>(movementsQuery(true));
+            rows = await q<Row>(movementsQuery(true), movScope.params);
           } catch {
-            rows = await q<Row>(movementsQuery(false));
+            rows = await q<Row>(movementsQuery(false), movScope.params);
           }
           const pays = await q<Row>(
             `SELECT p.id, p.id_purchased_package AS package_id,
@@ -382,9 +393,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                     NULL AS user_id, NULL AS user_name
                FROM purchased_packages_payments p
                JOIN purchased_packages pp ON pp.id = p.id_purchased_package
-              WHERE p.active = 1 AND pp.active = 1
+              WHERE p.active = 1 AND pp.active = 1 AND ${payScope.sql}
               ORDER BY p.created DESC, p.id DESC
-              LIMIT 400`
+              LIMIT 400`,
+            payScope.params
           );
           movementRows = [...pays, ...rows].sort((a, b) =>
             String(b.created).localeCompare(String(a.created))
@@ -450,8 +462,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     // Con paquete: se valida que exista. Sin paquete: movimiento general.
     if (purchasedPackageId) {
       const exists = await q(
-        `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
-        [purchasedPackageId]
+        `SELECT id FROM purchased_packages
+          WHERE id = ? AND active = 1 AND id_company = ?`,
+        [purchasedPackageId, companyId]
       );
       if (!exists.length) {
         fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
@@ -463,9 +476,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     try {
       r = await exec(
         `INSERT INTO purchased_packages_movements
-           (id_purchased_package, kind, amount, description)
-         VALUES (?, ?, ?, ?)`,
-        [purchasedPackageId || null, kind, round2(amount), description || null]
+           (id_purchased_package, kind, amount, description, id_company)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          purchasedPackageId || null,
+          kind,
+          round2(amount),
+          description || null,
+          companyId,
+        ]
       );
     } catch (e) {
       // La columna sigue siendo NOT NULL: falta la migración que permite los

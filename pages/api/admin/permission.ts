@@ -2,7 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
-import { userRoleId, userIsAdmin } from "../../../lib/permissions";
+import { userRoleId, userIsAdmin, userIsSuperAdmin } from "../../../lib/permissions";
 import { fail } from "../../../lib/api-response";
 
 // ==================================================================
@@ -38,6 +38,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       fail(res, 401, "Sesión inválida", "Tu usuario ya no existe o está inactivo");
       return;
     }
+
+    // El Superadministrador puede TODO en TODOS los módulos (incluido
+    // Empresas y la carpeta raíz del Drive), aunque la tabla de permisos
+    // todavía no tenga sus filas.
+    const superAdmin = await userIsSuperAdmin(roleId);
 
     const rows = await q<{
       module: string | null;
@@ -122,8 +127,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return (a.order ?? 0) - (b.order ?? 0);
       });
 
-    const isAdmin = await userIsAdmin(roleId);
-    res.status(200).json({ isAdmin, modules });
+    const isAdmin = superAdmin || (await userIsAdmin(roleId));
+    if (superAdmin) {
+      const keys = await q<{ pkey: string | null }>(
+        "SELECT `key` AS pkey FROM permissions WHERE active = 1"
+      );
+      const all = keys
+        .map((k) => String(k.pkey || "").toLowerCase().trim())
+        .filter(Boolean);
+      for (const m of modules) m.actions = [...all];
+    }
+    res.status(200).json({ isAdmin, isSuperAdmin: superAdmin, modules });
   } catch (e) {
     console.error("[admin/permission]", e);
     fail(res, 500, "Hubo un error", "No se pudieron cargar tus permisos");

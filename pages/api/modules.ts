@@ -2,6 +2,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../lib/cors";
 import { getSession } from "../../lib/auth";
 import { q } from "../../lib/db";
+import { userIsSuperAdmin } from "../../lib/permissions";
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const session = await getSession(req);
@@ -14,6 +15,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     ]);
     roleId = Number(u[0]?.id_role || 0);
   }
+
+  // El Superadministrador ve TODOS los módulos (incluido Empresas).
+  const superAdmin = session ? await userIsSuperAdmin(roleId) : false;
 
   // Permisos por módulo en una sola pasada (GROUP_CONCAT en vez de ARRAY_AGG)
   const rows = await q<{
@@ -55,7 +59,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       categoryKey: m.categoryKey,
       categoryName: m.categoryName,
       categoryOrder: m.categoryOrder,
-      permissions: (m.perms || "").split(",").filter(Boolean),
+      permissions: superAdmin
+        ? ["create", "read", "update", "delete", "download", "admin_package"]
+        : (m.perms || "").split(",").filter(Boolean),
     })),
   });
 });

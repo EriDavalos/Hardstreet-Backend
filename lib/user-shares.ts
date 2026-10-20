@@ -473,8 +473,16 @@ export async function unsharePathWith(
 }
 
 /** Nombres de los usuarios que pueden compartir (destinatarios posibles). */
+/**
+ * Usuarios con los que se puede compartir.
+ *
+ * Solo los de MI MISMA empresa: compartir una carpeta con alguien de otro
+ * estudio expondría archivos entre empresas, justo lo que la separación
+ * evita.
+ */
 export async function shareCandidates(
-  excludeId: number
+  excludeId: number,
+  companyId?: number | null
 ): Promise<{ id: number; name: string; email: string; role: string }[]> {
   try {
     const rows = await q<{
@@ -488,8 +496,9 @@ export async function shareCandidates(
          FROM users u
          LEFT JOIN roles r ON r.id = u.id_role AND r.active = 1
         WHERE u.active = 1 AND u.id <> ?
+          ${companyId ? "AND u.id_company = ?" : ""}
         ORDER BY u.name ASC, u.lastname ASC, u.id ASC`,
-      [excludeId]
+      companyId ? [excludeId, companyId] : [excludeId]
     );
     return rows.map((r) => ({
       id: Number(r.id),

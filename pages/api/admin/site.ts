@@ -7,6 +7,7 @@ import {
 import { q, exec } from "../../../lib/db";
 import { ok, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { requestScope } from "../../../lib/company-scope";
 
 // ==================================================================
 // DISEÑO DEL SITIO (panel) -> /api/admin/site
@@ -31,12 +32,23 @@ const asDoc = (v: unknown): Doc | null => {
   return v as Doc;
 };
 
-/** Lee la fila única. Tolerante: si falta la migración, devuelve nulls. */
-async function readRow(): Promise<{ design: unknown; landing: unknown }> {
-  const rows = await q<{ design: unknown; landing: unknown }>(
-    "SELECT design, landing FROM site_config WHERE id = 1 LIMIT 1"
-  );
-  return rows[0] || { design: null, landing: null };
+/**
+ * Lee el documento de la EMPRESA. Tolerante: si la migración de Empresas
+ * todavía no está, cae a la fila única de siempre.
+ */
+async function readRow(companyId: number): Promise<{ design: unknown; landing: unknown }> {
+  try {
+    const rows = await q<{ design: unknown; landing: unknown }>(
+      "SELECT design, landing FROM site_config WHERE id_company = ? ORDER BY id ASC LIMIT 1",
+      [companyId]
+    );
+    return rows[0] || { design: null, landing: null };
+  } catch {
+    const rows = await q<{ design: unknown; landing: unknown }>(
+      "SELECT design, landing FROM site_config WHERE id = 1 LIMIT 1"
+    );
+    return rows[0] || { design: null, landing: null };
+  }
 }
 
 // Tope del HTML propio de una sección (100 KB es de sobra para una sección;
@@ -119,8 +131,11 @@ function sanitizeLanding(doc: Doc): Doc {
   return out;
 }
 
-/** Guarda los documentos que vengan (la fila se crea si no existía). */
-async function writeRow(patch: { design?: string; landing?: string }) {
+/** Guarda los documentos de la empresa (la fila se crea si no existía). */
+async function writeRow(
+  patch: { design?: string; landing?: string },
+  companyId: number
+) {
   const fields: string[] = [];
   const params: unknown[] = [];
   if (patch.design !== undefined) {
@@ -132,8 +147,34 @@ async function writeRow(patch: { design?: string; landing?: string }) {
     params.push(patch.landing);
   }
   if (!fields.length) return;
+  if (await hasCompanyColumn()) {
+    await exec(
+      `INSERT INTO site_config (id_company)
+       SELECT ? WHERE NOT EXISTS (SELECT 1 FROM site_config WHERE id_company = ?)`,
+      [companyId, companyId]
+    );
+    await exec(
+      `UPDATE site_config SET ${fields.join(", ")} WHERE id_company = ?`,
+      [...params, companyId]
+    );
+    return;
+  }
+  // Sin la migración de Empresas: fila única de siempre.
   await exec("INSERT INTO site_config (id) VALUES (1) ON DUPLICATE KEY UPDATE id = id");
   await exec(`UPDATE site_config SET ${fields.join(", ")} WHERE id = 1`, params);
+}
+
+/** ¿La columna `site_config.id_company` ya existe? (se pregunta una vez) */
+let _companyColumn: boolean | null = null;
+async function hasCompanyColumn(): Promise<boolean> {
+  if (_companyColumn !== null) return _companyColumn;
+  try {
+    const rows = await q("SHOW COLUMNS FROM site_config LIKE 'id_company'");
+    _companyColumn = rows.length > 0;
+  } catch {
+    _companyColumn = false;
+  }
+  return _companyColumn;
 }
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
@@ -177,18 +218,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   try {
+    // Alcance por empresa: cada estudio tiene su propio sitio.
+    const scope = await requestScope(req, me);
+    const companyId = scope.writeCompanyId;
+
     if (req.method === "GET") {
-      const row = await readRow();
+      const row = await readRow(companyId);
       ok(res, "Diseño del sitio", { design: row.design, landing: row.landing });
       return;
     }
 
-    await writeRow({
-      ...(design ? { design: JSON.stringify(design) } : {}),
-      ...(landing ? { landing: JSON.stringify(sanitizeLanding(landing)) } : {}),
-    });
+    await writeRow(
+      {
+        ...(design ? { design: JSON.stringify(design) } : {}),
+        ...(landing ? { landing: JSON.stringify(sanitizeLanding(landing)) } : {}),
+      },
+      companyId
+    );
 
-    const row = await readRow();
+    const row = await readRow(companyId);
     await logActivity({
       userId: me.sub,
       module: design ? "packages" : "settings",

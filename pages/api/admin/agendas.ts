@@ -5,6 +5,13 @@ import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
+import {
+  agendaForViewer,
+  clientPackageIds,
+  viewerIsClient,
+  type AgendaItem,
+} from "../../../lib/agenda-visibility";
 
 // ==================================================================
 // Agendas de eventos por paquete comprado  ->  /api/admin/agendas
@@ -23,6 +30,11 @@ import { readPaging, pageMeta } from "../../../lib/pagination";
 // Permiso por acción sobre el módulo "schedules" (Admin pasa siempre).
 // Las agendas se crean desde el paquete comprado del cliente y se pueden
 // crear VARIAS por servicio.
+//
+// VISIBILIDAD PARA CLIENTES: un cliente (rol "Cliente" o usuario con
+// paquetes comprados) recibe sus eventos completos y los de los demás como
+// huecos "ocupado" (sin cliente, paquete, servicio, nota ni lugar). El
+// enmascarado se hace AQUÍ, en el servidor (ver lib/agenda-visibility.ts).
 // ==================================================================
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
@@ -72,11 +84,11 @@ function placeOf(b: Record<string, unknown>) {
   return { location, lat, lng };
 }
 
-/** Valida que un servicio exista y esté activo. */
-async function serviceExists(id: number): Promise<boolean> {
+/** Valida que un servicio exista, esté activo y sea de la empresa. */
+async function serviceExists(id: number, companyId: number): Promise<boolean> {
   const rows = await q<{ id: number }>(
-    `SELECT id FROM services WHERE id = ? AND active = 1`,
-    [id]
+    `SELECT id FROM services WHERE id = ? AND active = 1 AND id_company = ?`,
+    [id, companyId]
   );
   return rows.length > 0;
 }
@@ -97,11 +109,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "schedules", action);
   if (!me) return;
 
+  // Alcance por empresa: las agendas de un estudio no se mezclan con otro.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilterOn(scope, "a");
+  const companyId = scope.writeCompanyId;
+
   try {
     switch (req.method) {
       case "GET": {
-        const where: string[] = [`a.active = 1`];
-        const params: unknown[] = [];
+        const where: string[] = [`a.active = 1`, scopeSql.sql];
+        const params: unknown[] = [...scopeSql.params];
 
         const userId = Number(req.query.userId || 0);
         if (userId) {
@@ -168,9 +185,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           rows = await q<AgendaRow>(selectAgendas(""), params);
         }
 
-        res.status(200).json({
-          ...pageMeta(countRows[0]?.n, p),
-          agendas: rows.map((r) => ({
+        // ¿Quién mira? Si es CLIENTE, solo sus eventos llevan detalle; los
+        // demás se devuelven como huecos ocupados (la app pinta "Ocupado").
+        const isClient = await viewerIsClient(me.sub);
+        const ownPackages = isClient
+          ? new Set(await clientPackageIds(me.sub))
+          : null;
+
+        const agendas = rows.map((r) => {
+          const item: AgendaItem = {
             id: r.id,
             purchasedPackageId: r.id_purchased_package,
             userId: r.client_id ?? null,
@@ -184,7 +207,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             location: String(r.location || ""),
             lat: r.lat === null || r.lat === undefined ? null : Number(r.lat),
             lng: r.lng === null || r.lng === undefined ? null : Number(r.lng),
-          })),
+            busy: false,
+          };
+          return agendaForViewer(item, isClient, ownPackages);
+        });
+
+        res.status(200).json({
+          ...pageMeta(countRows[0]?.n, p),
+          // Se lo decimos a la app para que la franja de "próximos eventos"
+          // y el widget sepan que el calendario viene en modo cliente.
+          clientView: isClient,
+          agendas,
         });
         return;
       }
@@ -202,8 +235,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const pkg = await q(
-          `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
-          [purchasedPackageId]
+          `SELECT id FROM purchased_packages
+            WHERE id = ? AND active = 1 AND id_company = ?`,
+          [purchasedPackageId, companyId]
         );
         if (!pkg.length) {
           fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
@@ -211,7 +245,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         const serviceId =
           Number(b.serviceId ?? b.id_service ?? 0) || null;
-        if (serviceId && !(await serviceExists(serviceId))) {
+        if (serviceId && !(await serviceExists(serviceId, companyId))) {
           fail(res, 400, "Servicio inexistente", `No hay un servicio activo con id ${serviceId}`);
           return;
         }
@@ -224,8 +258,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           r = await exec(
             `INSERT INTO schedules
                (id_purchased_package, id_service, event_date, description,
-                location, lat, lng)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                location, lat, lng, id_company)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
             [
               purchasedPackageId,
               serviceId,
@@ -234,13 +268,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               location || null,
               lat,
               lng,
+              companyId,
             ]
           );
         } catch {
           r = await exec(
-            `INSERT INTO schedules (id_purchased_package, id_service, event_date, description)
-             VALUES (?, ?, ?, ?)`,
-            [purchasedPackageId, serviceId, eventDate, description || null]
+            `INSERT INTO schedules
+               (id_purchased_package, id_service, event_date, description, id_company)
+             VALUES (?, ?, ?, ?, ?)`,
+            [purchasedPackageId, serviceId, eventDate, description || null, companyId]
           );
         }
         const item = {
@@ -277,8 +313,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const exists = await q(
-          `SELECT id FROM schedules WHERE id = ? AND active = 1`,
-          [id]
+          `SELECT id FROM schedules WHERE id = ? AND active = 1 AND ${scopeSql.sql}`,
+          [id, ...scopeSql.params]
         );
         if (!exists.length) {
           fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);
@@ -290,7 +326,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
         if (b.serviceId !== undefined || b.id_service !== undefined) {
           const serviceId = Number(b.serviceId ?? b.id_service ?? 0) || null;
-          if (serviceId && !(await serviceExists(serviceId))) {
+          if (serviceId && !(await serviceExists(serviceId, companyId))) {
             fail(res, 400, "Servicio inexistente", `No hay un servicio activo con id ${serviceId}`);
             return;
           }
@@ -336,14 +372,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // no tiene nada que guardar: se dice en vez de fingir que se guardó.
         try {
           await exec(
-            `UPDATE schedules SET ${[...fields, ...extraFields].join(", ")} WHERE id = ?`,
-            [...params, ...extraParams, id]
+            `UPDATE schedules SET ${[...fields, ...extraFields].join(", ")}
+              WHERE id = ? AND ${scopeSql.sql}`,
+            [...params, ...extraParams, id, ...scopeSql.params]
           );
         } catch (e) {
           if (!fields.length) throw e;
           await exec(
-            `UPDATE schedules SET ${fields.join(", ")} WHERE id = ?`,
-            [...params, id]
+            `UPDATE schedules SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
+            [...params, id, ...scopeSql.params]
           );
         }
         await logActivity({
@@ -376,7 +413,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Falta el id de la agenda", "Indica qué agenda quieres eliminar");
           return;
         }
-        const r = await exec(`UPDATE schedules SET active = 0 WHERE id = ?`, [id]);
+        const r = await exec(
+          `UPDATE schedules SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
+          [id, ...scopeSql.params]
+        );
         if (!r.affectedRows) {
           fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);
           return;

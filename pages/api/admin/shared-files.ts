@@ -17,6 +17,7 @@ import {
   sharesByTarget,
   unsharePathWith,
 } from "../../../lib/user-shares";
+import { requestScope } from "../../../lib/company-scope";
 
 // ==================================================================
 // MÓDULO "ARCHIVOS COMPARTIDOS"  ->  /api/admin/shared-files
@@ -92,6 +93,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const allowed = await requirePermission(req, res, "archivos compartidos", action);
   if (!allowed) return;
 
+  // Alcance por empresa: solo se comparte DENTRO del mismo estudio.
+  const scope = await requestScope(req, me);
+  const companyId = scope.writeCompanyId;
+
+  /** Ids de usuario que pertenecen a mi empresa. */
+  async function sameCompanyIds(): Promise<Set<number>> {
+    const rows = await q<{ id: number }>(
+      "SELECT id FROM users WHERE active = 1 AND id_company = ?",
+      [companyId]
+    );
+    return new Set(rows.map((r) => Number(r.id)));
+  }
+
   // El módulo permite VER a todos, pero compartir no: el Cliente solo ve lo
   // que le comparten (la app le oculta los botones con el mismo criterio).
   const canShare = action === "read" ? await userCan("create") : true;
@@ -162,7 +176,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
                 permissions: s.permissions,
               })),
             },
-            candidates: await shareCandidates(me.sub),
+            candidates: await shareCandidates(me.sub, companyId),
             canShare,
             canDelete,
           });
@@ -171,7 +185,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const [shared, received, candidates] = await Promise.all([
           sharesByOwner(me.sub),
           sharesByTarget(me.sub),
-          shareCandidates(me.sub),
+          shareCandidates(me.sub, companyId),
         ]);
         return ok(res, "Archivos compartidos", {
           item: {
@@ -198,6 +212,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         if (!userIds.length) {
           fail(res, 400, "Falta a quién", "Elige al menos un usuario");
+          return;
+        }
+        // Solo dentro de la misma empresa.
+        const allowedIds = await sameCompanyIds();
+        const foreign = userIds.filter((id) => !allowedIds.has(id));
+        if (foreign.length) {
+          fail(
+            res,
+            403,
+            "Hay usuarios de otra empresa",
+            "Solo puedes compartir con usuarios de tu misma empresa"
+          );
           return;
         }
 

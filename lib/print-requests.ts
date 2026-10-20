@@ -20,6 +20,16 @@
 
 import { q, exec, transaccion } from "./db";
 import { normalizeDrivePath } from "./drive-paths";
+import { scopeFilter, scopeFilterOn, type CompanyScope } from "./company-scope";
+
+/** Filtro por empresa (sin alcance = todo, para llamadas internas). */
+function filterOf(scope?: CompanyScope, table?: string) {
+  return scope
+    ? table
+      ? scopeFilterOn(scope, table)
+      : scopeFilter(scope)
+    : { sql: "1 = 1", params: [] as number[] };
+}
 
 export type PrintStatus = "sent" | "finished";
 
@@ -136,14 +146,16 @@ function missingColumn(e: unknown): boolean {
   );
 }
 
-/** Formatos activos, en el orden que fijó el estudio. */
-export async function printFormats(): Promise<PrintFormat[]> {
+/** Formatos activos de la empresa, en el orden que fijó el estudio. */
+export async function printFormats(scope?: CompanyScope): Promise<PrintFormat[]> {
+  const f = filterOf(scope);
   try {
     const rows = await q<any>(
       `SELECT id, name, width, height, unit, \`order\`
          FROM print_formats
-        WHERE active = 1
-        ORDER BY \`order\` ASC, id ASC`
+        WHERE active = 1 AND ${f.sql}
+        ORDER BY \`order\` ASC, id ASC`,
+      f.params
     );
     return rows.map((r) => ({
       id: asNumber(r.id),
@@ -167,6 +179,7 @@ export async function savePrintFormat(input: {
   width: number;
   height: number;
   unit?: string;
+  scope: CompanyScope;
 }): Promise<PrintFormat> {
   const name = norm(input.name);
   const width = asNumber(input.width);
@@ -177,34 +190,47 @@ export async function savePrintFormat(input: {
     });
   }
   const unit = norm(input.unit).toLowerCase() === "cm" ? "cm" : "in";
+  const scope = input.scope;
+  const f = filterOf(scope);
   const existing = await q<{ id: number }>(
-    `SELECT id FROM print_formats WHERE LOWER(name) = LOWER(?) LIMIT 1`,
-    [name]
+    `SELECT id FROM print_formats
+      WHERE LOWER(name) = LOWER(?) AND ${f.sql} LIMIT 1`,
+    [name, ...f.params]
   );
   if (existing.length) {
     await exec(
       `UPDATE print_formats SET width = ?, height = ?, unit = ?, active = 1
-        WHERE id = ?`,
-      [width, height, unit, existing[0].id]
+        WHERE id = ? AND ${f.sql}`,
+      [width, height, unit, existing[0].id, ...f.params]
     );
-    const all = await printFormats();
-    return all.find((f) => f.id === existing[0].id) ?? all[0];
+    const all = await printFormats(scope);
+    return all.find((fmt) => fmt.id === existing[0].id) ?? all[0];
   }
   const order = await q<{ next: number }>(
-    `SELECT COALESCE(MAX(\`order\`), 0) + 1 AS next FROM print_formats`
+    `SELECT COALESCE(MAX(\`order\`), 0) + 1 AS next FROM print_formats
+      WHERE ${f.sql}`,
+    f.params
   );
   const r = await exec(
-    `INSERT INTO print_formats (name, width, height, unit, \`order\`, active)
-     VALUES (?, ?, ?, ?, ?, 1)`,
-    [name, width, height, unit, order[0]?.next ?? 1]
+    `INSERT INTO print_formats
+       (name, width, height, unit, \`order\`, active, id_company)
+     VALUES (?, ?, ?, ?, ?, 1, ?)`,
+    [name, width, height, unit, order[0]?.next ?? 1, scope.writeCompanyId]
   );
-  const all = await printFormats();
-  return all.find((f) => f.id === r.insertId) ?? all[all.length - 1];
+  const all = await printFormats(scope);
+  return all.find((fmt) => fmt.id === r.insertId) ?? all[all.length - 1];
 }
 
 /** Baja lógica de un formato (los envíos ya cerrados conservan su nombre). */
-export async function deletePrintFormat(id: number): Promise<void> {
-  await exec(`UPDATE print_formats SET active = 0 WHERE id = ?`, [id]);
+export async function deletePrintFormat(
+  id: number,
+  scope: CompanyScope
+): Promise<void> {
+  const f = filterOf(scope);
+  await exec(`UPDATE print_formats SET active = 0 WHERE id = ? AND ${f.sql}`, [
+    id,
+    ...f.params,
+  ]);
 }
 
 /**
@@ -285,6 +311,7 @@ export async function createPrintRequest(args: {
   serviceId: number;
   userId: number;
   paths: string[];
+  companyId?: number;
 }): Promise<number> {
   const serviceId = asNumber(args.serviceId);
   const paths: string[] = [];
@@ -306,9 +333,9 @@ export async function createPrintRequest(args: {
     );
     const [res]: any = await conn.query(
       `INSERT INTO print_requests
-         (id_purchased_package_service, id_user, status, sent_at, active)
-       VALUES (?, ?, 'sent', NOW(), 1)`,
-      [serviceId, args.userId || null]
+         (id_purchased_package_service, id_user, status, sent_at, active, id_company)
+       VALUES (?, ?, 'sent', NOW(), 1, ?)`,
+      [serviceId, args.userId || null, args.companyId || 1]
     );
     const requestId = Number(res.insertId);
     for (const p of paths) {
@@ -326,7 +353,8 @@ export async function createPrintRequest(args: {
  * Todos los envíos activos, listos para el módulo: servicio, paquete,
  * cliente, formato y fotos.
  */
-export async function printRequests(): Promise<PrintRequest[]> {
+export async function printRequests(scope?: CompanyScope): Promise<PrintRequest[]> {
+  const f = filterOf(scope, "r");
   let rows: any[] = [];
   try {
     rows = await q<any>(
@@ -336,7 +364,7 @@ export async function printRequests(): Promise<PrintRequest[]> {
               CONCAT_WS(' ', u.name, u.lastname) AS clientName,
               pp.name AS packageName,
               COALESCE(s.name, 'Servicio') AS serviceName,
-              f.name AS formatName
+              pf.name AS formatName
          FROM print_requests r
          JOIN purchased_packages_services pps
            ON pps.id = r.id_purchased_package_service
@@ -344,9 +372,10 @@ export async function printRequests(): Promise<PrintRequest[]> {
            ON pp.id = pps.id_purchased_package
          LEFT JOIN services s ON s.id = pps.id_service
          LEFT JOIN users u ON u.id = r.id_user
-         LEFT JOIN print_formats f ON f.id = r.id_format
-        WHERE r.active = 1
-        ORDER BY r.sent_at DESC, r.id DESC`
+         LEFT JOIN print_formats pf ON pf.id = r.id_format
+        WHERE r.active = 1 AND ${f.sql}
+        ORDER BY r.sent_at DESC, r.id DESC`,
+      f.params
     );
   } catch {
     return []; // migración pendiente
@@ -420,9 +449,11 @@ export async function savePrintRequestConfig(args: {
   formatId: number;
   border: number;
   crops: unknown;
+  scope: CompanyScope;
 }): Promise<{ id: number; border: number; crops: number }> {
   const id = asNumber(args.id);
   const formatId = asNumber(args.formatId);
+  const f = filterOf(args.scope);
   if (!id) {
     throw Object.assign(new Error("Indica el envío"), { status: 400 });
   }
@@ -432,8 +463,9 @@ export async function savePrintRequestConfig(args: {
     });
   }
   const current = await q<{ status: string }>(
-    `SELECT status FROM print_requests WHERE id = ? AND active = 1 LIMIT 1`,
-    [id]
+    `SELECT status FROM print_requests
+      WHERE id = ? AND active = 1 AND ${f.sql} LIMIT 1`,
+    [id, ...f.params]
   );
   if (!current.length) {
     throw Object.assign(new Error("Ese envío ya no existe"), { status: 404 });
@@ -450,8 +482,8 @@ export async function savePrintRequestConfig(args: {
   try {
     await exec(
       `UPDATE print_requests SET id_format = ?, border = ?, crops = ?
-        WHERE id = ?`,
-      [formatId, border, payload, id]
+        WHERE id = ? AND ${f.sql}`,
+      [formatId, border, payload, id, ...f.params]
     );
   } catch (e) {
     if (!missingColumn(e)) throw e;
@@ -472,7 +504,9 @@ export async function finishPrintRequest(args: {
   formatId: number;
   border: number;
   crops?: unknown;
+  scope: CompanyScope;
 }): Promise<void> {
+  const f = filterOf(args.scope);
   const border = Math.max(0, Math.min(30, Math.round(asNumber(args.border))));
   const withCrops = args.crops !== undefined;
   const payload = JSON.stringify(sanitizePrintCrops(args.crops));
@@ -482,10 +516,10 @@ export async function finishPrintRequest(args: {
       `UPDATE print_requests
           SET status = 'finished', id_format = ?, border = ?,
               finished_at = NOW(), active = 1${withCrops ? ", crops = ?" : ""}
-        WHERE id = ?`,
+        WHERE id = ? AND ${f.sql}`,
       withCrops
-        ? [args.formatId || null, border, payload, args.id]
-        : [args.formatId || null, border, args.id]
+        ? [args.formatId || null, border, payload, args.id, ...f.params]
+        : [args.formatId || null, border, args.id, ...f.params]
     );
   } catch (e) {
     // Cerrar el trabajo NUNCA debe quedar bloqueado por la migración de
@@ -495,8 +529,8 @@ export async function finishPrintRequest(args: {
       `UPDATE print_requests
           SET status = 'finished', id_format = ?, border = ?,
               finished_at = NOW(), active = 1
-        WHERE id = ?`,
-      [args.formatId || null, border, args.id]
+        WHERE id = ? AND ${f.sql}`,
+      [args.formatId || null, border, args.id, ...f.params]
     );
   }
   if (!r.affectedRows) {
@@ -508,17 +542,21 @@ export async function finishPrintRequest(args: {
  * Reabre un envío: deja de estar activo y el cliente vuelve a poder cambiar
  * su selección. El historial se conserva (active = 0).
  */
-export async function reopenPrintRequest(id: number): Promise<number> {
+export async function reopenPrintRequest(
+  id: number,
+  scope: CompanyScope
+): Promise<number> {
+  const f = filterOf(scope);
   const row = await q<{ serviceId: number }>(
     `SELECT id_purchased_package_service AS serviceId
-       FROM print_requests WHERE id = ? LIMIT 1`,
-    [id]
+       FROM print_requests WHERE id = ? AND ${f.sql} LIMIT 1`,
+    [id, ...f.params]
   );
   await exec(
     `UPDATE print_requests
         SET status = 'reopened', active = 0, finished_at = NULL
-      WHERE id = ?`,
-    [id]
+      WHERE id = ? AND ${f.sql}`,
+    [id, ...f.params]
   );
   return asNumber(row[0]?.serviceId);
 }

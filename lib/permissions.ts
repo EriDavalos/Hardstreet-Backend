@@ -12,10 +12,13 @@
 
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getSession } from "./auth";
+import { isSuperAdminRole } from "./companies";
+import { companyDisabledFor } from "./company-scope";
 import { q } from "./db";
 import { fail } from "./api-response";
 
 export const ADMIN_ROLE = "Admin";
+export const SUPERADMIN_ROLE = "Superadmin";
 
 export type PermissionAction =
   | "read"
@@ -53,6 +56,11 @@ export async function userRoleId(userId: number): Promise<number | null> {
     [userId]
   );
   return rows[0]?.id_role ?? null;
+}
+
+/** ¿Es el Superadministrador del sistema (ve y administra TODO)? */
+export async function userIsSuperAdmin(roleId: number | null): Promise<boolean> {
+  return isSuperAdminRole(roleId);
 }
 
 /** ¿Es administrador (rol Admin)? */
@@ -94,6 +102,20 @@ export async function requirePermission(
     return null;
   }
 
+  if (await userIsSuperAdmin(roleId)) {
+    return { sub: session.sub, role: SUPERADMIN_ROLE };
+  }
+
+  if (await companyDisabledFor(session.sub)) {
+    fail(
+      res,
+      403,
+      "Tu empresa está desactivada",
+      "Pide al Superadministrador que la reactive para volver a entrar"
+    );
+    return null;
+  }
+
   if (await userIsAdmin(roleId)) {
     return { sub: session.sub, role: ADMIN_ROLE };
   }
@@ -109,6 +131,28 @@ export async function requirePermission(
   }
 
   return { sub: session.sub, role: session.role };
+}
+
+/**
+ * Exige el rol SUPERADMINISTRADOR (módulo Empresas, ver todas las empresas,
+ * ver la carpeta raíz del Drive). Si no lo es, responde 403 y devuelve null.
+ */
+export async function requireSuperAdmin(
+  req: NextApiRequest,
+  res: NextApiResponse
+): Promise<{ sub: number; role: string; roleId: number } | null> {
+  const me = await authenticate(req, res);
+  if (!me) return null;
+  if (!(await userIsSuperAdmin(me.roleId))) {
+    fail(
+      res,
+      403,
+      "Solo el Superadministrador",
+      "Esta sección administra las empresas del sistema"
+    );
+    return null;
+  }
+  return me;
 }
 
 /**
@@ -138,6 +182,16 @@ async function authenticate(
     return null;
   }
 
+  if (!(await userIsSuperAdmin(roleId)) && (await companyDisabledFor(session.sub))) {
+    fail(
+      res,
+      403,
+      "Tu empresa está desactivada",
+      "Pide al Superadministrador que la reactive para volver a entrar"
+    );
+    return null;
+  }
+
   return { sub: session.sub, role: session.role, roleId };
 }
 
@@ -152,6 +206,9 @@ export async function requireAnyOfPermissions(
 ): Promise<{ sub: number; role: string } | null> {
   const me = await authenticate(req, res);
   if (!me) return null;
+  if (await userIsSuperAdmin(me.roleId)) {
+    return { sub: me.sub, role: SUPERADMIN_ROLE };
+  }
   if (await userIsAdmin(me.roleId)) return { sub: me.sub, role: ADMIN_ROLE };
 
   for (const check of checks) {
@@ -195,6 +252,20 @@ export async function requireAnyPermission(
   const roleId = await userRoleId(session.sub);
   if (!roleId) {
     fail(res, 401, "Sesión inválida", "Tu usuario ya no existe o está inactivo");
+    return null;
+  }
+
+  if (await userIsSuperAdmin(roleId)) {
+    return { sub: session.sub, role: SUPERADMIN_ROLE };
+  }
+
+  if (await companyDisabledFor(session.sub)) {
+    fail(
+      res,
+      403,
+      "Tu empresa está desactivada",
+      "Pide al Superadministrador que la reactive para volver a entrar"
+    );
     return null;
   }
 

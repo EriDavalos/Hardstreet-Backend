@@ -6,6 +6,7 @@ import { q, exec, transaccion } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilter } from "../../../lib/company-scope";
 
 // ==================================================================
 // Catálogo de PAQUETES (solo con permiso sobre el módulo "paquetes")
@@ -45,7 +46,8 @@ async function hasPublicColumn(): Promise<boolean> {
 
 async function resolveServiceIds(
   res: NextApiResponse,
-  raw: unknown
+  raw: unknown,
+  companyId: number
 ): Promise<number[] | null | undefined> {
   if (raw === undefined) return undefined; // no vino el campo
   if (!Array.isArray(raw)) {
@@ -55,8 +57,8 @@ async function resolveServiceIds(
   const ids = [...new Set(raw.map((v) => Number(v) || 0).filter(Boolean))];
   if (ids.length) {
     const found = await q<{ id: number }>(
-      `SELECT id FROM services WHERE active = 1 AND id IN (?)`,
-      [ids]
+      `SELECT id FROM services WHERE active = 1 AND id_company = ? AND id IN (?)`,
+      [companyId, ids]
     );
     const valid = new Set(found.map((f) => Number(f.id)));
     const missing = ids.filter((id) => !valid.has(id));
@@ -178,6 +180,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "paquetes", action);
   if (!me) return;
 
+  // Alcance por empresa: el catálogo de paquetes es de UNA empresa.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilter(scope, "p.id_company");
+  const companyId = scope.writeCompanyId;
+
   try {
     switch (req.method) {
       case "GET": {
@@ -185,7 +192,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const p = readPaging(req);
         const hasPublic = await hasPublicColumn();
         const countRows = await q<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM packages WHERE active = 1`
+          `SELECT COUNT(*) AS n FROM packages WHERE active = 1 AND ${scopeSql.sql}`,
+          scopeSql.params
         );
         const rows = await q<{
           id: number;
@@ -211,9 +219,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              FROM packages p
              LEFT JOIN tiers t ON t.id = p.id_tier
              LEFT JOIN packages_categories pc ON pc.id = p.id_package_category
-            WHERE p.active = 1
+            WHERE p.active = 1 AND ${scopeSql.sql}
             ORDER BY p.id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          scopeSql.params
         );
         // Solo los servicios de los paquetes de ESTA página.
         const pageIds = rows.map((r) => r.id);
@@ -282,7 +291,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "La categoría indicada no existe", `No hay una categoría activa con id ${catId}`);
           return;
         }
-        const serviceIds = await resolveServiceIds(res, b.serviceIds);
+        const serviceIds = await resolveServiceIds(res, b.serviceIds, companyId);
         if (serviceIds === null) return;
 
         const price = Number(b.price || 0);
@@ -298,6 +307,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           "is_extern",
           ...(hasPublic ? ["is_public"] : []),
           "url_image",
+          "id_company",
         ];
         const values: unknown[] = [
           name,
@@ -320,6 +330,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               ]
             : []),
           norm(b.url_image) || null,
+          companyId,
         ];
         const r = await exec(
           `INSERT INTO packages (${columns.join(", ")})
@@ -355,7 +366,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Falta el id del paquete", "Indica qué paquete quieres modificar");
           return;
         }
-        const exists = await q(`SELECT id FROM packages WHERE id = ? AND active = 1`, [id]);
+        const exists = await q(
+          `SELECT id FROM packages WHERE id = ? AND active = 1 AND ${scopeSql.sql}`,
+          [id, ...scopeSql.params]
+        );
         if (!exists.length) {
           fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${id}`);
           return;
@@ -409,8 +423,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           const catId = Number(b.id_package_category || 0) || null;
           if (catId) {
             const cat = await q(
-              `SELECT id FROM packages_categories WHERE id = ? AND active = 1`,
-              [catId]
+              `SELECT id FROM packages_categories WHERE id = ? AND active = 1 AND id_company = ?`,
+              [catId, companyId]
             );
             if (!cat.length) {
               fail(res, 400, "La categoría indicada no existe", `No hay una categoría activa con id ${catId}`);
@@ -421,10 +435,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           params.push(catId);
         }
         if (fields.length) {
-          await exec(`UPDATE packages SET ${fields.join(", ")} WHERE id = ?`, [...params, id]);
+          await exec(
+            `UPDATE packages SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
+            [...params, id, ...scopeSql.params]
+          );
         }
         // Servicios incluidos (reemplaza el set completo si vino el campo).
-        const serviceIds = await resolveServiceIds(res, b.serviceIds);
+        const serviceIds = await resolveServiceIds(res, b.serviceIds, companyId);
         if (serviceIds === null) return;
         if (serviceIds !== undefined) {
           await transaccion((conn) => replaceServices(conn, id, serviceIds));
@@ -467,7 +484,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           );
           return;
         }
-        const r = await exec(`UPDATE packages SET active = 0 WHERE id = ?`, [id]);
+        const r = await exec(
+          `UPDATE packages SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
+          [id, ...scopeSql.params]
+        );
         if (!r.affectedRows) {
           fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${id}`);
           return;

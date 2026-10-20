@@ -5,6 +5,7 @@ import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilter } from "../../../lib/company-scope";
 
 // ==================================================================
 // Catálogo de CATEGORÍAS de paquetes (módulo "Categorías")
@@ -35,18 +36,18 @@ const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 /// Categoría que recibe los paquetes de una categoría eliminada.
 const GENERAL_CATEGORY = "General";
 
-/** Id de "General", creándola si aún no existe (idempotente). */
-async function ensureGeneralCategory(): Promise<number> {
+/** Id de "General" de la empresa, creándola si aún no existe (idempotente). */
+async function ensureGeneralCategory(companyId: number): Promise<number> {
   const found = await q<{ id: number }>(
     `SELECT id FROM packages_categories
-      WHERE active = 1 AND LOWER(name) = LOWER(?)
+      WHERE active = 1 AND LOWER(name) = LOWER(?) AND id_company = ?
       LIMIT 1`,
-    [GENERAL_CATEGORY]
+    [GENERAL_CATEGORY, companyId]
   );
   if (found.length) return Number(found[0].id);
   const r = await exec(
-    `INSERT INTO packages_categories (name) VALUES (?)`,
-    [GENERAL_CATEGORY]
+    `INSERT INTO packages_categories (name, id_company) VALUES (?, ?)`,
+    [GENERAL_CATEGORY, companyId]
   );
   return Number(r.insertId);
 }
@@ -86,12 +87,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "Categorías", action);
   if (!me) return;
 
+  // Alcance por empresa: cada estudio arma su propio catálogo.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilter(scope);
+  const companyId = scope.writeCompanyId;
+
   try {
     if (req.method === "GET") {
       // Paginado: ?page=1&limit=30 (igual que los demás módulos).
       const p = readPaging(req);
       const countRows = await q<{ n: number }>(
-        `SELECT COUNT(*) AS n FROM packages_categories WHERE active = 1`
+        `SELECT COUNT(*) AS n FROM packages_categories WHERE active = 1 AND ${scopeSql.sql}`,
+        scopeSql.params
       );
       // La foto es opcional: si la migración de la columna todavía no se
       // aplicó, se listan las categorías igual (sin foto).
@@ -100,17 +107,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         rows = await q<Row>(
           `SELECT id, name, icon, url_image
              FROM packages_categories
-            WHERE active = 1
+            WHERE active = 1 AND ${scopeSql.sql}
             ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          scopeSql.params
         );
       } catch {
         rows = await q<Row>(
           `SELECT id, name, icon
              FROM packages_categories
-            WHERE active = 1
+            WHERE active = 1 AND ${scopeSql.sql}
             ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          scopeSql.params
         );
       }
       res.status(200).json({
@@ -132,8 +141,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const row = await q<{ id: number; name: string | null }>(
-        `SELECT id, name FROM packages_categories WHERE id = ? AND active = 1 LIMIT 1`,
-        [id]
+        `SELECT id, name FROM packages_categories
+          WHERE id = ? AND active = 1 AND ${scopeSql.sql} LIMIT 1`,
+        [id, ...scopeSql.params]
       );
       if (!row.length) {
         fail(
@@ -157,16 +167,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       // Los paquetes de la categoría NO se quedan sin categoría: pasan a
       // "General" (que se crea si todavía no existe).
-      const generalId = await ensureGeneralCategory();
+      const generalId = await ensureGeneralCategory(companyId);
       const moved = await exec(
         `UPDATE packages
             SET id_package_category = ?
-          WHERE id_package_category = ? AND active = 1`,
-        [generalId, id]
+          WHERE id_package_category = ? AND active = 1 AND ${scopeSql.sql}`,
+        [generalId, id, ...scopeSql.params]
       );
       const r = await exec(
-        `UPDATE packages_categories SET active = 0 WHERE id = ?`,
-        [id]
+        `UPDATE packages_categories SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
+        [id, ...scopeSql.params]
       );
       if (!r.affectedRows) {
         fail(
@@ -210,9 +220,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // parte los paquetes entre las dos.
       const dup = await q<{ id: number }>(
         `SELECT id FROM packages_categories
-          WHERE active = 1 AND LOWER(name) = LOWER(?)
+          WHERE active = 1 AND LOWER(name) = LOWER(?) AND ${scopeSql.sql}
           LIMIT 1`,
-        [name]
+        [name, ...scopeSql.params]
       );
       if (dup.length) {
         fail(
@@ -224,8 +234,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const r = await exec(
-        `INSERT INTO packages_categories (name, icon, url_image) VALUES (?, ?, ?)`,
-        [name, icon || null, urlImage || null]
+        `INSERT INTO packages_categories (name, icon, url_image, id_company)
+         VALUES (?, ?, ?, ?)`,
+        [name, icon || null, urlImage || null, companyId]
       );
       const item = { id: Number(r.insertId), name, icon, urlImage };
       await logActivity({
@@ -277,8 +288,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
     const r = await exec(
-      `UPDATE packages_categories SET ${fields.join(", ")} WHERE id = ?`,
-      [...params, id]
+      `UPDATE packages_categories SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
+      [...params, id, ...scopeSql.params]
     );
     if (!r.affectedRows) {
       fail(

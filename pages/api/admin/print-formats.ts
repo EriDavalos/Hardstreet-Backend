@@ -8,6 +8,7 @@ import {
   printFormats,
   savePrintFormat,
 } from "../../../lib/print-requests";
+import { requestScope } from "../../../lib/company-scope";
 
 // ==================================================================
 // FORMATOS DE IMPRESIÓN -> /api/admin/print-formats
@@ -31,7 +32,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const session = await requirePermission(req, res, "print", "read");
     if (!session) return;
     try {
-      ok(res, "Formatos", { formats: await printFormats() });
+      // Alcance por empresa: cada estudio tiene sus formatos.
+      const scope = await requestScope(req, session);
+      ok(res, "Formatos", { formats: await printFormats(scope) });
     } catch (e) {
       console.error("[admin/print-formats] GET:", e);
       fail(res, 500, "No se pudieron cargar los formatos");
@@ -44,11 +47,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (!session) return;
     const b = (req.body || {}) as Record<string, unknown>;
     try {
+      const scope = await requestScope(req, session);
       const format = await savePrintFormat({
         name: String(b.name || ""),
         width: asNumber(b.width),
         height: asNumber(b.height),
         unit: String(b.unit || "in"),
+        scope,
       });
       if (!format) {
         fail(res, 500, "No se pudo guardar el formato");
@@ -80,7 +85,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
     try {
-      await deletePrintFormat(id);
+      const scope = await requestScope(req, session);
+      await deletePrintFormat(id, scope);
       await logActivity({
         userId: session.sub,
         module: "print",

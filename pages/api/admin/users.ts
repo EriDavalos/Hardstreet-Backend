@@ -5,12 +5,14 @@ import { q, exec } from "../../../lib/db";
 import {
   requirePermission,
   userIsAdmin,
+  userIsSuperAdmin,
   userRoleId,
 } from "../../../lib/permissions";
 import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
 
 // ==================================================================
 // CRUD de usuarios (solo rol Admin)  ->  /api/admin/users
@@ -60,10 +62,34 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // REGLA DEL ROL MÁS ALTO: la cuenta Admin no se toca ni se ve desde otros
   // roles. Solo un Admin puede listarla, editarla o eliminarla.
   const requesterIsAdmin = await userIsAdmin(await userRoleId(me.sub));
+  // El rol Superadmin es del sistema: solo el propio Superadministrador puede
+  // asignarlo (a nadie se le "escapa" desde Usuarios).
+  const requesterIsSuper = await userIsSuperAdmin(await userRoleId(me.sub));
+
+  // Alcance por empresa: cada usuario pertenece a UNA empresa. El Superadmin
+  // puede elegir con `X-Company-Id` o dejar que vea todas.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilterOn(scope, "u");
+  const companyId = scope.writeCompanyId;
+
+  /** ¿El rol [roleId] es el Superadministrador? */
+  async function roleIsSuper(roleId: number | null): Promise<boolean> {
+    if (!roleId) return false;
+    const rows = await q<{ id: number }>(
+      "SELECT id FROM roles WHERE id = ? AND LOWER(name) = 'superadmin' AND active = 1 LIMIT 1",
+      [roleId]
+    );
+    return rows.length > 0;
+  }
 
   /** ¿El usuario [id] es una cuenta con rol Admin? */
   async function targetIsAdmin(id: number): Promise<boolean> {
     return userIsAdmin(await userRoleId(id));
+  }
+
+  /** ¿El usuario [id] es el Superadministrador? */
+  async function targetIsSuper(id: number): Promise<boolean> {
+    return roleIsSuper(await userRoleId(id));
   }
 
   try {
@@ -90,9 +116,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
            )`,
         ];
         const baseParams: unknown[] = [];
+        base.push(scopeSql.sql);
+        baseParams.push(...scopeSql.params);
         // Los Admin quedan OCULTOS para quien no sea Admin.
         if (!requesterIsAdmin) {
           base.push("(r.name IS NULL OR LOWER(r.name) <> 'admin')");
+        }
+        // El Superadministrador queda FUERA del listado salvo que lo pida él
+        // mismo: los demás ni siquiera deben saber que la cuenta existe.
+        if (!requesterIsSuper) {
+          base.push("(r.name IS NULL OR LOWER(r.name) <> 'superadmin')");
         }
         if (search) {
           const like = `%${search}%`;
@@ -178,6 +211,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           );
           return;
         }
+        if (id_role && !requesterIsSuper && (await roleIsSuper(id_role))) {
+          fail(
+            res,
+            403,
+            "Solo el Superadministrador asigna ese rol",
+            "El rol Superadmin es del sistema"
+          );
+          return;
+        }
         // Crear directamente una cuenta Admin también es exclusivo del Admin:
         // si no, cualquier rol podría saltarse la regla del rol más alto.
         if (!requesterIsAdmin && id_role) {
@@ -202,9 +244,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         const hash = await bcrypt.hash(password, 10);
         const r = await exec(
-          `INSERT INTO users (name, lastname, number, email, password, id_role)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [name, lastname, number, email, hash, id_role]
+          `INSERT INTO users (name, lastname, number, email, password, id_role, id_company)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [name, lastname, number, email, hash, id_role, companyId]
         );
         const item = { id: r.insertId, name, lastname, number, email, roleId: id_role };
         await logActivity({
@@ -232,6 +274,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         // Nadie edita una cuenta Admin salvo otro Admin (ni puede ascender a
         // nadie a Admin si no lo es).
+        if (!requesterIsSuper && (await targetIsSuper(id))) {
+          fail(
+            res,
+            403,
+            "Solo el superadministrador puede modificar esta cuenta",
+            "La cuenta Superadministrador administra todo el sistema"
+          );
+          return;
+        }
         if (!requesterIsAdmin && (await targetIsAdmin(id))) {
           fail(
             res,
@@ -243,6 +294,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         if (!requesterIsAdmin && b.id_role !== undefined) {
           const wanted = Number(b.id_role || 0);
+          if (wanted && !requesterIsSuper && (await roleIsSuper(wanted))) {
+            fail(
+              res,
+              403,
+              "Solo el Superadministrador asigna ese rol",
+              "El rol Superadmin es del sistema"
+            );
+            return;
+          }
           if (wanted) {
             const adminRole = await q<{ id: number }>(
               `SELECT id FROM roles WHERE id = ? AND LOWER(name) = 'admin' AND active = 1 LIMIT 1`,
@@ -291,9 +351,22 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (b.id_role !== undefined) {
           const id_role = Number(b.id_role || 0) || null;
           if (id_role) {
-            const role = await q(`SELECT id FROM roles WHERE id = ? AND active = 1`, [id_role]);
+            const role = await q(
+              `SELECT id FROM roles WHERE id = ? AND active = 1
+                AND (id_company = ? OR id_company IS NULL)`,
+              [id_role, companyId]
+            );
             if (!role.length) {
               fail(res, 400, "El rol indicado no existe", `No hay un rol activo con id ${id_role}`);
+              return;
+            }
+            if (!requesterIsSuper && (await roleIsSuper(id_role))) {
+              fail(
+                res,
+                403,
+                "Solo el superadministrador puede asignar ese rol",
+                "El rol Superadministrador solo lo otorga un Superadministrador"
+              );
               return;
             }
           }
@@ -304,7 +377,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del usuario");
           return;
         }
-        const r = await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ?`, [...params, id]);
+        const r = await exec(
+          `UPDATE users SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
+          [...params, id, ...scopeSql.params]
+        );
         if (!r.affectedRows) {
           fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${id}`);
           return;
@@ -335,6 +411,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "No puedes eliminar tu propia cuenta", "Estás intentando borrar tu sesión actual");
           return;
         }
+        if (!requesterIsSuper && (await targetIsSuper(id))) {
+          fail(
+            res,
+            403,
+            "Solo el superadministrador puede eliminar esta cuenta",
+            "La cuenta Superadministrador administra todo el sistema"
+          );
+          return;
+        }
         if (await targetIsAdmin(id)) {
           if (!requesterIsAdmin) {
             fail(
@@ -350,7 +435,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             `SELECT COUNT(*) AS n
                FROM users u
                JOIN roles r ON r.id = u.id_role AND r.active = 1
-              WHERE u.active = 1 AND LOWER(r.name) = 'admin'`
+              WHERE u.active = 1 AND LOWER(r.name) = 'admin' AND ${scopeSql.sql}`,
+            scopeSql.params
           );
           if (Number(admins[0]?.n || 0) <= 1) {
             fail(
@@ -362,7 +448,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             return;
           }
         }
-        const r = await exec(`UPDATE users SET active = 0 WHERE id = ?`, [id]);
+        const r = await exec(
+          `UPDATE users SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
+          [id, ...scopeSql.params]
+        );
         if (!r.affectedRows) {
           fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${id}`);
           return;

@@ -4,6 +4,7 @@ import { requireUser } from "../../../lib/auth";
 import { q } from "../../../lib/db";
 import { notifyPrintRequest } from "../../../lib/admin-notifications";
 import { userIsAdmin, userRoleId } from "../../../lib/permissions";
+import { userCompanyId } from "../../../lib/companies";
 import { serviceShare } from "../../../lib/service-shares";
 import {
   createPrintRequest,
@@ -115,6 +116,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       serviceId,
       userId: session.sub,
       paths: photos,
+      companyId: (await userCompanyId(session.sub)) ?? undefined,
     });
     // El equipo (administradores y colaboradores con permiso de Impresiones)
     // recibe el aviso en su campanita. Si falla, el envío ya quedó hecho.

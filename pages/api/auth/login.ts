@@ -37,5 +37,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   });
   // Sin cookies: el token viaja al cliente y este lo manda en el header Authorization
 
-  res.status(200).json({ token, user: mapUser(user, { id: user.id_role || 0, name: user.role_name }) });
+  // EMPRESA: el panel necesita saber en qué empresa trabaja la sesión y si
+  // es el Superadministrador (que ve todas y es el único que entra a
+  // Empresas / a la carpeta raíz del Drive).
+  const isSuperAdmin =
+    String(user.role_name || "").toLowerCase() === "superadmin";
+  const companyId = isSuperAdmin ? null : user.id_company ?? null;
+
+  res.status(200).json({
+    token,
+    user: {
+      ...mapUser(user, { id: user.id_role || 0, name: user.role_name }),
+      companyId,
+      companyName: isSuperAdmin ? "" : user.company_name || "",
+      isSuperAdmin,
+    },
+  });
 });

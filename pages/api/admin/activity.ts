@@ -12,6 +12,7 @@ import { withCors } from "../../../lib/cors";
 import { requirePermission } from "../../../lib/permissions";
 import { q } from "../../../lib/db";
 import { ok, fail } from "../../../lib/api-response";
+import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
 
 const MAX_LIMIT = 200;
 
@@ -65,13 +66,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
-  if (!(await requirePermission(req, res, "activity", "read"))) return;
+  const me = await requirePermission(req, res, "activity", "read");
+  if (!me) return;
 
   try {
+    // Alcance por empresa: cada estudio ve SOLO su bitácora.
+    const scope = await requestScope(req, me);
+    const scopeSql = scopeFilterOn(scope, "a");
+
     // Condiciones BASE (buscador, usuario, fechas, entidad): las compartes el
     // listado y los conteos de los chips.
-    const base: string[] = ["1 = 1"];
-    const baseParams: unknown[] = [];
+    const base: string[] = ["1 = 1", scopeSql.sql];
+    const baseParams: unknown[] = [...scopeSql.params];
 
     const module = norm(req.query.module);
     const action = norm(req.query.action).toLowerCase();

@@ -1,10 +1,15 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
 import { q, exec, transaccion } from "../../../lib/db";
-import { requirePermission } from "../../../lib/permissions";
+import {
+  requirePermission,
+  userIsSuperAdmin,
+  userRoleId,
+} from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilter } from "../../../lib/company-scope";
 
 // ==================================================================
 // CRUD de roles + asignacion de permisos (solo rol Admin)
@@ -61,7 +66,7 @@ async function savePermissions(
 async function validateRole(
   res: NextApiResponse,
   b: Record<string, unknown>,
-  opts: { withName: boolean; excludeId?: number }
+  opts: { withName: boolean; excludeId?: number; companyId: number }
 ): Promise<{ ok: boolean; name?: string; permissions?: PermInput[] }> {
   const name = typeof b.name === "string" ? b.name.trim() : "";
   if (opts.withName && !name) {
@@ -69,9 +74,12 @@ async function validateRole(
     return { ok: false };
   }
   if (name) {
+    // El nombre puede repetirse ENTRE empresas (cada una tiene su Admin),
+    // pero no dentro de la misma empresa.
     const dup = await q(
-      `SELECT id FROM roles WHERE LOWER(name) = ? AND active = 1 AND id <> ?`,
-      [name.toLowerCase(), opts.excludeId || 0]
+      `SELECT id FROM roles
+        WHERE LOWER(name) = ? AND active = 1 AND id <> ? AND id_company = ?`,
+      [name.toLowerCase(), opts.excludeId || 0, opts.companyId]
     );
     if (dup.length) {
       fail(res, 409, "Ya existe un rol con ese nombre", name);
@@ -104,18 +112,32 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "roles", action);
   if (!me) return;
 
+  // Alcance por empresa: cada estudio define sus propios roles.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilter(scope);
+  const companyId = scope.writeCompanyId;
+
+  // El rol Superadmin SOLO lo ve y lo toca el propio Superadministrador: un
+  // Admin no puede crearlo, editarlo, borrarlo ni asignárselo a nadie.
+  const isSuper = await userIsSuperAdmin(await userRoleId(me.sub));
+
   try {
     switch (req.method) {
       case "GET": {
         // Paginado: ?page=1&limit=30. Los permisos se piden SOLO de los roles
         // que van en esta página (antes se traían todos y se filtraban aquí).
         const p = readPaging(req);
+        const hidden = isSuper ? "" : "AND LOWER(name) <> 'superadmin'";
         const countRows = await q<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM roles WHERE active = 1`
+          `SELECT COUNT(*) AS n FROM roles
+            WHERE active = 1 ${hidden} AND ${scopeSql.sql}`,
+          scopeSql.params
         );
         const roles = await q<{ id: number; name: string | null }>(
-          `SELECT id, name FROM roles WHERE active = 1 ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`
+          `SELECT id, name FROM roles
+            WHERE active = 1 ${hidden} AND ${scopeSql.sql} ORDER BY id ASC
+            LIMIT ${p.limit} OFFSET ${p.offset}`,
+          scopeSql.params
         );
         const ids = roles.map((r) => r.id);
         const perms = ids.length
@@ -141,9 +163,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
       case "POST": {
         const b = (req.body || {}) as Record<string, unknown>;
-        const v = await validateRole(res, b, { withName: true });
+        const v = await validateRole(res, b, { withName: true, companyId });
         if (!v.ok) return;
-        const r = await exec(`INSERT INTO roles (name) VALUES (?)`, [v.name]);
+        if (String(v.name || "").toLowerCase() === "superadmin" && !isSuper) {
+          fail(
+            res,
+            403,
+            "Ese rol es del sistema",
+            "Solo el Superadministrador administra su propio rol"
+          );
+          return;
+        }
+        const r = await exec(`INSERT INTO roles (name, id_company) VALUES (?, ?)`, [
+          v.name,
+          companyId,
+        ]);
         if (v.permissions?.length) {
           await transaccion((conn) => savePermissions(conn, r.insertId, v.permissions!));
         }
@@ -171,10 +205,29 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Falta el id del rol", "Indica qué rol quieres modificar");
           return;
         }
-        const v = await validateRole(res, b, { withName: false, excludeId: id });
+        if (!isSuper) {
+          const target = await q<{ name: string | null }>(
+            "SELECT name FROM roles WHERE id = ? LIMIT 1",
+            [id]
+          );
+          if (String(target[0]?.name || "").toLowerCase() === "superadmin") {
+            fail(
+              res,
+              403,
+              "Ese rol es del sistema",
+              "Solo el Superadministrador administra su propio rol"
+            );
+            return;
+          }
+        }
+        const v = await validateRole(res, b, { withName: false, excludeId: id, companyId });
         if (!v.ok) return;
         if (v.name !== undefined) {
-          await exec(`UPDATE roles SET name = ? WHERE id = ?`, [v.name, id]);
+          await exec(`UPDATE roles SET name = ? WHERE id = ? AND ${scopeSql.sql}`, [
+            v.name,
+            id,
+            ...scopeSql.params,
+          ]);
         }
         if (v.permissions !== undefined) {
           await transaccion((conn) => savePermissions(conn, id, v.permissions!));
@@ -204,7 +257,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Falta el id del rol", "Indica qué rol quieres eliminar");
           return;
         }
-        const inUse = await q(`SELECT id FROM users WHERE id_role = ? AND active = 1 LIMIT 1`, [id]);
+        if (!isSuper) {
+          const target = await q<{ name: string | null }>(
+            "SELECT name FROM roles WHERE id = ? LIMIT 1",
+            [id]
+          );
+          if (String(target[0]?.name || "").toLowerCase() === "superadmin") {
+            fail(
+              res,
+              403,
+              "Ese rol es del sistema",
+              "Solo el Superadministrador administra su propio rol"
+            );
+            return;
+          }
+        }
+        const inUse = await q(
+          `SELECT id FROM users WHERE id_role = ? AND active = 1 AND id_company = ? LIMIT 1`,
+          [id, companyId]
+        );
         if (inUse.length) {
           fail(
             res,
@@ -216,7 +287,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         await transaccion(async (conn) => {
           await conn.query(`UPDATE permissions_roles SET active = 0 WHERE id_role = ?`, [id]);
-          await conn.query(`UPDATE roles SET active = 0 WHERE id = ?`, [id]);
+          await conn.query(`UPDATE roles SET active = 0 WHERE id = ? AND ${scopeSql.sql}`, [
+            id,
+            ...scopeSql.params,
+          ]);
         });
         await logActivity({
           userId: me.sub,

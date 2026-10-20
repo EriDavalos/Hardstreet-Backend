@@ -5,6 +5,7 @@ import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
+import { requestScope, scopeFilter } from "../../../lib/company-scope";
 
 // ==================================================================
 // Catálogo de SERVICIOS (módulo "Servicios") -> /api/admin/services
@@ -72,6 +73,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const me = await requirePermission(req, res, "Servicios", action);
   if (!me) return;
 
+  // Alcance por empresa: el catálogo de servicios es de UNA empresa.
+  const scope = await requestScope(req, me);
+  const scopeSql = scopeFilter(scope);
+  const companyId = scope.writeCompanyId;
+
   try {
     if (req.method === "GET") {
       // PAGINADO EN EL SERVIDOR: ?page=1&limit=30 + buscador (`q`) y filtro
@@ -82,8 +88,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const linkFilter = norm(req.query.link).toLowerCase();
 
       const hasLink = "TRIM(COALESCE(url, '')) <> ''";
-      const base: string[] = ["active = 1"];
-      const baseParams: unknown[] = [];
+      const base: string[] = ["active = 1", scopeSql.sql];
+      const baseParams: unknown[] = [...scopeSql.params];
       if (search) {
         base.push("(name LIKE ? OR description LIKE ?)");
         const like = `%${search}%`;
@@ -180,7 +186,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(res, 400, "Falta el servicio", "Indica qué servicio quieres eliminar");
         return;
       }
-      const r = await exec(`UPDATE services SET active = 0 WHERE id = ?`, [id]);
+      const r = await exec(`UPDATE services SET active = 0 WHERE id = ? AND id_company = ?`, [
+        id,
+        companyId,
+      ]);
       if (!r.affectedRows) {
         fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${id}`);
         return;
@@ -219,8 +228,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       try {
         r = await exec(
           `INSERT INTO services
-             (name, description, icon, url, photos_max, allow_folder)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+             (name, description, icon, url, photos_max, allow_folder, id_company)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
           [
             name,
             description || null,
@@ -228,13 +237,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             url || null,
             photosMax,
             allowFolder ? 1 : 0,
+            companyId,
           ]
         );
       } catch {
         r = await exec(
-          `INSERT INTO services (name, description, icon, url)
-           VALUES (?, ?, ?, ?)`,
-          [name, description || null, icon || null, url || null]
+          `INSERT INTO services (name, description, icon, url, id_company)
+           VALUES (?, ?, ?, ?, ?)`,
+          [name, description || null, icon || null, url || null, companyId]
         );
       }
       const item = {
@@ -310,16 +320,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     let r: { insertId: number; affectedRows: number };
     try {
       r = await exec(
-        `UPDATE services SET ${allFields.join(", ")} WHERE id = ?`,
-        [...allParams, id]
+        `UPDATE services SET ${allFields.join(", ")} WHERE id = ? AND id_company = ?`,
+        [...allParams, id, companyId]
       );
     } catch (e) {
       // Sin la migración, una actualización que sólo toca los parámetros no
       // tiene nada que guardar; con campos de siempre se reintenta sin ellos.
       if (!fields.length) throw e;
       r = await exec(
-        `UPDATE services SET ${fields.join(", ")} WHERE id = ?`,
-        [...params, id]
+        `UPDATE services SET ${fields.join(", ")} WHERE id = ? AND id_company = ?`,
+        [...params, id, companyId]
       );
     }
     if (!r.affectedRows) {
