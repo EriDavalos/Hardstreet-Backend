@@ -28,6 +28,8 @@ export interface PackageRow {
   id: number; name: string | null; subtitle: string | null; description: string | null;
   price: string | number | null; currency: string | null;
   id_tier: number | null; id_package_category: number | null; is_extern: number | null;
+  /** ¿Se muestra en la web? (ausente en bases sin la migración). */
+  is_public?: number | null;
   url_image?: string | null;
 }
 export interface PurchasedPackageRow {
@@ -78,6 +80,8 @@ export interface Package {
   tier: Tier;
   packageCategory: PackageCategory;
   isExtern: boolean;
+  /** Visible en la web pública (catálogo). */
+  isPublic: boolean;
   urlImage: string;      // url_image (carousel "Nuestros servicios")
   services: Service[];
 }
@@ -177,6 +181,12 @@ export function mapPackage(
       ? mapPackageCategory(category)
       : { id: 0, name: "General", icon: "", urlImage: "" },
     isExtern: Number(r.is_extern) === 1,
+    // Sin la columna (migración pendiente) se asume público: es el
+    // comportamiento que tenía el catálogo antes de existir el switch.
+    isPublic:
+      r.is_public === null || r.is_public === undefined
+        ? true
+        : Number(r.is_public) === 1,
     urlImage: str(r.url_image),
     services: services.map(mapService),
   };
@@ -226,7 +236,7 @@ export function mapPurchasedPackage(
       price: num(r.price), currency: str(r.currency) || "MXN",
       tier: { id: 0, name: "Basic", tier: 3 },
       packageCategory: { id: 0, name: "General", icon: "", urlImage: "" },
-      isExtern: false, urlImage: "", services: [],
+      isExtern: false, isPublic: true, urlImage: "", services: [],
     },
     services,
   };

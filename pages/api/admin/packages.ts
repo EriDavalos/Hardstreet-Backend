@@ -13,7 +13,10 @@ import { readPaging, pageMeta } from "../../../lib/pagination";
 //   GET            lista TODO el catálogo (con tier, categoría y servicios)
 //   POST           crea paquete { name, subtitle?, description?, price,
 //                  currency?, id_tier, id_package_category, is_extern?,
-//                  url_image?, serviceIds?: number[] }
+//                  is_public?, url_image?, serviceIds?: number[] }
+//
+// `is_public` decide si el paquete sale en la WEB (/api/packages). Ausente
+// al crear = público (1), para que un panel viejo siga publicando igual.
 //   PUT/PATCH      actualiza { id, ...campos?, serviceIds?: number[] }
 //   DELETE         baja lógica (?id=N) — active = 0
 //
@@ -22,6 +25,23 @@ import { readPaging, pageMeta } from "../../../lib/pagination";
 // ==================================================================
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+
+/**
+ * ¿La migración `is_public` ya se aplicó? Se pregunta UNA vez por proceso y
+ * se recuerda. Si todavía no está, el módulo sigue funcionando como antes
+ * (sin el switch) en vez de responder 500 en todo el catálogo.
+ */
+let _hasPublicColumn: boolean | null = null;
+async function hasPublicColumn(): Promise<boolean> {
+  if (_hasPublicColumn !== null) return _hasPublicColumn;
+  try {
+    const rows = await q(`SHOW COLUMNS FROM packages LIKE 'is_public'`);
+    _hasPublicColumn = rows.length > 0;
+  } catch {
+    _hasPublicColumn = false;
+  }
+  return _hasPublicColumn;
+}
 
 async function resolveServiceIds(
   res: NextApiResponse,
@@ -88,6 +108,7 @@ type PackageRowFull = {
   id_tier: number | null;
   id_package_category: number | null;
   is_extern: number | null;
+  is_public: number | null;
   url_image: string | null;
   tier_name: string | null;
   tier_num: number | null;
@@ -96,9 +117,11 @@ type PackageRowFull = {
 
 /** Modelo del paquete (misma forma que el listado) para `item`. */
 async function packageModel(id: number) {
+  const hasPublic = await hasPublicColumn();
   const rows = await q<PackageRowFull>(
     `SELECT p.id, p.name, p.subtitle, p.description, p.price, p.currency,
-            p.id_tier, p.id_package_category, p.is_extern, p.url_image,
+            p.id_tier, p.id_package_category, p.is_extern,
+            ${hasPublic ? "p.is_public," : ""} p.url_image,
             t.name AS tier_name, t.tier AS tier_num, pc.name AS cat_name
        FROM packages p
        LEFT JOIN tiers t ON t.id = p.id_tier
@@ -129,6 +152,9 @@ async function packageModel(id: number) {
     categoryId: p.id_package_category,
     categoryName: p.cat_name || "",
     isExtern: p.is_extern === 1,
+    isPublic: p.is_public === null || p.is_public === undefined
+      ? true
+      : Number(p.is_public) === 1,
     urlImage: p.url_image || "",
     serviceIds: svcRows.map((s) => Number(s.id)),
     serviceNames: svcRows.map((s) => s.name || ""),
@@ -157,6 +183,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       case "GET": {
         // Paginado: ?page=1&limit=30 (o ?all=1 para desplegables/totales).
         const p = readPaging(req);
+        const hasPublic = await hasPublicColumn();
         const countRows = await q<{ n: number }>(
           `SELECT COUNT(*) AS n FROM packages WHERE active = 1`
         );
@@ -170,13 +197,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           id_tier: number | null;
           id_package_category: number | null;
           is_extern: number | null;
+          is_public: number | null;
           url_image: string | null;
           tier_name: string | null;
           tier_num: number | null;
           cat_name: string | null;
         }>(
           `SELECT p.id, p.name, p.subtitle, p.description, p.price, p.currency,
-                  p.id_tier, p.id_package_category, p.is_extern, p.url_image,
+                  p.id_tier, p.id_package_category, p.is_extern,
+                  ${hasPublic ? "p.is_public," : ""} p.url_image,
                   t.name AS tier_name, t.tier AS tier_num,
                   pc.name AS cat_name
              FROM packages p
@@ -213,6 +242,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             categoryId: p.id_package_category,
             categoryName: p.cat_name || "",
             isExtern: p.is_extern === 1,
+            isPublic: p.is_public === null || p.is_public === undefined
+              ? true
+              : Number(p.is_public) === 1,
             urlImage: p.url_image || "",
             serviceIds: svcRows.filter((s) => s.id_package === p.id).map((s) => Number(s.id)),
             serviceNames: svcRows
@@ -254,20 +286,45 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (serviceIds === null) return;
 
         const price = Number(b.price || 0);
+        const hasPublic = await hasPublicColumn();
+        const columns = [
+          "name",
+          "subtitle",
+          "description",
+          "price",
+          "currency",
+          "id_tier",
+          "id_package_category",
+          "is_extern",
+          ...(hasPublic ? ["is_public"] : []),
+          "url_image",
+        ];
+        const values: unknown[] = [
+          name,
+          norm(b.subtitle),
+          norm(b.description),
+          price,
+          norm(b.currency) || "MXN",
+          tierId,
+          catId,
+          b.is_extern === true || b.is_extern === 1 ? 1 : 0,
+          // Ausente = público: el catálogo de la web no se vacía porque un
+          // panel antiguo todavía no mande el campo.
+          ...(hasPublic
+            ? [
+                b.is_public === undefined
+                  ? 1
+                  : b.is_public === true || b.is_public === 1
+                  ? 1
+                  : 0,
+              ]
+            : []),
+          norm(b.url_image) || null,
+        ];
         const r = await exec(
-          `INSERT INTO packages (name, subtitle, description, price, currency, id_tier, id_package_category, is_extern, url_image)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          [
-            name,
-            norm(b.subtitle),
-            norm(b.description),
-            price,
-            norm(b.currency) || "MXN",
-            tierId,
-            catId,
-            b.is_extern === true || b.is_extern === 1 ? 1 : 0,
-            norm(b.url_image) || null,
-          ]
+          `INSERT INTO packages (${columns.join(", ")})
+           VALUES (${columns.map(() => "?").join(", ")})`,
+          values
         );
         if (serviceIds && serviceIds.length) {
           await transaccion((conn) =>
@@ -331,6 +388,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (b.is_extern !== undefined) {
           fields.push("`is_extern` = ?");
           params.push(b.is_extern === true || b.is_extern === 1 ? 1 : 0);
+        }
+        if (b.is_public !== undefined && (await hasPublicColumn())) {
+          fields.push("`is_public` = ?");
+          params.push(b.is_public === true || b.is_public === 1 ? 1 : 0);
         }
         if (b.id_tier !== undefined) {
           const tierId = Number(b.id_tier || 0) || null;

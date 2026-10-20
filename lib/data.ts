@@ -36,10 +36,30 @@ export async function getTiers(): Promise<Tier[]> {
 }
 
 // ---------- Catalogo: paquetes (con tier, categoria y servicios) ----------
+//
+// Es el catálogo PÚBLICO (lo leen la web y /api/extern-services): solo salen
+// los paquetes con `is_public = 1`. El módulo Paquetes del panel tiene su
+// propio listado (/api/admin/packages) y ahí sí se ven todos.
+//
+// Si la migración de paquetes públicos todavía no está aplicada se consulta
+// sin ese filtro: el sitio sigue enseñando el catálogo de siempre en vez de
+// quedarse vacío por un 500.
 export async function getPackages(opts: { extern?: boolean; category?: string } = {}): Promise<Package[]> {
+  try {
+    return await selectPackages(opts, true);
+  } catch {
+    return selectPackages(opts, false);
+  }
+}
+
+async function selectPackages(
+  opts: { extern?: boolean; category?: string },
+  withPublic: boolean
+): Promise<Package[]> {
   const params: unknown[] = [];
   const where: string[] = [`p.active = 1`];
 
+  if (withPublic) where.push(`p.is_public = 1`);
   if (opts.extern !== undefined) {
     params.push(opts.extern ? 1 : 0);
     where.push(`p.is_extern = ?`);
@@ -51,7 +71,8 @@ export async function getPackages(opts: { extern?: boolean; category?: string } 
 
   const rows = await q<PackageRow & { tier_name: string | null; tier_num: number | null; cat_name: string | null; cat_icon: string | null }>(
     `SELECT p.id, p.name, p.subtitle, p.description, p.price, p.currency,
-            p.id_tier, p.id_package_category, p.is_extern, p.url_image,
+            p.id_tier, p.id_package_category, p.is_extern,
+            ${withPublic ? "p.is_public," : ""} p.url_image,
             t.name AS tier_name, t.tier AS tier_num,
             pc.name AS cat_name, pc.icon AS cat_icon
        FROM packages p
