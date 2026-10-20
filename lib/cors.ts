@@ -17,7 +17,20 @@ export function withCors(handler: (req: NextApiRequest, res: NextApiResponse) =>
     // base de datos.
     res.setHeader("Vary", "Origin");
     res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+    // `X-Company-Id` lo manda el panel cuando el Superadministrador elige una
+    // empresa: si no está permitido, el navegador RECHAZA el preflight y el
+    // error que se ve es "CORS" (aunque la API esté bien). `Apikey` es el
+    // token del Drive por si alguna pantalla lo manda a este backend.
+    res.setHeader(
+      "Access-Control-Allow-Headers",
+      "Content-Type, Authorization, X-Company-Id, Apikey"
+    );
+    // Cabeceras que el navegador puede LEER (progreso de descargas, rangos):
+    // sin esto quedan ocultas aunque la respuesta llegue bien.
+    res.setHeader(
+      "Access-Control-Expose-Headers",
+      "Content-Range, X-Video-Duration, X-Total-Count"
+    );
 
     if (req.method === "OPTIONS") {
       res.status(200).end();
