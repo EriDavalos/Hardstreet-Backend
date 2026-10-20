@@ -13,20 +13,44 @@ import {
 } from "./mappers";
 
 // ---------- Catalogo: categorias ----------
-export async function getCategories(): Promise<PackageCategory[]> {
+//
+// Las categorías son de CADA EMPRESA (cada estudio arma su catálogo).
+// [companyId] recorta la lista a una empresa; `null` devuelve todas, que es lo
+// que se sirve cuando el cliente no dice a qué empresa pregunta (la web
+// pública de siempre). Antes no se filtraba y el panel dejaba ver, al cambiar
+// de empresa, las categorías de los demás.
+export async function getCategories(
+  companyId: number | null = null
+): Promise<PackageCategory[]> {
+  // 1) Con la foto (migración 2026-10-16_categorias_imagen.sql).
   try {
-    const rows = await q<PackageCategoryRow>(
-      `SELECT id, name, icon, url_image FROM packages_categories WHERE active = 1 ORDER BY id`
-    );
-    return rows.map(mapPackageCategory);
+    return await selectCategories(companyId, true);
   } catch {
-    // Migración 2026-10-16_categorias_imagen.sql aún no aplicada: el catálogo
-    // sigue funcionando (sin la foto de la categoría).
-    const rows = await q<PackageCategoryRow>(
-      `SELECT id, name, icon FROM packages_categories WHERE active = 1 ORDER BY id`
-    );
-    return rows.map(mapPackageCategory);
+    // 2) Sin la foto: el catálogo sigue funcionando.
+    try {
+      return await selectCategories(companyId, false);
+    } catch {
+      // 3) Sin `id_company` (migración de Empresas pendiente): catálogo global.
+      if (companyId === null) throw new Error("No se pudo leer el catálogo de categorías");
+      return selectCategories(null, false);
+    }
   }
+}
+
+async function selectCategories(
+  companyId: number | null,
+  withPhoto: boolean
+): Promise<PackageCategory[]> {
+  const where = companyId
+    ? `WHERE active = 1 AND id_company = ?`
+    : `WHERE active = 1`;
+  const params = companyId ? [companyId] : [];
+  const rows = await q<PackageCategoryRow>(
+    `SELECT id, name, icon${withPhoto ? ", url_image" : ""}
+       FROM packages_categories ${where} ORDER BY id`,
+    params
+  );
+  return rows.map(mapPackageCategory);
 }
 
 // ---------- Catalogo: tiers ----------
