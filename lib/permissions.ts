@@ -63,9 +63,18 @@ export async function userIsSuperAdmin(roleId: number | null): Promise<boolean> 
   return isSuperAdminRole(roleId);
 }
 
-/** ¿Es administrador (rol Admin)? */
+/**
+ * ¿Es administrador?
+ *
+ * Es el rol Admin Y TAMBIÉN el Superadministrador: es el nivel más alto del
+ * sistema, así que todas las reglas del rol Admin le aplican (ver y editar la
+ * cuenta Admin, asignar ese rol, y no ser tratado como "cliente" en agendas,
+ * impresiones ni Drive). Antes devolvía false para él y quedaba fuera de esas
+ * reglas: el panel le ocultaba los administradores de cada empresa.
+ */
 export async function userIsAdmin(roleId: number | null): Promise<boolean> {
   if (!roleId) return false;
+  if (await isSuperAdminRole(roleId)) return true;
   const rows = await q<{ id: number }>(
     `SELECT id FROM roles WHERE id = ? AND LOWER(name) = ? AND active = 1 LIMIT 1`,
     [roleId, ADMIN_ROLE.toLowerCase()]

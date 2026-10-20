@@ -60,7 +60,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   if (!me) return;
 
   // REGLA DEL ROL MÁS ALTO: la cuenta Admin no se toca ni se ve desde otros
-  // roles. Solo un Admin puede listarla, editarla o eliminarla.
+  // roles. Solo un Admin (o el Superadministrador, que es el nivel más alto)
+  // puede listarla, editarla o eliminarla.
   const requesterIsAdmin = await userIsAdmin(await userRoleId(me.sub));
   // El rol Superadmin es del sistema: solo el propio Superadministrador puede
   // asignarlo (a nadie se le "escapa" desde Usuarios).
