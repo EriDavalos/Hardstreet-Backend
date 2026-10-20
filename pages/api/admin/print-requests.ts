@@ -8,6 +8,7 @@ import {
   printFormats,
   printRequests,
   reopenPrintRequest,
+  savePrintRequestConfig,
 } from "../../../lib/print-requests";
 
 // ==================================================================
@@ -16,10 +17,15 @@ import {
 //   GET  { requests: [...], formats: [...] }
 //        Cada envío: { id, serviceId, serviceName, packageName, clientId,
 //                      clientName, status, formatId, formatName, border,
-//                      sentAt, finishedAt, photos: ["ruta/foto.jpg", ...] }
+//                      sentAt, finishedAt, photos: ["ruta/foto.jpg", ...],
+//                      crops: { "ruta/foto.jpg": { x, y, zoom, landscape } } }
 //
-//   POST { action: "finish", requestId, formatId, border }
-//        Cierra el envío con su formato y el grosor de borde (0-30 %).
+//   POST { action: "save", requestId, formatId, border, crops }
+//        GUARDA el formato, el borde y las posiciones SIN cerrar el envío:
+//        se puede seguir ajustando y descargando después.
+//   POST { action: "finish", requestId, formatId, border, crops? }
+//        Cierra el envío con su formato, el grosor de borde (0-30 %) y las
+//        posiciones de las fotos.
 //   POST { action: "reopen", requestId }
 //        Reabre el envío: el cliente vuelve a poder cambiar su selección.
 //
@@ -67,6 +73,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   try {
+    if (action === "save") {
+      const saved = await savePrintRequestConfig({
+        id: requestId,
+        formatId: asNumber(body.formatId),
+        border: asNumber(body.border),
+        crops: body.crops,
+      });
+      await logActivity({
+        userId: session.sub,
+        module: "print",
+        action: "update",
+        entity: "impresion",
+        entityId: requestId,
+        description:
+          `Guardó el formato del envío #${requestId} ` +
+          `(${saved.crops} posiciones)`,
+      });
+      ok(res, "Configuración guardada", {
+        done: true,
+        ...saved,
+        details:
+          `${saved.crops} ` +
+          `${saved.crops === 1 ? "posición guardada" : "posiciones guardadas"}`,
+      });
+      return;
+    }
+
     if (action === "finish") {
       const formatId = asNumber(body.formatId);
       if (!formatId) {
@@ -77,6 +110,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         id: requestId,
         formatId,
         border: asNumber(body.border),
+        crops: body.crops,
       });
       await logActivity({
         userId: session.sub,

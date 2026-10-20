@@ -32,6 +32,21 @@ export interface PrintFormat {
   order: number | null;
 }
 
+/// Ajuste de recorte de UNA foto (lo mismo que `PrintCrop` del panel).
+///
+///   x, y    centro del recorte dentro de la foto (0..1)
+///   zoom    1 = recorte máximo, 8 = ocho veces más cerca
+///   landscape  true/false = orientación elegida; null = automática
+///
+/// Se guarda por RUTA, así el estudio recupera el encuadre de cada foto la
+/// próxima vez que abra el formato, sin volver a ajustarlo.
+export interface PrintCropEntry {
+  x: number;
+  y: number;
+  zoom: number;
+  landscape: boolean | null;
+}
+
 export interface PrintRequest {
   id: number;
   serviceId: number;
@@ -46,6 +61,7 @@ export interface PrintRequest {
   sentAt: string;
   finishedAt: string;
   photos: string[];
+  crops: Record<string, PrintCropEntry>;
 }
 
 export interface PrintRequestState {
@@ -62,6 +78,62 @@ function norm(v: unknown): string {
 function asNumber(v: unknown, fallback = 0): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+const clamp = (v: number, min: number, max: number): number =>
+  v < min ? min : v > max ? max : v;
+
+/**
+ * Normaliza el mapa de posiciones que manda el panel.
+ *
+ * Se aceptan solo rutas del Drive (normalizadas) y números dentro de rango;
+ * lo que no encaje se descarta en vez de romper el guardado. El límite de
+ * 2000 fotos evita que una petición enorme llene la fila.
+ */
+export function sanitizePrintCrops(
+  value: unknown
+): Record<string, PrintCropEntry> {
+  const out: Record<string, PrintCropEntry> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  let n = 0;
+  for (const [rawPath, raw] of Object.entries(value as Record<string, unknown>)) {
+    if (n >= 2000) break;
+    const path = normalizeDrivePath(rawPath);
+    if (!path || !raw || typeof raw !== "object" || Array.isArray(raw)) {
+      continue;
+    }
+    const c = raw as Record<string, unknown>;
+    out[path] = {
+      x: clamp(asNumber(c.x, 0.5), 0, 1),
+      y: clamp(asNumber(c.y, 0.5), 0, 1),
+      zoom: clamp(asNumber(c.zoom, 1), 1, 8),
+      landscape:
+        c.landscape === true ? true : c.landscape === false ? false : null,
+    };
+    n++;
+  }
+  return out;
+}
+
+/** Lee la columna `crops` (TEXT con JSON). Nunca lanza. */
+export function parsePrintCrops(raw: unknown): Record<string, PrintCropEntry> {
+  const text = Buffer.isBuffer(raw) ? raw.toString("utf8") : raw;
+  if (typeof text !== "string" || !text.trim()) return {};
+  try {
+    return sanitizePrintCrops(JSON.parse(text));
+  } catch {
+    return {};
+  }
+}
+
+/** ¿El error es "esa columna no existe" (migración pendiente)? */
+function missingColumn(e: unknown): boolean {
+  const err = e as { code?: string; errno?: number; message?: string };
+  return (
+    err?.code === "ER_BAD_FIELD_ERROR" ||
+    err?.errno === 1054 ||
+    /unknown column/i.test(err?.message || "")
+  );
 }
 
 /** Formatos activos, en el orden que fijó el estudio. */
@@ -282,6 +354,23 @@ export async function printRequests(): Promise<PrintRequest[]> {
   if (!rows.length) return [];
 
   const ids = rows.map((r) => asNumber(r.id));
+  // Las posiciones van en su propia consulta: si la migración todavía no se
+  // aplicó, el listado sigue funcionando (solo se pierde el encuadre).
+  const cropsByRequest = new Map<number, Record<string, PrintCropEntry>>();
+  try {
+    const saved = await q<{ id: number; crops: string | null }>(
+      `SELECT id, crops FROM print_requests WHERE id IN (?)`,
+      [ids]
+    );
+    for (const row of saved) {
+      const crops = parsePrintCrops(row.crops);
+      if (Object.keys(crops).length) {
+        cropsByRequest.set(asNumber(row.id), crops);
+      }
+    }
+  } catch {
+    // Columna pendiente de migración: sin posiciones guardadas.
+  }
   const items = new Map<number, string[]>();
   try {
     const photos = await q<any>(
@@ -317,23 +406,99 @@ export async function printRequests(): Promise<PrintRequest[]> {
     sentAt: norm(r.sentAt),
     finishedAt: norm(r.finishedAt),
     photos: items.get(asNumber(r.id)) ?? [],
+    crops: cropsByRequest.get(asNumber(r.id)) ?? {},
   }));
 }
 
-/** Cierra un envío con su formato y grosor de borde. */
+/**
+ * Guarda el formato, el borde y las POSICIONES de las fotos SIN cerrar el
+ * envío: el estudio puede ajustar hoy, descargar, y seguir mañana donde lo
+ * dejó. El cliente sigue bloqueado (status = sent) hasta dar «Terminar».
+ */
+export async function savePrintRequestConfig(args: {
+  id: number;
+  formatId: number;
+  border: number;
+  crops: unknown;
+}): Promise<{ id: number; border: number; crops: number }> {
+  const id = asNumber(args.id);
+  const formatId = asNumber(args.formatId);
+  if (!id) {
+    throw Object.assign(new Error("Indica el envío"), { status: 400 });
+  }
+  if (!formatId) {
+    throw Object.assign(new Error("Elige el formato de impresión"), {
+      status: 400,
+    });
+  }
+  const current = await q<{ status: string }>(
+    `SELECT status FROM print_requests WHERE id = ? AND active = 1 LIMIT 1`,
+    [id]
+  );
+  if (!current.length) {
+    throw Object.assign(new Error("Ese envío ya no existe"), { status: 404 });
+  }
+  if (norm(current[0].status) === "finished") {
+    throw Object.assign(
+      new Error("El trabajo está terminado: reábrelo para cambiar el formato"),
+      { status: 409 }
+    );
+  }
+  const border = Math.max(0, Math.min(30, Math.round(asNumber(args.border))));
+  const crops = sanitizePrintCrops(args.crops);
+  const payload = JSON.stringify(crops);
+  try {
+    await exec(
+      `UPDATE print_requests SET id_format = ?, border = ?, crops = ?
+        WHERE id = ?`,
+      [formatId, border, payload, id]
+    );
+  } catch (e) {
+    if (!missingColumn(e)) throw e;
+    // Sin la migración de posiciones: se avisa en vez de guardar a medias.
+    throw Object.assign(
+      new Error(
+        "El servidor no tiene aplicada la migración de posiciones de impresión"
+      ),
+      { status: 500, cause: e }
+    );
+  }
+  return { id, border, crops: Object.keys(crops).length };
+}
+
+/** Cierra un envío con su formato, grosor de borde y posiciones. */
 export async function finishPrintRequest(args: {
   id: number;
   formatId: number;
   border: number;
+  crops?: unknown;
 }): Promise<void> {
   const border = Math.max(0, Math.min(30, Math.round(asNumber(args.border))));
-  const r = await exec(
-    `UPDATE print_requests
-        SET status = 'finished', id_format = ?, border = ?,
-            finished_at = NOW(), active = 1
-      WHERE id = ?`,
-    [args.formatId || null, border, args.id]
-  );
+  const withCrops = args.crops !== undefined;
+  const payload = JSON.stringify(sanitizePrintCrops(args.crops));
+  let r;
+  try {
+    r = await exec(
+      `UPDATE print_requests
+          SET status = 'finished', id_format = ?, border = ?,
+              finished_at = NOW(), active = 1${withCrops ? ", crops = ?" : ""}
+        WHERE id = ?`,
+      withCrops
+        ? [args.formatId || null, border, payload, args.id]
+        : [args.formatId || null, border, args.id]
+    );
+  } catch (e) {
+    // Cerrar el trabajo NUNCA debe quedar bloqueado por la migración de
+    // posiciones: se termina sin ellas (el encuadre ya se pudo guardar antes).
+    if (!withCrops || !missingColumn(e)) throw e;
+    r = await exec(
+      `UPDATE print_requests
+          SET status = 'finished', id_format = ?, border = ?,
+              finished_at = NOW(), active = 1
+        WHERE id = ?`,
+      [args.formatId || null, border, args.id]
+    );
+  }
   if (!r.affectedRows) {
     throw Object.assign(new Error("Ese envío ya no existe"), { status: 404 });
   }
