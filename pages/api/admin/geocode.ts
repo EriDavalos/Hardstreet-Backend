@@ -74,6 +74,81 @@ async function getJson(url: string): Promise<any> {
   }
 }
 
+// ------------------------------------------------------------------
+// PHOTON (Komoot): buscador pensado para escribir, no para direcciones
+// exactas. Encuentra "hacienda san jose" aunque falte una palabra o esté
+// mal escrita, y devuelve negocios (salones, iglesias, hoteles…). Nominatim
+// es más estricto: con solo él, media búsqueda se quedaba en "no se
+// encontraron lugares". Se usa Photon PRIMERO y Nominatim completa.
+// ------------------------------------------------------------------
+const PHOTON = "https://photon.komoot.io/api/";
+
+/** Una petición a Photon (sin el ritmo de Nominatim: no lo exige). */
+async function photonJson(q: string): Promise<any> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  try {
+    // OJO: Photon NO acepta `lang=es` (responde 400; solo default/de/en/fr).
+    // Los nombres locales ya vienen en español.
+    const url = `${PHOTON}?q=${encodeURIComponent(q)}&limit=12`;
+    const res = await fetch(url, {
+      headers: { "User-Agent": USER_AGENT, "Accept-Language": "es" },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`Photon ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Propiedades de Photon → el mismo `Place` que pinta el panel. */
+function placeOfPhoton(feature: any): Place | null {
+  const coords = feature?.geometry?.coordinates;
+  if (!Array.isArray(coords) || coords.length < 2) return null;
+  const lng = Number(coords[0]);
+  const lat = Number(coords[1]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
+  const p = feature?.properties || {};
+  const street = [p.street, p.housenumber].filter(Boolean).join(" ");
+  const name =
+    String(p.name || street || p.city || p.district || p.state || "").trim();
+  if (!name) return null;
+  const parts = [
+    street,
+    p.city || p.district,
+    p.state,
+    p.country,
+  ]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean);
+  // Sin repetir "Ciudad, Ciudad" cuando la calle ya la nombra.
+  const address = [...new Set(parts)].join(", ");
+  return {
+    name: name.slice(0, 255),
+    address,
+    displayName: address || name,
+    lat,
+    lng,
+  };
+}
+
+/** Quita repetidos (mismo sitio devuelto por los dos buscadores). */
+function dedupePlaces(list: Place[]): Place[] {
+  const out: Place[] = [];
+  for (const p of list) {
+    const repeated = out.some(
+      (o) =>
+        (Math.abs(o.lat - p.lat) < 0.00025 &&
+          Math.abs(o.lng - p.lng) < 0.00025) ||
+        (o.name.toLowerCase() === p.name.toLowerCase() &&
+          o.address === p.address)
+    );
+    if (!repeated) out.push(p);
+  }
+  return out;
+}
+
 /** Un resultado de búsqueda tal como lo pinta el panel. */
 type Place = {
   name: string;
@@ -156,13 +231,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       ok(res, "Lugares encontrados", { results: hit });
       return;
     }
-    const data = await getJson(
-      `${NOMINATIM}/search?format=jsonv2&addressdetails=1&limit=8&q=${encodeURIComponent(q)}`
-    );
-    const results = Array.isArray(data)
-      ? data.map(toPlace).filter((p): p is Place => !!p)
+    // Los dos buscadores traen cosas distintas: Photon acierta con nombres
+    // parciales y negocios; Nominatim con direcciones exactas. Se juntan y se
+    // recortan a 10, con Photon primero (es el orden que espera quien escribe).
+    const photon = await photonJson(q).catch(() => null);
+    let results: Place[] = Array.isArray(photon?.features)
+      ? photon.features
+          .map(placeOfPhoton)
+          .filter((p: Place | null): p is Place => !!p)
       : [];
-    ok(res, "Lugares encontrados", { results: remember(key, results) });
+    if (results.length < 6) {
+      try {
+        const data = await getJson(
+          `${NOMINATIM}/search?format=jsonv2&addressdetails=1&dedupe=1` +
+            `&namedetails=1&limit=10&accept-language=es&q=${encodeURIComponent(q)}`
+        );
+        const extra = Array.isArray(data)
+          ? data.map(toPlace).filter((p): p is Place => !!p)
+          : [];
+        results = dedupePlaces([...results, ...extra]);
+      } catch (e) {
+        // Si Nominatim falla pero Photon trajo algo, se devuelve igual.
+        if (!results.length) throw e;
+      }
+    }
+    ok(res, "Lugares encontrados", {
+      results: remember(key, results.slice(0, 10)),
+    });
   } catch (e) {
     console.error("[admin/geocode]", e);
     fail(
