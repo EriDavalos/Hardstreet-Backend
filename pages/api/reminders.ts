@@ -100,7 +100,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           eventDate: n.created,
           isRead: n.isRead ? 1 : 0,
           created: n.created,
-          source: "print",
+          // `print` = envío a impresión; `notification` = aviso del módulo
+          // Notificaciones (manual o de otro evento). Los dos viven en
+          // `admin_notifications`, por eso comparten el mismo "source" a
+          // efectos de marcarlos leídos.
+          source: n.kind === "print" ? "print" : "notification",
+          target: n.target,
           printRequestId: n.printRequestId,
           serviceId: n.serviceId,
         });
@@ -130,7 +135,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
         await markAdminNotificationsRead(session.sub);
       } else if (id > 0) {
-        if (source === "print") {
+        if (source === "print" || source === "notification") {
           await markAdminNotificationsRead(session.sub, [id]);
         } else {
           await exec(

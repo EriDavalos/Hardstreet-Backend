@@ -71,7 +71,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
       // Qué ofrece ESTE servicio: su carpeta compartida y su máximo de fotos.
       const info = await servicePickInfo(serviceId);
-      if (!info.pickPhotos) {
+      // El ESTUDIO (admin) también puede marcar la selección por si el
+      // cliente no puede hacerlo: no necesita que «Elegir fotos» esté
+      // encendido, pero sí la carpeta compartida (el cliente solo ve eso).
+      if (!info.pickPhotos && !isAdmin) {
         res.status(400).json({
           error: "Elegir fotos no está disponible para este servicio",
         });

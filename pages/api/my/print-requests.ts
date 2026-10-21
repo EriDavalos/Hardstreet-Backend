@@ -112,15 +112,23 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
+    const companyId = (await userCompanyId(session.sub)) ?? undefined;
     const requestId = await createPrintRequest({
       serviceId,
       userId: session.sub,
       paths: photos,
-      companyId: (await userCompanyId(session.sub)) ?? undefined,
+      companyId,
     });
-    // El equipo (administradores y colaboradores con permiso de Impresiones)
-    // recibe el aviso en su campanita. Si falla, el envío ya quedó hecho.
-    await notifyTeam(requestId, serviceId, session.sub, photos.length);
+    // El equipo (los roles que el módulo Notificaciones elija para «envío de
+    // fotos seleccionadas») recibe el aviso en su campanita. Si falla, el
+    // envío ya quedó hecho.
+    await notifyTeam(
+      requestId,
+      serviceId,
+      session.sub,
+      photos.length,
+      companyId ?? null
+    );
     res.status(200).json({
       serviceId,
       requestId,
@@ -142,7 +150,8 @@ async function notifyTeam(
   requestId: number,
   serviceId: number,
   userId: number,
-  photos: number
+  photos: number,
+  companyId: number | null = null
 ): Promise<void> {
   try {
     const rows = await q<{
@@ -170,6 +179,7 @@ async function notifyTeam(
       serviceName: String(r?.serviceName || "").trim(),
       packageName: String(r?.packageName || "").trim(),
       photos,
+      companyId,
     });
   } catch (e) {
     console.error("[my/print-requests notify]", e);

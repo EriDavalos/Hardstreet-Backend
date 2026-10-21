@@ -11,6 +11,8 @@ import {
   savePrintRequestConfig,
 } from "../../../lib/print-requests";
 import { requestScope } from "../../../lib/company-scope";
+import { q } from "../../../lib/db";
+import { notifyPackageUsers } from "../../../lib/notifications";
 
 // ==================================================================
 // IMPRESIONES -> /api/admin/print-requests
@@ -118,6 +120,42 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         crops: body.crops,
         scope,
       });
+      // El cliente recibe el aviso de que su impresión ya está lista (los
+      // roles se configuran en el módulo Notificaciones).
+      try {
+        const rows = await q<{
+          package_id: number
+          service_id: number
+          service_name: string | null
+          package_name: string | null
+        }>(
+          `SELECT pps.id_purchased_package AS package_id,
+                  pps.id AS service_id,
+                  s.name AS service_name,
+                  pp.name AS package_name
+             FROM print_requests pr
+             JOIN purchased_packages_services pps
+               ON pps.id = pr.id_purchased_package_service
+             LEFT JOIN services s ON s.id = pps.id_service
+             LEFT JOIN purchased_packages pp ON pp.id = pps.id_purchased_package
+            WHERE pr.id = ? LIMIT 1`,
+          [requestId]
+        );
+        const row = rows[0];
+        if (row && Number(row.package_id) > 0) {
+          await notifyPackageUsers({
+            purchasedPackageId: Number(row.package_id),
+            serviceId: Number(row.service_id) || null,
+            kind: "impresion-terminada",
+            title: "Tu impresión está lista",
+            body:
+              `«${String(row.service_name || "Tu servicio")}» de ` +
+              `«${String(row.package_name || "tu paquete")}» ya está impreso.`,
+          });
+        }
+      } catch {
+        // El aviso es un extra: cerrar el envío manda.
+      }
       await logActivity({
         userId: session.sub,
         module: "print",

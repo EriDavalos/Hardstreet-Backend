@@ -20,6 +20,7 @@
 // ==================================================================
 
 import { q, exec } from "./db";
+import { ruleFor, usersWithRoles } from "./notification-rules";
 
 export type AdminNotification = {
   id: number;
@@ -30,6 +31,8 @@ export type AdminNotification = {
   created: string;
   printRequestId: number | null;
   serviceId: number | null;
+  /** Módulo que se abre al tocar el aviso (vacío = no navega). */
+  target: string;
 };
 
 const MAX_TITLE = 200;
@@ -47,7 +50,19 @@ const text = (v: unknown) =>
  * permisos del módulo: el aviso es justo para que se enteren del trabajo
  * nuevo.
  */
-export async function printRecipientIds(): Promise<number[]> {
+export async function printRecipientIds(
+  companyId: number | null = null
+): Promise<number[]> {
+  // Módulo Notificaciones: si el estudio eligió los roles del aviso
+  // «envío de fotos seleccionadas», mandan ELLOS (y solo ellos).
+  try {
+    const rule = await ruleFor(companyId, "fotos-enviadas");
+    if (rule.configured) {
+      return rule.enabled ? await usersWithRoles(rule.roles, companyId) : [];
+    }
+  } catch {
+    // Sin configuración: se sigue con la regla de siempre.
+  }
   try {
     const rows = await q<{ id: number }>(
       `SELECT DISTINCT u.id
@@ -85,6 +100,8 @@ export async function notifyPrintRequest(input: {
   serviceName?: string;
   packageName?: string;
   photos?: number;
+  /** Empresa del envío: con ella se leen los roles configurados. */
+  companyId?: number | null;
 }): Promise<number> {
   const requestId = Number(input.requestId) || 0;
   if (!requestId) return 0;
@@ -103,7 +120,7 @@ export async function notifyPrintRequest(input: {
     .join(" · ")
     .slice(0, MAX_BODY);
 
-  const recipients = await printRecipientIds();
+  const recipients = await printRecipientIds(input.companyId ?? null);
   if (!recipients.length) return 0;
 
   try {
@@ -119,7 +136,7 @@ export async function notifyPrintRequest(input: {
     if (!pending.length) return 0;
 
     const values: unknown[] = [];
-    const rows = pending.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
+    const rows = pending.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
     for (const id of pending) {
       values.push(
         id,
@@ -127,16 +144,33 @@ export async function notifyPrintRequest(input: {
         input.serviceId ?? null,
         "print",
         title,
-        body
+        body,
+        "print"
       );
     }
-    await exec(
-      `INSERT INTO admin_notifications
-         (id_user, id_print_request, id_purchased_package_service,
-          kind, title, body)
-       VALUES ${rows}`,
-      values
-    );
+    try {
+      await exec(
+        `INSERT INTO admin_notifications
+           (id_user, id_print_request, id_purchased_package_service,
+            kind, title, body, target)
+         VALUES ${rows}`,
+        values
+      );
+    } catch {
+      // Migración pendiente (sin `target`): el aviso se guarda igual.
+      const legacy = pending.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
+      const legacyValues: unknown[] = [];
+      for (const id of pending) {
+        legacyValues.push(id, requestId, input.serviceId ?? null, "print", title, body);
+      }
+      await exec(
+        `INSERT INTO admin_notifications
+           (id_user, id_print_request, id_purchased_package_service,
+            kind, title, body)
+         VALUES ${legacy}`,
+        legacyValues
+      );
+    }
     return pending.length;
   } catch {
     // Migración pendiente: el envío del cliente no se cae por un aviso.
@@ -150,26 +184,45 @@ export async function listAdminNotifications(
   limit = 40
 ): Promise<AdminNotification[]> {
   const take = Math.max(1, Math.min(100, Number(limit) || 40));
+  type Row = {
+    id: number;
+    kind: string;
+    title: string;
+    body: string;
+    is_read: number;
+    created: string;
+    id_print_request: number | null;
+    id_purchased_package_service: number | null;
+    target: string | null;
+  };
   try {
-    const rows = await q<{
-      id: number;
-      kind: string;
-      title: string;
-      body: string;
-      is_read: number;
-      created: string;
-      id_print_request: number | null;
-      id_purchased_package_service: number | null;
-    }>(
-      `SELECT id, kind, title, body, is_read,
-              DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created,
-              id_print_request, id_purchased_package_service
-         FROM admin_notifications
-        WHERE active = 1 AND id_user = ?
-        ORDER BY id DESC
-        LIMIT ${take}`,
-      [userId]
-    );
+    let rows: Row[];
+    try {
+      rows = await q<Row>(
+        `SELECT id, kind, title, body, is_read,
+                DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created,
+                id_print_request, id_purchased_package_service, target
+           FROM admin_notifications
+          WHERE active = 1 AND id_user = ?
+          ORDER BY id DESC
+          LIMIT ${take}`,
+        [userId]
+      );
+    } catch {
+      // Migración pendiente (sin `target`): los avisos se leen igual.
+      rows = (
+        await q<Omit<Row, "target">>(
+          `SELECT id, kind, title, body, is_read,
+                  DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created,
+                  id_print_request, id_purchased_package_service
+             FROM admin_notifications
+            WHERE active = 1 AND id_user = ?
+            ORDER BY id DESC
+            LIMIT ${take}`,
+          [userId]
+        )
+      ).map((r) => ({ ...r, target: "print" }));
+    }
     return rows.map((r) => ({
       id: Number(r.id),
       kind: String(r.kind || "print"),
@@ -183,6 +236,7 @@ export async function listAdminNotifications(
         r.id_purchased_package_service === null
           ? null
           : Number(r.id_purchased_package_service),
+      target: String(r.target || "print"),
     }));
   } catch {
     return [];

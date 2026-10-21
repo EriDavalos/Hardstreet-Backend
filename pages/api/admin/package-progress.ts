@@ -634,6 +634,23 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           WHERE id = ?`,
         [ST_FINISHED, purchasedPackageId]
       );
+      // Aviso automático al cliente: su paquete quedó terminado (los roles
+      // que lo reciben se eligen en el módulo Notificaciones).
+      try {
+        const pkg = await q<Row>(
+          `SELECT name FROM purchased_packages WHERE id = ? LIMIT 1`,
+          [purchasedPackageId]
+        );
+        await notifyPackageUsers({
+          purchasedPackageId,
+          kind: "paquete-terminado",
+          title: "Tu paquete está terminado",
+          body: `«${String(pkg[0]?.name || "Tu paquete")}» quedó completo. ` +
+            "Gracias por confiar en el estudio.",
+        });
+      } catch {
+        // El aviso es un extra: finalizar manda.
+      }
       await logActivity({
         userId: me.sub,
         module: "clientes",

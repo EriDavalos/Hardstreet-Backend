@@ -17,6 +17,7 @@
 // ==================================================================
 
 import { q, exec } from "./db";
+import { ruleFor } from "./notification-rules";
 
 export type PackageNotification = {
   id: number;
@@ -52,6 +53,66 @@ const DEDUPE_WINDOW_MS = 10 * 60 * 1000;
 const text = (v: unknown, max: number) =>
   String(v ?? "").replace(/\s+/g, " ").trim().slice(0, max);
 
+/**
+ * Evento del módulo Notificaciones al que corresponde un `kind`.
+ * Los kinds que no son eventos del catálogo (`paquete`, avisos escritos a
+ * mano) NO se filtran: llegan a todos los clientes del paquete como siempre.
+ */
+const KNOWN_EVENTS = new Set([
+  "fotos-disponibles",
+  "servicio-terminado",
+  "paquete-terminado",
+  "impresion-terminada",
+]);
+
+const eventOfKind = (kind: string): string | null =>
+  KNOWN_EVENTS.has(kind) ? kind : null;
+
+/** Empresa del paquete comprado (null si no se puede saber). */
+async function packageCompanyId(purchasedPackageId: number): Promise<number | null> {
+  try {
+    const rows = await q<{ id_company: number | null }>(
+      `SELECT id_company FROM purchased_packages WHERE id = ? LIMIT 1`,
+      [purchasedPackageId]
+    );
+    const id = rows[0]?.id_company;
+    return id === null || id === undefined ? null : Number(id);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Deja solo los usuarios cuyo ROL recibe ese evento según la regla
+ * configurada en el módulo Notificaciones. Sin regla guardada no se toca
+ * nada (se conserva el comportamiento de siempre).
+ */
+async function filterByRule(
+  ids: number[],
+  eventKey: string,
+  companyId: number | null
+): Promise<number[]> {
+  const rule = await ruleFor(companyId, eventKey);
+  if (!rule.configured) return ids;
+  if (!rule.enabled || !rule.roles.length) return [];
+  const wanted = new Set(rule.roles.map((r) => r.trim().toLowerCase()));
+  try {
+    const rows = await q<{ id: number; role_name: string | null }>(
+      `SELECT u.id, r.name AS role_name
+         FROM users u
+         LEFT JOIN roles r ON r.id = u.id_role
+        WHERE u.id IN (?)`,
+      [ids]
+    );
+    return rows
+      .filter((r) => wanted.has(String(r.role_name || "").trim().toLowerCase()))
+      .map((r) => Number(r.id))
+      .filter((n) => n > 0);
+  } catch {
+    return ids;
+  }
+}
+
 /** `fotos-disponibles`, `servicio-terminado`, `paquete`, … */
 const kindOf = (v: unknown) => {
   const k = String(v ?? "paquete")
@@ -80,11 +141,23 @@ export async function notifyPackageUsers(input: NotifyInput): Promise<number> {
         WHERE up.id_purchased_package = ? AND up.active = 1`,
       [purchasedPackageId]
     );
-    const ids = users.map((u) => Number(u.id_user)).filter((n) => n > 0);
+    let ids = users.map((u) => Number(u.id_user)).filter((n) => n > 0);
     if (!ids.length) return 0;
 
     const serviceId = Number(input.serviceId) || null;
     const kind = kindOf(input.kind);
+
+    // Qué roles reciben ESTE aviso (módulo Notificaciones). Solo los eventos
+    // del catálogo; un aviso a mano sigue llegando a todo el paquete.
+    const event = eventOfKind(kind);
+    if (event) {
+      ids = await filterByRule(
+        ids,
+        event,
+        await packageCompanyId(purchasedPackageId)
+      );
+      if (!ids.length) return 0;
+    }
 
     // NO DUPLICAR: si el cliente ya tiene ese MISMO aviso sin leer, o se le
     // creó hace menos de [DEDUPE_WINDOW_MS] (aunque ya lo haya leído), se

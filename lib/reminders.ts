@@ -20,6 +20,7 @@
 
 import { q, exec } from "./db";
 import { clientPackageIds, viewerIsClient } from "./agenda-visibility";
+import { ruleFor, userRoleInfo } from "./notification-rules";
 
 /** Cuentas regresivas configuradas. 7 = falta una semana; 1 = mañana. */
 export const REMINDER_DAYS = [7, 1] as const;
@@ -59,6 +60,22 @@ export interface DueSchedule {
   package_id: number | null;
 }
 
+/**
+ * ¿La regla del módulo Notificaciones deja recibir «agenda próxima» a este
+ * usuario? Sin regla guardada devuelve true (comportamiento de siempre).
+ *
+ * Es lo que permite avisar a los CLIENTES de sus propios eventos: el rol
+ * Cliente no tiene permiso de Agendas y antes nunca entraba en la lista.
+ */
+async function agendaRuleAllows(userId: number): Promise<boolean> {
+  const info = await userRoleInfo(userId);
+  const rule = await ruleFor(info.companyId, "agenda-proxima");
+  if (!rule.configured) return true;
+  if (!rule.enabled) return false;
+  const role = info.roleName.trim().toLowerCase();
+  return rule.roles.some((r) => r.trim().toLowerCase() === role);
+}
+
 /** Usuarios que reciben avisos: Admin o con permiso activo sobre Agendas. */
 export async function eligibleUserIds(): Promise<number[]> {
   const rows = await q<{ id: number }>(
@@ -85,7 +102,10 @@ export async function eligibleUserIds(): Promise<number[]> {
   // ([ensureRemindersForUser]), que filtra por sus paquetes.
   const out: number[] = [];
   for (const id of rows.map((r) => r.id)) {
-    if (!(await viewerIsClient(id))) out.push(id);
+    if (await viewerIsClient(id)) continue;
+    // Qué roles reciben «fechas próximas a agenda» (módulo Notificaciones).
+    if (!(await agendaRuleAllows(id))) continue;
+    out.push(id);
   }
   return out;
 }
@@ -113,7 +133,15 @@ export async function userIsEligible(userId: number): Promise<boolean> {
       LIMIT 1`,
     [userId]
   );
-  return rows.length > 0;
+  if (rows.length > 0) return true;
+  // Sin permiso de Agendas: solo pasa si el módulo Notificaciones le dio a su
+  // rol el aviso de fechas próximas (p. ej. el rol Cliente para SUS eventos).
+  // Sin regla guardada no se amplía: cada uno recibe lo de siempre.
+  const info = await userRoleInfo(userId);
+  const rule = await ruleFor(info.companyId, "agenda-proxima");
+  if (!rule.configured || !rule.enabled) return false;
+  const role = info.roleName.trim().toLowerCase();
+  return rule.roles.some((r) => r.trim().toLowerCase() === role);
 }
 
 /** Eventos activos de un día concreto ("YYYY-MM-DD"), con cliente/paquete. */
