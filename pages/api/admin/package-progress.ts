@@ -545,9 +545,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           const round2 = (n: number) => Math.round(n * 100) / 100;
           const abonado = sumBy(movements, (m) => m.kind === "abono");
           const invertido = sumBy(movements, (m) => m.kind === "inversion");
-          // Los PAGOS a colaboradores/empleados se REGISTRAN (para saber a
-          // quién se le pagó y cuánto) pero son un gasto INVISIBLE: no se
-          // descuentan del paquete ni de su disponible.
+          // Los PAGOS a colaboradores/empleados se REGISTRAN con su
+          // destinatario y SÍ salen del dinero: se descuentan del disponible
+          // (antes se trataban como un "gasto invisible").
           const pagos = sumBy(movements, (m) => m.kind === "pago");
           // Inversión = un tipo de gasto: "Gastado" incluye ambos (sin pagos).
           const gastado =
@@ -559,19 +559,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             pagos,
             ahorrado: sumBy(movements, (m) => m.kind === "ahorro"),
             abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
-            // DISPONIBLE = abonado - gastado (gasto + inversión) - ahorro +
-            // abono externo. El AHORRO se aparta (sale del disponible) y el
-            // ABONO EXTERNO es dinero que entra por fuera del paquete, así
-            // que se suma. Es el dinero libre y la BASE del ahorro en
-            // porcentaje que ofrece el panel.
-            disponible: Math.max(
-              0,
-              round2(
-                abonado -
-                  gastado -
-                  sumBy(movements, (m) => m.kind === "ahorro") +
-                  sumBy(movements, (m) => m.kind === "abono_externo")
-              )
+            // DISPONIBLE = abonado + abono externo - gastado (gasto +
+            // inversión) - ahorro - pagos. El AHORRO se aparta, el ABONO
+            // EXTERNO entra por fuera y los PAGOS a personas salen del
+            // dinero. Es la misma fórmula que el módulo Finanzas y la BASE
+            // del ahorro en porcentaje que ofrece el panel.
+            disponible: round2(
+              abonado +
+                sumBy(movements, (m) => m.kind === "abono_externo") -
+                gastado -
+                sumBy(movements, (m) => m.kind === "ahorro") -
+                pagos
             ),
           };
         })(),

@@ -9,10 +9,18 @@ import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-s
 // ==================================================================
 // FINANZAS DEL NEGOCIO -> /api/admin/finance
 //
-//   GET   { currency, totals, packages, months, movements }
+//   GET   { currency, totals, packages, months, movements, payees, payments }
 //     totals    ganancias (abonos cobrados), porCobrar (saldo), facturado,
-//               disponible, ahorro, inversiones, gastos, abonoExterno
-//     packages  dinero de CADA paquete activo, con su cliente
+//               disponible (DINERO ACTUAL), ahorro, inversiones, gastos,
+//               abonoExterno y pagos
+//     packages  dinero de CADA paquete activo, con su cliente. Los paquetes
+//               GRATIS (precio 0) se omiten salvo que tengan algún abono,
+//               gasto, inversión, ahorro, abono externo o pago.
+//     payees    pagos agrupados por colaborador/empleado (total histórico)
+//     payments  cada pago individual, con su destinatario y su paquete
+//
+//     DINERO ACTUAL = abonos + abono externo - gastos - inversión - ahorro
+//                     - pagos. Los pagos a colaboradores/empleados SÍ salen.
 //     months    últimos 6 meses: ganancias vs. gastos/inversiones/ahorro
 //     movements movimientos INDIVIDUALES (con paquete y cliente) para que el
 //               módulo pueda desglosar cada fila de su tabla; los abonos
@@ -153,9 +161,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         inversion: 0,
         ahorro: 0,
         abonoExterno: 0,
-        // Los PAGOS a colaboradores/empleados son un gasto INVISIBLE: se
-        // registran (para saber a quién se le pagó) pero NO se descuentan
-        // del paquete ni del disponible.
+        // Los PAGOS a colaboradores/empleados salen del dinero: se
+        // descuentan del paquete y del dinero actual (y se pueden desglosar
+        // por persona en `payees` / `payments`).
         pagos: 0,
       });
       type ByKind = ReturnType<typeof emptyByKind>;
@@ -195,14 +203,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         inversiones: 0,
         gastos: 0,
         abonoExterno: 0,
-        // Pagos repartidos: solo informativos (no son una salida).
+        // Pagos repartidos a colaboradores/empleados: SÍ son una salida.
         pagos: 0,
-        // Ganancia ESTIMADA: el ahorro y la inversión se cuentan como salida
-        // (el dinero se movió, aunque siga siendo del negocio), pero el GASTO
-        // no se descuenta: es el "gasto inconveniente".
+        // Ganancia ESTIMADA: abonado + abono externo − inversión − ahorro
+        // (sin descontar gastos ni pagos).
         gananciaEstimada: 0,
-        // Ganancia REAL: la estimada MENOS los gastos (lo que de verdad
-        // queda). Coincide con el disponible del negocio.
+        // Ganancia REAL / DINERO ACTUAL: la estimada MENOS los gastos y los
+        // pagos. Coincide con el `disponible` del negocio.
         gananciaReal: 0,
       };
 
@@ -212,27 +219,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const paid = Number(p.paid || 0);
         const k = byKind.get(id) ?? emptyByKind();
         // Gastado = gasto + inversión (la inversión también es dinero que
-        // sale). Los PAGOS no entran: son un gasto invisible.
+        // sale); los pagos se restan aparte, para poder verlos por persona.
         const gastado = k.gasto + k.inversion;
-        // DISPONIBLE = abonado - gastado - ahorro + abono externo.
-        // El ahorro se APARTA (sale del disponible) y el abono externo es
-        // dinero que entra por fuera del paquete (se suma). Misma fórmula
-        // que /api/admin/package-progress.
-        const disponible = Math.max(
-          0,
-          round2(paid - gastado - k.ahorro + k.abonoExterno)
+        // DINERO ACTUAL = abonado + abono externo - gastos - inversión -
+        // ahorro - pagos. Los PAGOS a colaboradores/empleados SÍ salen del
+        // dinero (antes se trataban como un "gasto invisible").
+        const disponible = round2(
+          paid + k.abonoExterno - gastado - k.ahorro - k.pagos
         );
         const porCobrar = Math.max(0, round2(price - paid));
-
-        totals.facturado += price;
-        totals.ganancias += paid;
-        totals.porCobrar += porCobrar;
-        totals.disponible += disponible;
-        totals.ahorro += k.ahorro;
-        totals.inversiones += k.inversion;
-        totals.gastos += k.gasto;
-        totals.abonoExterno += k.abonoExterno;
-        totals.pagos += k.pagos;
 
         return {
           id,
@@ -256,12 +251,37 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         };
       });
 
+      // PAQUETES GRATIS: no salen en Finanzas salvo que tengan ALGO
+      // registrado (un abono, un gasto, una inversión, ahorro, abono externo
+      // o un pago). Un paquete de precio 0 sin movimientos solo llenaba la
+      // tabla de ceros.
+      const packagesVisible = packagesOut.filter(
+        (p) =>
+          p.price > 0 ||
+          p.paid > 0 ||
+          p.gastos > 0 ||
+          p.inversiones > 0 ||
+          p.ahorro > 0 ||
+          p.abonoExterno > 0 ||
+          p.pagos > 0
+      );
+      for (const p of packagesVisible) {
+        totals.facturado += p.price;
+        totals.ganancias += p.paid;
+        totals.porCobrar += p.balance;
+        totals.ahorro += p.ahorro;
+        totals.inversiones += p.inversiones;
+        totals.gastos += p.gastos;
+        totals.abonoExterno += p.abonoExterno;
+        totals.pagos += p.pagos;
+      }
+
       // ---- Movimientos GENERALES del negocio ----
       // Gastado = gasto + inversión; el ahorro se aparta y el abono externo
-      // entra por fuera, igual que en un paquete.
+      // entra por fuera, igual que en un paquete. Los pagos también salen.
       const generalGastado = general.gasto + general.inversion;
       const generalNeto =
-        general.abonoExterno - generalGastado - general.ahorro;
+        general.abonoExterno - generalGastado - general.ahorro - general.pagos;
       generalOut = {
         gastos: round2(general.gasto),
         inversiones: round2(general.inversion),
@@ -271,27 +291,25 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         pagos: round2(general.pagos),
         neto: round2(generalNeto),
       };
-      // El negocio entero: lo que suman los paquetes MENOS lo que se gastó,
-      // se apartó o entró por fuera del paquete.
+      // El negocio entero suma paquetes + movimientos generales.
       totals.gastos += general.gasto;
       totals.inversiones += general.inversion;
       totals.ahorro += general.ahorro;
       totals.abonoExterno += general.abonoExterno;
       totals.pagos += general.pagos;
-      totals.disponible = Math.max(
-        0,
-        round2(totals.disponible - generalGastado - general.ahorro + general.abonoExterno)
-      );
-      // Ganancia estimada = cobrado + abono externo - inversión - ahorro
-      // (el gasto no se descuenta). Ganancia real = estimada - gastos, que es
-      // exactamente el disponible del negocio.
+      // DINERO ACTUAL (lo que se tiene hoy): abonado + abono externo -
+      // gastos - inversión - ahorro - pagos. Es la MISMA fórmula de cada
+      // paquete, así el total cuadra con la tabla.
       totals.gananciaEstimada = round2(
         totals.ganancias +
           totals.abonoExterno -
           totals.inversiones -
           totals.ahorro
       );
-      totals.gananciaReal = round2(totals.gananciaEstimada - totals.gastos);
+      totals.gananciaReal = round2(
+        totals.gananciaEstimada - totals.gastos - totals.pagos
+      );
+      totals.disponible = totals.gananciaReal;
 
       for (const key of Object.keys(totals) as (keyof typeof totals)[]) {
         totals[key] = round2(totals[key]);
@@ -354,14 +372,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
 
       const currency =
-        packagesOut.find((p) => p.currency)?.currency ||
+        packagesVisible.find((p) => p.currency)?.currency ||
         String(packages[0]?.currency || "MXN");
 
       // ---- Movimientos INDIVIDUALES (desglose de la tabla) ----
       // La tabla expande cada fila: los paquetes para ver su resumen y cada
       // tipo de movimiento para ver sus registros uno por uno.
       const nameById = new Map<number, { name: string; clientName: string }>();
-      for (const p of packagesOut) {
+      for (const p of packagesVisible) {
         nameById.set(p.id, { name: p.name, clientName: p.clientName });
       }
       let movementRows: Row[] = [];
@@ -418,13 +436,93 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         });
       }
 
+      // ---- PAGOS A COLABORADORES Y EMPLEADOS ----
+      // Se listan TODOS los pagos repartidos (kind = 'pago'), con su
+      // destinatario, su rol y el paquete al que se cargaron. `payees` los
+      // agrupa por PERSONA para la pestaña "Pagos".
+      let paymentRows: Row[] = [];
+      const paymentsQuery = (withUser: boolean) =>
+        `SELECT m.id, ${withUser ? "m.id_user" : "NULL"} AS user_id,
+                ${withUser ? "CONCAT_WS(' ', u.name, u.lastname)" : "NULL"} AS user_name,
+                ${withUser ? "COALESCE(r.name, '')" : "''"} AS role_name,
+                m.id_purchased_package AS package_id,
+                COALESCE(pp.name, '') AS package_name,
+                m.amount, m.description,
+                DATE_FORMAT(m.created, '%Y-%m-%dT%H:%i:%s') AS created
+           FROM purchased_packages_movements m${
+             withUser
+               ? " LEFT JOIN users u ON u.id = m.id_user LEFT JOIN roles r ON r.id = u.id_role"
+               : ""
+           }
+           LEFT JOIN purchased_packages pp ON pp.id = m.id_purchased_package
+          WHERE m.active = 1 AND m.kind = 'pago' AND ${movJoinScope.sql}
+          ORDER BY m.created DESC, m.id DESC`;
+      try {
+        try {
+          paymentRows = await q<Row>(paymentsQuery(true), movJoinScope.params);
+        } catch {
+          paymentRows = await q<Row>(paymentsQuery(false), movJoinScope.params);
+        }
+      } catch {
+        paymentRows = [];
+      }
+
+      const payeeMap = new Map<
+        number,
+        {
+          userId: number;
+          name: string;
+          roleName: string;
+          total: number;
+          count: number;
+          packages: Set<number>;
+          lastPaid: string;
+        }
+      >();
+      for (const p of paymentRows) {
+        const uid = Number(p.user_id || 0);
+        const key = uid > 0 ? uid : -1;
+        const name = String(p.user_name || "").trim() || "Sin destinatario";
+        const prev = payeeMap.get(key);
+        const amount = Number(p.amount || 0);
+        if (prev) {
+          prev.total += amount;
+          prev.count += 1;
+          prev.packages.add(Number(p.package_id || 0));
+          if (String(p.created || "") > prev.lastPaid) {
+            prev.lastPaid = String(p.created || "");
+          }
+        } else {
+          payeeMap.set(key, {
+            userId: uid,
+            name,
+            roleName: String(p.role_name || "").trim(),
+            total: amount,
+            count: 1,
+            packages: new Set([Number(p.package_id || 0)]),
+            lastPaid: String(p.created || ""),
+          });
+        }
+      }
+      const payees = [...payeeMap.values()]
+        .map((p) => ({
+          userId: p.userId,
+          name: p.name,
+          roleName: p.roleName,
+          total: round2(p.total),
+          count: p.count,
+          packageCount: p.packages.size,
+          lastPaid: p.lastPaid,
+        }))
+        .sort((a, b) => b.total - a.total);
+
       res.status(200).json({
         currency,
         totals,
         // Dinero registrado SIN paquete (gastos/inversiones/ahorro del
-        // negocio). La tabla de la app lo muestra como grupo "General".
+        // negocio). La pestaña "Por paquete" lo muestra como "General".
         general: generalOut,
-        packages: packagesOut,
+        packages: packagesVisible,
         months: [...series.values()],
         movements: movementRows.map((m) => {
           const meta = nameById.get(Number(m.package_id)) || {
@@ -441,7 +539,32 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             description: String(m.description || ""),
             created: m.created || "",
             // Quién recibió el pago (solo movimientos con destinatario).
+            userId: Number(m.user_id || 0),
             userName: String(m.user_name || "").trim(),
+          };
+        }),
+        // Pagos a colaboradores/empleados, agrupados por PERSONA (pestaña
+        // "Pagos"): total histórico, cuántos pagos y en cuántos paquetes.
+        payees,
+        // Cada pago individual (con su paquete y su fecha), para desglosar a
+        // cada persona.
+        payments: paymentRows.map((p) => {
+          const pid = Number(p.package_id || 0);
+          const meta = nameById.get(pid) || {
+            name: String(p.package_name || ""),
+            clientName: "",
+          };
+          return {
+            id: Number(p.id),
+            userId: Number(p.user_id || 0),
+            userName: String(p.user_name || "").trim(),
+            roleName: String(p.role_name || ""),
+            packageId: pid,
+            packageName: meta.name,
+            clientName: meta.clientName,
+            amount: round2(Number(p.amount || 0)),
+            description: String(p.description || ""),
+            created: p.created || "",
           };
         }),
         movementsAvailable,
