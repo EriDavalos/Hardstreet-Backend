@@ -28,6 +28,16 @@ import { roleCan, userIsAdmin, userRoleId } from "./permissions";
 /** Nombre del rol fijo de los clientes (roles.name). */
 export const CLIENT_ROLE = "cliente";
 
+/** Una ubicación de la agenda: número (1, 2, 3…) + nombre y coordenadas. */
+export type AgendaLocation = {
+  id?: number;
+  /** Número con el que se enumera la ubicación (1 = primera). */
+  position: number;
+  location: string;
+  lat: number | null;
+  lng: number | null;
+};
+
 /** Una agenda tal como la manda la API (camelCase). */
 export interface AgendaItem {
   id: number;
@@ -39,9 +49,12 @@ export interface AgendaItem {
   serviceName: string;
   eventDate: string;
   description: string;
+  /** Primera ubicación (compatibilidad con el calendario y el widget). */
   location: string;
   lat: number | null;
   lng: number | null;
+  /** TODAS las ubicaciones, ya numeradas por `position` (1, 2, 3…). */
+  locations?: AgendaLocation[];
   /** true = hueco ocupado SIN detalle (solo lo reciben los clientes). */
   busy: boolean;
 }
@@ -132,6 +145,7 @@ export function busyAgenda(item: AgendaItem): AgendaItem {
     location: "",
     lat: null,
     lng: null,
+    locations: [],
     busy: true,
   };
 }

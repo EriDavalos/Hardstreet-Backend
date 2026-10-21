@@ -11,6 +11,7 @@ import {
   clientPackageIds,
   viewerIsClient,
   type AgendaItem,
+  type AgendaLocation,
 } from "../../../lib/agenda-visibility";
 
 // ==================================================================
@@ -82,6 +83,75 @@ function placeOf(b: Record<string, unknown>) {
   const lat = coordinate(b.lat ?? b.latitude, 90);
   const lng = coordinate(b.lng ?? b.lon ?? b.longitude, 180);
   return { location, lat, lng };
+}
+
+/** Una ubicación ya normalizada (nombre + coordenadas). */
+type PlaceInput = { location: string; lat: number | null; lng: number | null };
+
+/**
+ * TODAS las ubicaciones que llegan en el cuerpo.
+ *
+ * Acepta la forma nueva `locations: [{ location, lat, lng }, ...]` (en el
+ * orden en que se capturaron) y la forma vieja de UNA sola
+ * (`location` + `lat`/`lng`, o un simple texto entre las ubicaciones).
+ * Las entradas vacías se descartan: así la numeración queda 1, 2, 3 sin
+ * huecos.
+ */
+function locationsOf(b: Record<string, unknown>): PlaceInput[] {
+  const raw = b.locations ?? b.places ?? b.ubicaciones;
+  const list: PlaceInput[] = [];
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (entry === null || entry === undefined) continue;
+      if (typeof entry !== "string" && typeof entry !== "object") continue;
+      const rec = (typeof entry === "string"
+        ? { location: entry }
+        : entry) as Record<string, unknown>;
+      const location = norm(
+        rec.location ?? rec.name ?? rec.place ?? rec.lugar
+      ).slice(0, 255);
+      const lat = coordinate(rec.lat ?? rec.latitude, 90);
+      const lng = coordinate(rec.lng ?? rec.lon ?? rec.longitude, 180);
+      if (!location && (lat === null || lng === null)) continue;
+      list.push({ location, lat, lng });
+    }
+  }
+  if (!list.length) {
+    const one = placeOf(b);
+    if (one.location || (one.lat !== null && one.lng !== null)) list.push(one);
+  }
+  return list;
+}
+
+/**
+ * Guarda las ubicaciones de una agenda: da de baja las que había y escribe las
+ * nuevas numeradas 1..N (el número es el orden de captura).
+ *
+ * Sin la migración (`schedule_locations` no existe) no falla: la agenda sigue
+ * guardando su primera ubicación en `schedules.location`.
+ */
+async function replaceScheduleLocations(
+  scheduleId: number,
+  companyId: number | null,
+  locations: PlaceInput[]
+): Promise<void> {
+  try {
+    await exec(
+      `UPDATE schedule_locations SET active = 0 WHERE id_schedule = ?`,
+      [scheduleId]
+    );
+    for (let i = 0; i < locations.length; i++) {
+      const l = locations[i];
+      await exec(
+        `INSERT INTO schedule_locations
+           (id_schedule, id_company, position, location, lat, lng)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [scheduleId, companyId, i + 1, l.location || null, l.lat, l.lng]
+      );
+    }
+  } catch {
+    // Migración pendiente: el lugar principal vive en la propia agenda.
+  }
 }
 
 /** Valida que un servicio exista, esté activo y sea de la empresa. */
@@ -185,6 +255,45 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           rows = await q<AgendaRow>(selectAgendas(""), params);
         }
 
+        // UBICACIONES de cada agenda, ya numeradas (1, 2, 3…). Sin la
+        // migración no hay ninguna y el detalle usa `location`.
+        const locationsBySchedule = new Map<number, AgendaLocation[]>();
+        const scheduleIds = rows.map((r) => Number(r.id));
+        if (scheduleIds.length) {
+          try {
+            const locRows = await q<{
+              id: number;
+              id_schedule: number;
+              position: number;
+              location: string | null;
+              lat: string | number | null;
+              lng: string | number | null;
+            }>(
+              `SELECT id, id_schedule, position, location, lat, lng
+                 FROM schedule_locations
+                WHERE active = 1 AND id_schedule IN (?)
+                ORDER BY id_schedule ASC, position ASC, id ASC`,
+              [scheduleIds]
+            );
+            for (const l of locRows) {
+              const key = Number(l.id_schedule);
+              const list = locationsBySchedule.get(key) ?? [];
+              list.push({
+                id: Number(l.id),
+                position: Number(l.position) || list.length + 1,
+                location: String(l.location || ""),
+                lat:
+                  l.lat === null || l.lat === undefined ? null : Number(l.lat),
+                lng:
+                  l.lng === null || l.lng === undefined ? null : Number(l.lng),
+              });
+              locationsBySchedule.set(key, list);
+            }
+          } catch {
+            // Migración pendiente: cada agenda sigue con su lugar único.
+          }
+        }
+
         // ¿Quién mira? Si es CLIENTE, solo sus eventos llevan detalle; los
         // demás se devuelven como huecos ocupados (la app pinta "Ocupado").
         const isClient = await viewerIsClient(me.sub);
@@ -193,6 +302,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           : null;
 
         const agendas = rows.map((r) => {
+          const places = locationsBySchedule.get(Number(r.id)) ?? [];
+          const primary = places[0];
           const item: AgendaItem = {
             id: r.id,
             purchasedPackageId: r.id_purchased_package,
@@ -203,10 +314,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             serviceName: String(r.service_name || ""),
             eventDate: String(r.event_date || ""),
             description: String(r.description || ""),
-            // El LUGAR: nombre y coordenadas (null si la agenda no lo tiene).
-            location: String(r.location || ""),
-            lat: r.lat === null || r.lat === undefined ? null : Number(r.lat),
-            lng: r.lng === null || r.lng === undefined ? null : Number(r.lng),
+            // El LUGAR: la PRIMERA ubicación en los campos sueltos (para el
+            // calendario y el widget) y TODAS en `locations` (numeradas).
+            location: String(primary?.location ?? r.location ?? ""),
+            lat:
+              primary?.lat ??
+              (r.lat === null || r.lat === undefined ? null : Number(r.lat)),
+            lng:
+              primary?.lng ??
+              (r.lng === null || r.lng === undefined ? null : Number(r.lng)),
+            locations: places,
             busy: false,
           };
           return agendaForViewer(item, isClient, ownPackages);
@@ -250,7 +367,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const description = norm(b.description);
-        const { location, lat, lng } = placeOf(b);
+        // VARIAS ubicaciones: la primera va también en la agenda (el
+        // calendario y el widget siguen leyendo un solo lugar).
+        const locations = locationsOf(b);
+        const location = locations[0]?.location || "";
+        const lat = locations[0]?.lat ?? null;
+        const lng = locations[0]?.lng ?? null;
         // Con la migración del lugar se guarda también DÓNDE es; sin ella, la
         // agenda se guarda igual (no se pierde la fecha ni la nota).
         let r: { insertId: number; affectedRows: number };
@@ -279,6 +401,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             [purchasedPackageId, serviceId, eventDate, description || null, companyId]
           );
         }
+        // Numeradas 1..N en el orden en que se capturaron.
+        await replaceScheduleLocations(r.insertId, companyId, locations);
         const item = {
           id: r.insertId,
           purchasedPackageId,
@@ -288,6 +412,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           location,
           lat,
           lng,
+          locations,
         };
         await logActivity({
           userId: me.sub,
@@ -347,19 +472,35 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fields.push("`description` = ?");
           params.push(description || null);
         }
-        // LUGAR: se puede fijar, cambiar o quitar (location vacío = sin lugar).
-        const place = placeOf(b);
+        // UBICACIONES: si llega la lista se REEMPLAZA completa y la primera
+        // pasa a ser el lugar principal de la agenda (numeradas 1..N).
+        // Sin lista se mantiene la forma vieja de UNA sola ubicación.
+        const newLocations =
+          b.locations !== undefined ||
+          b.places !== undefined ||
+          b.ubicaciones !== undefined
+            ? locationsOf(b)
+            : null;
+        const place =
+          newLocations && newLocations.length ? newLocations[0] : placeOf(b);
         const extraFields: string[] = [];
         const extraParams: unknown[] = [];
-        if (b.location !== undefined || b.place !== undefined) {
+        if (newLocations) {
+          extraFields.push("`location` = ?", "`lat` = ?", "`lng` = ?");
+          extraParams.push(place.location || null, place.lat, place.lng);
+        }
+        if (!newLocations && (b.location !== undefined || b.place !== undefined)) {
           extraFields.push("`location` = ?");
           extraParams.push(place.location || null);
         }
-        if (b.lat !== undefined || b.latitude !== undefined) {
+        if (!newLocations && (b.lat !== undefined || b.latitude !== undefined)) {
           extraFields.push("`lat` = ?");
           extraParams.push(place.lat);
         }
-        if (b.lng !== undefined || b.lon !== undefined || b.longitude !== undefined) {
+        if (
+          !newLocations &&
+          (b.lng !== undefined || b.lon !== undefined || b.longitude !== undefined)
+        ) {
           extraFields.push("`lng` = ?");
           extraParams.push(place.lng);
         }
@@ -383,6 +524,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             [...params, id, ...scopeSql.params]
           );
         }
+        // La lista de ubicaciones se reescribe completa (1, 2, 3…).
+        if (newLocations) {
+          await replaceScheduleLocations(id, companyId, newLocations);
+        }
         await logActivity({
           userId: me.sub,
           module: "schedules",
@@ -402,6 +547,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             location: place.location,
             lat: place.lat,
             lng: place.lng,
+            ...(newLocations ? { locations: newLocations } : {}),
           },
         });
         return;
@@ -420,6 +566,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (!r.affectedRows) {
           fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);
           return;
+        }
+        // Sus ubicaciones se van con ella (baja lógica).
+        try {
+          await exec(
+            `UPDATE schedule_locations SET active = 0 WHERE id_schedule = ?`,
+            [id]
+          );
+        } catch {
+          // Migración pendiente: no hay ubicaciones que dar de baja.
         }
         await logActivity({
           userId: me.sub,
