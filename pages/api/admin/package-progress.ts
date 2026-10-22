@@ -324,35 +324,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
              LEFT JOIN status st ON st.id = pps.id_status
             WHERE pps.id_purchased_package = ? AND pps.active = 1
             ORDER BY pps.id ASC`;
+      // Cada migración se prueba por separado: la del banner, la de los
+      // parámetros especiales (fotos/carpeta) y la de la liga.
+      async function servicesWith(extra: string): Promise<Row[]> {
+        return q<Row>(svcBase.replace("{EXTRA}", extra), [purchasedPackageId]);
+      }
       let services: Row[];
       try {
-        services = await q<Row>(
-          svcBase.replace(
-            "{EXTRA}",
-            ", s.url AS service_url, s.photos_max, s.allow_folder"
-          ),
-          [purchasedPackageId]
+        services = await servicesWith(
+          ", s.url AS service_url, s.photos_max, s.allow_folder, s.show_banner"
         );
       } catch {
         try {
-          services = await q<Row>(
-            svcBase.replace(
-              "{EXTRA}",
-              ", s.url AS service_url, s.photos_max, s.allow_folder"
-            ),
-            [purchasedPackageId]
+          services = await servicesWith(
+            ", s.url AS service_url, s.photos_max, s.allow_folder"
           );
         } catch {
           try {
-            services = await q<Row>(
-              svcBase.replace("{EXTRA}", ", s.url AS service_url"),
-              [purchasedPackageId]
-            );
+            services = await servicesWith(", s.url AS service_url");
           } catch {
-            services = await q<Row>(
-              svcBase.replace("{EXTRA}", ""),
-              [purchasedPackageId]
-            );
+            services = await servicesWith("");
           }
         }
       }
@@ -511,6 +502,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               s.allow_folder === null || s.allow_folder === undefined
                 ? true
                 : Number(s.allow_folder) === 1,
+            // ¿Sus fotos salen en el banner de «Mi paquete» al cumplirse?
+            showBanner:
+              Number(s.show_banner) === 1 &&
+              (s.allow_folder === null || s.allow_folder === undefined
+                ? true
+                : Number(s.allow_folder) === 1),
             // Descripción que el paquete tiene para este servicio.
             description: String(s.description || ""),
             status: String(s.status_name || "Pendiente"),

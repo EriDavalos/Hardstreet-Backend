@@ -17,6 +17,8 @@ export interface ServiceRow {
   photos_max?: number | null;
   /** ¿Se le puede compartir una carpeta del Drive? */
   allow_folder?: number | null;
+  /** ¿Las fotos de la carpeta salen en el banner de «Mi paquete»? */
+  show_banner?: number | null;
 }
 export interface TierRow { id: number; name: string | null; tier: number | null; }
 export interface PackageCategoryRow {
@@ -68,6 +70,12 @@ export interface Service {
   photosMax: number;
   /** ¿Se le puede compartir una carpeta del Drive? */
   allowFolder: boolean;
+  /**
+   * ¿Mostrar las fotos de la carpeta compartida en el banner de «Mi paquete»
+   * cuando el servicio esté cumplido? Solo puede estar encendido si
+   * [allowFolder] también lo está.
+   */
+  showBanner: boolean;
 }
 
 export interface Package {
@@ -160,6 +168,8 @@ export function mapService(r: ServiceRow): Service {
     allowFolder: r.allow_folder === null || r.allow_folder === undefined
       ? true
       : Number(r.allow_folder) === 1,
+    // Banner del cliente: apagado salvo que la migración lo encienda.
+    showBanner: Number(r.show_banner) === 1,
   };
 }
 
@@ -212,6 +222,7 @@ export function mapPurchasedPackageService(
           url: "",
           photosMax: 0,
           allowFolder: true,
+          showBanner: false,
         },
   };
 }

@@ -136,25 +136,34 @@ export async function getServices() {
   // prueba aparte para que una BD sin migrar siga devolviendo el catálogo.
   try {
     const rows = await q<ServiceRow>(
-      `SELECT id, name, description, icon, url, photos_max, allow_folder
+      `SELECT id, name, description, icon, url, photos_max, allow_folder, show_banner
          FROM services WHERE active = 1 ORDER BY id`
     );
     return rows.map(mapService);
   } catch {
     try {
-      // Migración de los parámetros especiales aún no aplicada.
+      // Migración del BANNER aún no aplicada: el resto del catálogo sigue.
       const rows = await q<ServiceRow>(
-        `SELECT id, name, description, icon, url
+        `SELECT id, name, description, icon, url, photos_max, allow_folder
            FROM services WHERE active = 1 ORDER BY id`
       );
       return rows.map(mapService);
     } catch {
-      // Migración 2026-10-13_services_url.sql aún no aplicada: sin la columna
-      // `url` el catálogo sigue funcionando (sin ligas).
-      const rows = await q<ServiceRow>(
-        `SELECT id, name, description, icon FROM services WHERE active = 1 ORDER BY id`
-      );
-      return rows.map(mapService);
+      try {
+        // Migración de los parámetros especiales aún no aplicada.
+        const rows = await q<ServiceRow>(
+          `SELECT id, name, description, icon, url
+             FROM services WHERE active = 1 ORDER BY id`
+        );
+        return rows.map(mapService);
+      } catch {
+        // Migración 2026-10-13_services_url.sql aún no aplicada: sin la columna
+        // `url` el catálogo sigue funcionando (sin ligas).
+        const rows = await q<ServiceRow>(
+          `SELECT id, name, description, icon FROM services WHERE active = 1 ORDER BY id`
+        );
+        return rows.map(mapService);
+      }
     }
   }
 }
@@ -182,6 +191,7 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
     svc_name: string | null; svc_description: string | null;
     svc_icon: string | null; status_name: string | null; svc_url?: string | null;
     svc_photos_max?: number | null; svc_allow_folder?: number | null;
+    svc_show_banner?: number | null;
   };
   const svcSelect = `SELECT pps.id, pps.description, pps.delivery_date, pps.id_purchased_package, pps.id_status, pps.id_service,
             s.name AS svc_name, s.description AS svc_description, s.icon AS svc_icon,
@@ -193,14 +203,21 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
       ORDER BY pps.id ASC`;
   const svcUrl = ", s.url AS svc_url";
   const svcCaps = ", s.url AS svc_url, s.photos_max AS svc_photos_max, s.allow_folder AS svc_allow_folder";
+  const svcBanner =
+    ", s.url AS svc_url, s.photos_max AS svc_photos_max, s.allow_folder AS svc_allow_folder, " +
+    "s.show_banner AS svc_show_banner";
   let svcRows: SvcRow[];
   try {
-    svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcCaps), [ppIds]);
+    svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcBanner), [ppIds]);
   } catch {
     try {
-      svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcUrl), [ppIds]);
+      svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcCaps), [ppIds]);
     } catch {
-      svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", ""), [ppIds]);
+      try {
+        svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", svcUrl), [ppIds]);
+      } catch {
+        svcRows = await q<SvcRow>(svcSelect.replace("{EXTRA}", ""), [ppIds]);
+      }
     }
   }
 
@@ -272,6 +289,7 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
                       : Number(s.svc_allow_folder) === 1
                         ? 1
                         : 0,
+                  show_banner: Number(s.svc_show_banner) === 1 ? 1 : 0,
                 }
               : null,
             s.status_name ? { id: s.id_status || 0, name: s.status_name } : null

@@ -30,6 +30,7 @@ type Row = {
   url: string | null;
   photos_max?: number | null;
   allow_folder?: number | null;
+  show_banner?: number | null;
 };
 
 function map(r: Row) {
@@ -46,6 +47,12 @@ function map(r: Row) {
       r.allow_folder === null || r.allow_folder === undefined
         ? true
         : Number(r.allow_folder) === 1,
+    // El banner del cliente SOLO vale con la carpeta habilitada (la app lo
+    // apaga al desactivarla; aquí se vuelve a asegurar).
+    showBanner:
+      (r.allow_folder === null || r.allow_folder === undefined
+        ? true
+        : Number(r.allow_folder) === 1) && Number(r.show_banner) === 1,
   };
 }
 
@@ -118,7 +125,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         };
         try {
           rows = await q<Row>(
-            `SELECT id, name, description, icon, url, photos_max, allow_folder
+            `SELECT id, name, description, icon, url, photos_max, allow_folder, show_banner
                FROM services
               WHERE ${sqlWhere}
               ORDER BY id ASC
@@ -126,8 +133,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             params
           );
         } catch {
-          // Migración de los parámetros pendiente: catálogo como antes (con
-          // las columnas que ya existan de la migración anterior).
+          // Migración del BANNER pendiente: catálogo con lo anterior.
           try {
             rows = await q<Row>(
               `SELECT id, name, description, icon, url, photos_max, allow_folder
@@ -138,14 +144,27 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
               params
             );
           } catch {
-            rows = await q<Row>(
-              `SELECT id, name, description, icon, url
-                 FROM services
-                WHERE ${sqlWhere}
-                ORDER BY id ASC
-                LIMIT ${p.limit} OFFSET ${p.offset}`,
-              params
-            );
+            // Migración de los parámetros pendiente: catálogo como antes (con
+            // las columnas que ya existan de la migración anterior).
+            try {
+              rows = await q<Row>(
+                `SELECT id, name, description, icon, url, photos_max, allow_folder
+                   FROM services
+                  WHERE ${sqlWhere}
+                  ORDER BY id ASC
+                  LIMIT ${p.limit} OFFSET ${p.offset}`,
+                params
+              );
+            } catch {
+              rows = await q<Row>(
+                `SELECT id, name, description, icon, url
+                   FROM services
+                  WHERE ${sqlWhere}
+                  ORDER BY id ASC
+                  LIMIT ${p.limit} OFFSET ${p.offset}`,
+                params
+              );
+            }
           }
         }
         const countRows = await q<{ n: number }>(
@@ -218,6 +237,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     // Sin la migración no existe la columna: la carpeta sigue disponible.
     const allowFolder =
       b.allowFolder === undefined ? true : Boolean(b.allowFolder);
+    // Banner del cliente: solo con la carpeta compartida encendida.
+    const showBanner = allowFolder && b.showBanner === true;
 
     if (req.method === "POST") {
       if (!name) {
@@ -228,8 +249,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       try {
         r = await exec(
           `INSERT INTO services
-             (name, description, icon, url, photos_max, allow_folder, id_company)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+             (name, description, icon, url, photos_max, allow_folder, show_banner, id_company)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [
             name,
             description || null,
@@ -237,15 +258,34 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             url || null,
             photosMax,
             allowFolder ? 1 : 0,
+            showBanner ? 1 : 0,
             companyId,
           ]
         );
       } catch {
-        r = await exec(
-          `INSERT INTO services (name, description, icon, url, id_company)
-           VALUES (?, ?, ?, ?, ?)`,
-          [name, description || null, icon || null, url || null, companyId]
-        );
+        try {
+          // Migración del banner pendiente: se guarda el resto.
+          r = await exec(
+            `INSERT INTO services
+               (name, description, icon, url, photos_max, allow_folder, id_company)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [
+              name,
+              description || null,
+              icon || null,
+              url || null,
+              photosMax,
+              allowFolder ? 1 : 0,
+              companyId,
+            ]
+          );
+        } catch {
+          r = await exec(
+            `INSERT INTO services (name, description, icon, url, id_company)
+             VALUES (?, ?, ?, ?, ?)`,
+            [name, description || null, icon || null, url || null, companyId]
+          );
+        }
       }
       const item = {
         id: Number(r.insertId),
@@ -255,6 +295,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         url,
         photosMax,
         allowFolder,
+        showBanner,
       };
       await logActivity({
         userId: me.sub,
@@ -311,6 +352,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       extraFields.push("`allow_folder` = ?");
       extraParams.push(allowFolder ? 1 : 0);
     }
+    if (b.showBanner !== undefined || b.allowFolder === false) {
+      extraFields.push("`show_banner` = ?");
+      // Apagar la carpeta apaga también el banner del cliente.
+      extraParams.push(showBanner ? 1 : 0);
+    }
     if (!fields.length && !extraFields.length) {
       fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del servicio");
       return;
@@ -344,6 +390,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       url,
       photosMax,
       allowFolder,
+      showBanner,
     };
     await logActivity({
       userId: me.sub,
