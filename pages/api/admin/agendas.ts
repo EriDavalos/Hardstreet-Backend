@@ -163,6 +163,50 @@ async function serviceExists(id: number, companyId: number): Promise<boolean> {
   return rows.length > 0;
 }
 
+/**
+ * Valida que el usuario sea un CLIENTE de la empresa (activo).
+ *
+ * Se usa cuando la agenda va a nombre del cliente y no de un paquete
+ * comprado. Sin la migración de Empresas se valida sin el id_company.
+ */
+async function clientExists(id: number, companyId: number): Promise<boolean> {
+  try {
+    const rows = await q<{ id: number }>(
+      `SELECT id FROM users WHERE id = ? AND active = 1 AND id_company = ?`,
+      [id, companyId]
+    );
+    return rows.length > 0;
+  } catch {
+    const rows = await q<{ id: number }>(
+      `SELECT id FROM users WHERE id = ? AND active = 1`,
+      [id]
+    );
+    return rows.length > 0;
+  }
+}
+
+/** Id del cliente dueño de un paquete comprado (subconsulta del listado). */
+const packageClientId = (col: string) =>
+  `(SELECT u2.id FROM users_packages up2
+      JOIN users u2 ON u2.id = up2.id_user
+     WHERE up2.id_purchased_package = ${col}
+       AND up2.active = 1 AND u2.active = 1
+     ORDER BY up2.id LIMIT 1)`;
+
+/** Nombre del cliente dueño de un paquete comprado (subconsulta). */
+const packageClientName = (col: string) =>
+  `(SELECT TRIM(CONCAT(u2.name, ' ', COALESCE(u2.lastname, '')))
+      FROM users_packages up2
+      JOIN users u2 ON u2.id = up2.id_user
+     WHERE up2.id_purchased_package = ${col}
+       AND up2.active = 1 AND u2.active = 1
+     ORDER BY up2.id LIMIT 1)`;
+
+/** Nombre del cliente de una agenda suelta (sin paquete). */
+const userNameOf = (col: string) =>
+  `(SELECT TRIM(CONCAT(u3.name, ' ', COALESCE(u3.lastname, '')))
+      FROM users u3 WHERE u3.id = ${col})`;
+
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const ACTIONS: Record<string, "read" | "create" | "update" | "delete"> = {
     GET: "read",
@@ -187,73 +231,105 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     switch (req.method) {
       case "GET": {
-        const where: string[] = [`a.active = 1`, scopeSql.sql];
-        const params: unknown[] = [...scopeSql.params];
-
-        const userId = Number(req.query.userId || 0);
-        if (userId) {
-          where.push(
-            `a.id_purchased_package IN (SELECT id_purchased_package FROM users_packages WHERE id_user = ? AND active = 1)`
-          );
-          params.push(userId);
-        }
+        // Filtros que NO dependen de columnas nuevas: sirven igual en una BD
+        // sin migrar.
+        const baseWhere: string[] = [`a.active = 1`, scopeSql.sql];
+        const baseParams: unknown[] = [...scopeSql.params];
 
         const purchasedPackageId = Number(req.query.purchasedPackageId || 0);
         if (purchasedPackageId) {
-          where.push(`a.id_purchased_package = ?`);
-          params.push(purchasedPackageId);
+          baseWhere.push(`a.id_purchased_package = ?`);
+          baseParams.push(purchasedPackageId);
         }
 
         const from = norm(req.query.from);
         if (/^\d{4}-\d{2}-\d{2}$/.test(from)) {
-          where.push(`DATE(a.event_date) >= ?`);
-          params.push(from);
+          baseWhere.push(`DATE(a.event_date) >= ?`);
+          baseParams.push(from);
         }
         const to = norm(req.query.to);
         if (/^\d{4}-\d{2}-\d{2}$/.test(to)) {
-          where.push(`DATE(a.event_date) <= ?`);
-          params.push(to);
+          baseWhere.push(`DATE(a.event_date) <= ?`);
+          baseParams.push(to);
         }
+
+        // Un evento puede colgar de un PAQUETE comprado o ser SOLO del cliente
+        // (agendado sin paquete, migración 2026-10-22). `byClient` dice si la
+        // consulta puede leer `a.id_user`; sin esa migración se pregunta solo
+        // por los paquetes, como antes.
+        const userId = Number(req.query.userId || 0);
+        const whereFor = (byClient: boolean) => {
+          const where = [...baseWhere];
+          const params = [...baseParams];
+          if (userId) {
+            const byPackages = `a.id_purchased_package IN (SELECT id_purchased_package FROM users_packages WHERE id_user = ? AND active = 1)`;
+            where.push(byClient ? `(a.id_user = ? OR ${byPackages})` : byPackages);
+            if (byClient) params.push(userId);
+            params.push(userId);
+          }
+          return { sql: where.join(" AND "), params };
+        };
 
         // Paginado: ?page=1&limit=30 además de los filtros de arriba.
         const p = readPaging(req);
-        const countRows = await q<{ n: number }>(
-          `SELECT COUNT(*) AS n FROM schedules a WHERE ${where.join(" AND ")}`,
-          params
-        );
-        // El LUGAR puede no existir todavía (migración pendiente): se pide con
-        // sus columnas y, si la base no las tiene, se pide sin ellas. Así el
-        // calendario sigue funcionando en una BD sin migrar.
-        const selectAgendas = (place: string) =>
-          `SELECT a.id, a.id_purchased_package, a.description,
-                  DATE_FORMAT(a.event_date, '%Y-%m-%dT%H:%i:%s') AS event_date,
-                  ${place}
-                  pp.name AS package_name,
-                  s.id AS service_id, s.name AS service_name,
-                  (SELECT u2.id FROM users_packages up2
-                     JOIN users u2 ON u2.id = up2.id_user
-                    WHERE up2.id_purchased_package = a.id_purchased_package
-                      AND up2.active = 1 AND u2.active = 1
-                    ORDER BY up2.id LIMIT 1) AS client_id,
-                  (SELECT TRIM(CONCAT(u2.name, ' ', COALESCE(u2.lastname, '')))
-                     FROM users_packages up2
-                     JOIN users u2 ON u2.id = up2.id_user
-                    WHERE up2.id_purchased_package = a.id_purchased_package
-                      AND up2.active = 1 AND u2.active = 1
-                    ORDER BY up2.id LIMIT 1) AS client_name
-             FROM schedules a
-             LEFT JOIN purchased_packages pp ON pp.id = a.id_purchased_package
-             LEFT JOIN services s ON s.id = a.id_service
-            WHERE ${where.join(" AND ")}
-            ORDER BY a.event_date ASC, a.id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`;
 
-        let rows: AgendaRow[];
-        try {
-          rows = await q<AgendaRow>(selectAgendas("a.location, a.lat, a.lng,"), params);
-        } catch {
-          rows = await q<AgendaRow>(selectAgendas(""), params);
+        // El cliente de la agenda: el de una agenda suelta (`a.id_user`) o el
+        // dueño del paquete comprado. El NOMBRE se resuelve igual.
+        const clientIdOf = (byClient: boolean) =>
+          byClient
+            ? `COALESCE(a.id_user, ${packageClientId("a.id_purchased_package")})`
+            : packageClientId("a.id_purchased_package");
+        const clientNameOf = (byClient: boolean) =>
+          byClient
+            ? `COALESCE(${userNameOf("a.id_user")}, ${packageClientName("a.id_purchased_package")})`
+            : packageClientName("a.id_purchased_package");
+
+        const selectAgendas = (byClient: boolean, place: string) => {
+          const w = whereFor(byClient);
+          return {
+            sql: `SELECT a.id, a.id_purchased_package, a.description,
+                    DATE_FORMAT(a.event_date, '%Y-%m-%dT%H:%i:%s') AS event_date,
+                    ${place}
+                    pp.name AS package_name,
+                    s.id AS service_id, s.name AS service_name,
+                    ${clientIdOf(byClient)} AS client_id,
+                    ${clientNameOf(byClient)} AS client_name
+               FROM schedules a
+               LEFT JOIN purchased_packages pp ON pp.id = a.id_purchased_package
+               LEFT JOIN services s ON s.id = a.id_service
+              WHERE ${w.sql}
+              ORDER BY a.event_date ASC, a.id ASC
+              LIMIT ${p.limit} OFFSET ${p.offset}`,
+            params: w.params,
+          };
+        };
+
+        // El LUGAR y el CLIENTE de la agenda suelta pueden no existir todavía
+        // (migraciones pendientes): se pide de la forma más completa a la más
+        // básica, así el calendario sigue funcionando en una BD sin migrar.
+        let rows: AgendaRow[] | null = null;
+        let countRows: { n: number }[] = [];
+        let lastError: unknown = null;
+        for (const attempt of [
+          { byClient: true, place: "a.location, a.lat, a.lng," },
+          { byClient: false, place: "a.location, a.lat, a.lng," },
+          { byClient: false, place: "" },
+        ]) {
+          try {
+            const w = whereFor(attempt.byClient);
+            countRows = await q<{ n: number }>(
+              `SELECT COUNT(*) AS n FROM schedules a WHERE ${w.sql}`,
+              w.params
+            );
+            const sel = selectAgendas(attempt.byClient, attempt.place);
+            rows = await q<AgendaRow>(sel.sql, sel.params);
+            break;
+          } catch (e) {
+            lastError = e;
+            rows = null;
+          }
         }
+        if (!rows) throw lastError;
 
         // UBICACIONES de cada agenda, ya numeradas (1, 2, 3…). Sin la
         // migración no hay ninguna y el detalle usa `location`.
@@ -326,7 +402,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             locations: places,
             busy: false,
           };
-          return agendaForViewer(item, isClient, ownPackages);
+          return agendaForViewer(item, isClient, ownPackages, me.sub);
         });
 
         res.status(200).json({
@@ -342,8 +418,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       case "POST": {
         const b = (req.body || {}) as Record<string, unknown>;
         const purchasedPackageId = Number(b.purchasedPackageId || 0);
-        if (!purchasedPackageId) {
-          fail(res, 400, "Indica el paquete comprado", "La agenda debe pertenecer a un paquete del cliente");
+        // El evento también puede ser SOLO del cliente, sin paquete: se guarda
+        // con `id_user` y la fecha que el estudio elija.
+        const clientUserId = Number(b.userId ?? b.clientId ?? b.id_user ?? 0) || 0;
+        if (!purchasedPackageId && !clientUserId) {
+          fail(
+            res,
+            400,
+            "Indica el cliente",
+            "Elige el cliente del evento (con su paquete o solo el cliente)"
+          );
           return;
         }
         const eventDate = normalizeDateTime(b.eventDate ?? b.datetime);
@@ -351,13 +435,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Fecha y hora inválida", "Usa el formato YYYY-MM-DD HH:MM");
           return;
         }
-        const pkg = await q(
-          `SELECT id FROM purchased_packages
-            WHERE id = ? AND active = 1 AND id_company = ?`,
-          [purchasedPackageId, companyId]
-        );
-        if (!pkg.length) {
-          fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
+        if (purchasedPackageId) {
+          const pkg = await q(
+            `SELECT id FROM purchased_packages
+              WHERE id = ? AND active = 1 AND id_company = ?`,
+            [purchasedPackageId, companyId]
+          );
+          if (!pkg.length) {
+            fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
+            return;
+          }
+        } else if (!(await clientExists(clientUserId, companyId))) {
+          fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${clientUserId}`);
           return;
         }
         const serviceId =
@@ -376,36 +465,79 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // Con la migración del lugar se guarda también DÓNDE es; sin ella, la
         // agenda se guarda igual (no se pierde la fecha ni la nota).
         let r: { insertId: number; affectedRows: number };
-        try {
-          r = await exec(
-            `INSERT INTO schedules
-               (id_purchased_package, id_service, event_date, description,
-                location, lat, lng, id_company)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-            [
-              purchasedPackageId,
-              serviceId,
-              eventDate,
-              description || null,
-              location || null,
-              lat,
-              lng,
-              companyId,
-            ]
-          );
-        } catch {
-          r = await exec(
-            `INSERT INTO schedules
-               (id_purchased_package, id_service, event_date, description, id_company)
-             VALUES (?, ?, ?, ?, ?)`,
-            [purchasedPackageId, serviceId, eventDate, description || null, companyId]
-          );
+        if (purchasedPackageId) {
+          try {
+            r = await exec(
+              `INSERT INTO schedules
+                 (id_purchased_package, id_service, event_date, description,
+                  location, lat, lng, id_company)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                purchasedPackageId,
+                serviceId,
+                eventDate,
+                description || null,
+                location || null,
+                lat,
+                lng,
+                companyId,
+              ]
+            );
+          } catch {
+            r = await exec(
+              `INSERT INTO schedules
+                 (id_purchased_package, id_service, event_date, description, id_company)
+               VALUES (?, ?, ?, ?, ?)`,
+              [purchasedPackageId, serviceId, eventDate, description || null, companyId]
+            );
+          }
+        } else {
+          // SOLO del cliente: `id_purchased_package` va en NULL y el cliente
+          // en `id_user` (migración 2026-10-22). Sin la migración no hay dónde
+          // ponerlo: se dice en vez de perder el evento.
+          try {
+            r = await exec(
+              `INSERT INTO schedules
+                 (id_purchased_package, id_user, id_service, event_date,
+                  description, location, lat, lng, id_company)
+               VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [
+                clientUserId,
+                serviceId,
+                eventDate,
+                description || null,
+                location || null,
+                lat,
+                lng,
+                companyId,
+              ]
+            );
+          } catch {
+            try {
+              r = await exec(
+                `INSERT INTO schedules
+                   (id_purchased_package, id_user, id_service, event_date,
+                    description, id_company)
+                 VALUES (NULL, ?, ?, ?, ?, ?)`,
+                [clientUserId, serviceId, eventDate, description || null, companyId]
+              );
+            } catch {
+              fail(
+                res,
+                400,
+                "Falta una migración en la base",
+                "Para agendar sin paquete aplica 2026-10-22_agendas_por_cliente.sql"
+              );
+              return;
+            }
+          }
         }
         // Numeradas 1..N en el orden en que se capturaron.
         await replaceScheduleLocations(r.insertId, companyId, locations);
         const item = {
           id: r.insertId,
-          purchasedPackageId,
+          purchasedPackageId: purchasedPackageId || null,
+          userId: clientUserId || null,
           serviceId,
           eventDate,
           description,

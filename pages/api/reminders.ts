@@ -7,6 +7,10 @@ import {
   listAdminNotifications,
   markAdminNotificationsRead,
 } from "../../lib/admin-notifications";
+import {
+  listUserNotifications,
+  markNotificationsRead,
+} from "../../lib/notifications";
 
 // ==================================================================
 // Avisos del usuario  ->  /api/reminders
@@ -22,6 +26,11 @@ import {
 //   * `source: "print"`  avisos del equipo: un cliente envió fotos a
 //                        impresión (solo los reciben admins y colaboradores
 //                        con permiso de Impresiones).
+//   * `source: "notification"` avisos del módulo Notificaciones.
+//   * `source: "package"` avisos del PAQUETE del cliente («Ya puedes elegir
+//                        tus fotos», «Servicio terminado»…): son los mismos
+//                        que muestra «Novedades» en Mi paquete, ahora también
+//                        en la campanita.
 //
 // Autogeneración perezosa: además del cron diario (que es quien genera
 // los avisos por defecto), este GET crea los avisos vencidos del día si
@@ -111,6 +120,29 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         });
       }
 
+      // Avisos del PAQUETE del cliente (los de «Novedades» en Mi paquete).
+      // Antes vivían solo ahí y la campanita no los enseñaba; ahora llegan al
+      // mismo listado y al tocar uno se abre Mi paquete.
+      const packageNotices = await listUserNotifications(session.sub, 20);
+      for (const n of packageNotices.items) {
+        items.push({
+          id: n.id,
+          scheduleId: null,
+          kind: n.kind,
+          title: n.title,
+          body: n.body,
+          // La campanita pinta la fecha con `eventDate`: aquí es el momento
+          // en que el estudio mandó el aviso.
+          eventDate: n.created,
+          isRead: n.isRead ? 1 : 0,
+          created: n.created,
+          source: "package",
+          target: "my_package",
+          packageId: n.purchasedPackageId,
+          serviceId: n.serviceId,
+        });
+      }
+
       // Más recientes primero (los dos orígenes ya vienen ordenados).
       items.sort((a, b) =>
         String(b.created ?? "").localeCompare(String(a.created ?? ""))
@@ -134,8 +166,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [session.sub]
         );
         await markAdminNotificationsRead(session.sub);
+        // También los avisos del paquete que ahora se listan aquí.
+        await markNotificationsRead(session.sub);
       } else if (id > 0) {
-        if (source === "print" || source === "notification") {
+        if (source === "package") {
+          await markNotificationsRead(session.sub, [id]);
+        } else if (source === "print" || source === "notification") {
           await markAdminNotificationsRead(session.sub, [id]);
         } else {
           await exec(
@@ -160,6 +196,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         (n) => !n.isRead
       );
       unread += printUnread.length;
+      unread += (await listUserNotifications(session.sub, 100)).unread;
       res.status(200).json({ ok: true, unread });
       return;
     }

@@ -153,17 +153,26 @@ export function busyAgenda(item: AgendaItem): AgendaItem {
 /**
  * Qué versión de [item] recibe quien consulta:
  *   * personal -> la agenda completa (`busy: false`);
- *   * cliente y es SUYA (paquete propio) -> completa;
+ *   * cliente y es SUYA (paquete propio, o agenda suelta a su nombre) ->
+ *     completa;
  *   * cliente y es de OTRO -> hueco ocupado, sin nombres ni detalles.
+ *
+ * [viewerId] es el usuario de la sesión: con él se reconocen las agendas que
+ * el estudio le agendó SIN paquete (solo el cliente, migración 2026-10-22).
  */
 export function agendaForViewer(
   item: AgendaItem,
   isClient: boolean,
-  ownPackageIds: Set<number> | null
+  ownPackageIds: Set<number> | null,
+  viewerId: number | null = null
 ): AgendaItem {
   if (!isClient) return { ...item, busy: false };
   const own = item.purchasedPackageId;
   if (own !== null && ownPackageIds?.has(Number(own))) {
+    return { ...item, busy: false };
+  }
+  // Agenda del CLIENTE sin paquete: es suya aunque no tenga paquetes.
+  if (item.userId !== null && viewerId !== null && Number(item.userId) === viewerId) {
     return { ...item, busy: false };
   }
   return busyAgenda(item);
