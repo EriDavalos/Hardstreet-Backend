@@ -11,7 +11,11 @@ import { q } from "../../../lib/db";
 //
 // Sin CORS a propósito (server-to-server) y con un secreto compartido: nunca
 // se exponen credenciales, solo nombres y URLs internas.
-// Requiere la migración 2026-10-23_drive_nodos.sql.
+//
+// `depends_on` (CSV de ids) dice de qué servidores depende cada uno: el hub
+// bloquea al dependiente cuando el otro no responde. La consulta tiene un
+// RESPALDO sin esa columna para que el hub siga funcionando aunque la
+// migración 2026-10-25_drive_nodos_dependencias.sql aún no esté aplicada.
 // ==================================================================
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -26,12 +30,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     return;
   }
   try {
-    const nodes = await q(
-      `SELECT id, name, url, priority
-         FROM drive_nodes
-        WHERE enabled = 1
-        ORDER BY priority ASC, id ASC`
-    );
+    let nodes;
+    try {
+      nodes = await q(
+        `SELECT id, name, url, priority, depends_on
+           FROM drive_nodes
+          WHERE enabled = 1
+          ORDER BY priority ASC, id ASC`
+      );
+    } catch {
+      // Base sin la migración de dependencias: se sirve la lista de siempre.
+      nodes = await q(
+        `SELECT id, name, url, priority
+           FROM drive_nodes
+          WHERE enabled = 1
+          ORDER BY priority ASC, id ASC`
+      );
+    }
     res.setHeader("Cache-Control", "no-store");
     res.status(200).json({ nodes });
   } catch (e) {

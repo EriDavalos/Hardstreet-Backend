@@ -148,17 +148,13 @@ export async function requirePermission(
  */
 export async function requireSuperAdmin(
   req: NextApiRequest,
-  res: NextApiResponse
+  res: NextApiResponse,
+  detail = "Esta sección administra las empresas del sistema"
 ): Promise<{ sub: number; role: string; roleId: number } | null> {
   const me = await authenticate(req, res);
   if (!me) return null;
   if (!(await userIsSuperAdmin(me.roleId))) {
-    fail(
-      res,
-      403,
-      "Solo el Superadministrador",
-      "Esta sección administra las empresas del sistema"
-    );
+    fail(res, 403, "Solo el Superadministrador", detail);
     return null;
   }
   return me;
