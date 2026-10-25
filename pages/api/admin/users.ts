@@ -12,7 +12,7 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
-import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
+import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-scope";
 
 // ==================================================================
 // CRUD de usuarios (solo rol Admin)  ->  /api/admin/users
@@ -70,7 +70,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   // Alcance por empresa: cada usuario pertenece a UNA empresa. El Superadmin
   // puede elegir con `X-Company-Id` o dejar que vea todas.
   const scope = await requestScope(req, me);
+  // `scopeSql` (alias `u`) es para las consultas con `FROM users u`; los
+  // UPDATE/DELETE de una sola tabla usan `scopeRow`, porque `u.id_company` ahí
+  // es un error de MySQL (500 al editar o borrar un usuario).
   const scopeSql = scopeFilterOn(scope, "u");
+  const scopeRow = scopeFilter(scope);
   const companyId = scope.writeCompanyId;
 
   // La CUENTA Superadmin es del sistema, no de una empresa: el Superadmin la
@@ -392,8 +396,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const r = await exec(
-          `UPDATE users SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
-          [...params, id, ...scopeSql.params]
+          `UPDATE users SET ${fields.join(", ")} WHERE id = ? AND ${scopeRow.sql}`,
+          [...params, id, ...scopeRow.params]
         );
         if (!r.affectedRows) {
           fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${id}`);
@@ -463,8 +467,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           }
         }
         const r = await exec(
-          `UPDATE users SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
-          [id, ...scopeSql.params]
+          `UPDATE users SET active = 0 WHERE id = ? AND ${scopeRow.sql}`,
+          [id, ...scopeRow.params]
         );
         if (!r.affectedRows) {
           fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${id}`);

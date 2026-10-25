@@ -5,7 +5,7 @@ import { q, exec } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
-import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
+import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-scope";
 import {
   agendaForViewer,
   clientPackageIds,
@@ -225,7 +225,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   // Alcance por empresa: las agendas de un estudio no se mezclan con otro.
   const scope = await requestScope(req, me);
+  // `scopeSql` lleva el alias `a` y sirve SOLO para el listado (que hace
+  // `FROM schedules a`). Los UPDATE/DELETE de una sola tabla no tienen alias:
+  // ahí va `scopeRow` (`id_company = ?`), porque `a.id_company` en un
+  // `UPDATE schedules` es un error de MySQL («Unknown column») y el panel
+  // recibía un 500 al editar o borrar la agenda.
   const scopeSql = scopeFilterOn(scope, "a");
+  const scopeRow = scopeFilter(scope);
   const companyId = scope.writeCompanyId;
 
   try {
@@ -570,8 +576,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const exists = await q(
-          `SELECT id FROM schedules WHERE id = ? AND active = 1 AND ${scopeSql.sql}`,
-          [id, ...scopeSql.params]
+          `SELECT id FROM schedules WHERE id = ? AND active = 1 AND ${scopeRow.sql}`,
+          [id, ...scopeRow.params]
         );
         if (!exists.length) {
           fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);
@@ -646,14 +652,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         try {
           await exec(
             `UPDATE schedules SET ${[...fields, ...extraFields].join(", ")}
-              WHERE id = ? AND ${scopeSql.sql}`,
-            [...params, ...extraParams, id, ...scopeSql.params]
+              WHERE id = ? AND ${scopeRow.sql}`,
+            [...params, ...extraParams, id, ...scopeRow.params]
           );
         } catch (e) {
           if (!fields.length) throw e;
           await exec(
-            `UPDATE schedules SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`,
-            [...params, id, ...scopeSql.params]
+            `UPDATE schedules SET ${fields.join(", ")} WHERE id = ? AND ${scopeRow.sql}`,
+            [...params, id, ...scopeRow.params]
           );
         }
         // La lista de ubicaciones se reescribe completa (1, 2, 3…).
@@ -692,8 +698,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const r = await exec(
-          `UPDATE schedules SET active = 0 WHERE id = ? AND ${scopeSql.sql}`,
-          [id, ...scopeSql.params]
+          `UPDATE schedules SET active = 0 WHERE id = ? AND ${scopeRow.sql}`,
+          [id, ...scopeRow.params]
         );
         if (!r.affectedRows) {
           fail(res, 404, "Agenda no encontrada", `No hay una agenda activa con id ${id}`);

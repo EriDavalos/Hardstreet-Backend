@@ -8,7 +8,7 @@ import { mapUser, UserRow } from "../../../lib/mappers";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
-import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
+import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-scope";
 
 // ==================================================================
 // Clientes (solo rol Admin)  ->  /api/admin/clients
@@ -70,7 +70,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   // Alcance por empresa: el directorio de clientes es de UNA empresa.
   const scope = await requestScope(req, me);
+  // `scopeSql` (alias `u`) es para las consultas con `FROM users u`; los
+  // UPDATE de una sola tabla usan `scopeRow`, porque `u.id_company` ahí es un
+  // error de MySQL (500 al editar o borrar un cliente).
   const scopeSql = scopeFilterOn(scope, "u");
+  const scopeRow = scopeFilter(scope);
   const companyId = scope.writeCompanyId;
 
   const roleId = await clientRoleId(companyId);
@@ -213,8 +217,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         // Solo clientes: evita editar admins desde este modulo
         const isClient = await q(
-          `SELECT id FROM users WHERE id = ? AND id_role = ? AND ${scopeSql.sql} AND active = 1`,
-          [id, roleId, ...scopeSql.params]
+          `SELECT id FROM users WHERE id = ? AND id_role = ? AND ${scopeRow.sql} AND active = 1`,
+          [id, roleId, ...scopeRow.params]
         );
         if (!isClient.length) {
           fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${id}`);
@@ -253,10 +257,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "Nada que actualizar", "No enviaste ningún campo del cliente");
           return;
         }
-        await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ? AND ${scopeSql.sql}`, [
+        await exec(`UPDATE users SET ${fields.join(", ")} WHERE id = ? AND ${scopeRow.sql}`, [
           ...params,
           id,
-          ...scopeSql.params,
+          ...scopeRow.params,
         ]);
         const item = await clientModel(id);
         await logActivity({
@@ -281,8 +285,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           return;
         }
         const r = await exec(
-          `UPDATE users SET active = 0 WHERE id = ? AND id_role = ? AND ${scopeSql.sql}`,
-          [id, roleId, ...scopeSql.params]
+          `UPDATE users SET active = 0 WHERE id = ? AND id_role = ? AND ${scopeRow.sql}`,
+          [id, roleId, ...scopeRow.params]
         );
         if (!r.affectedRows) {
           fail(res, 404, "Cliente no encontrado", `No hay un cliente activo con id ${id}`);
