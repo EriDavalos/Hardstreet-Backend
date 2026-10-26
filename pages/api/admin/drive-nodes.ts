@@ -147,8 +147,43 @@ const MIGRATION_HINT =
 const MIGRATION_MISSING =
   "Falta la columna de dependencias en la base de datos";
 
+type DbError = {
+  code?: string;
+  errno?: number;
+  sqlMessage?: string;
+  message?: string;
+};
+
+/**
+ * ¿El fallo es de ESQUEMA (falta la migración)?
+ *
+ * Solo entonces tiene sentido mandar al usuario a ejecutar el .sql. Antes el
+ * `catch` culpaba a la migración de CUALQUIER error (un tiempo de espera, una
+ * llave foránea, un privilegio…) y el panel repetía «ejecuta el .sql» aunque
+ * ya estuviera aplicado.
+ */
+function isSchemaError(e: unknown): boolean {
+  const code = String((e as DbError)?.code || "");
+  return (
+    code === "ER_BAD_FIELD_ERROR" ||
+    code === "ER_NO_SUCH_TABLE" ||
+    code === "ER_UNKNOWN_COLUMN"
+  );
+}
+
+/** El error REAL de la base, en corto (sin credenciales ni la consulta). */
+function dbDetail(e: unknown): string {
+  const db = (e || {}) as DbError;
+  const message = String(db.sqlMessage || db.message || e || "").trim();
+  const code = String(db.code || "").trim();
+  const text = code ? `${code}: ${message}` : message;
+  return text.slice(0, 240) || "La base de datos rechazó la operación";
+}
+
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const body = (req.body || {}) as Record<string, unknown>;
+  // Para que el aviso de error diga lo que de verdad se estaba haciendo.
+  const verb = req.method === "DELETE" ? "quitar" : "guardar";
 
   // La comprobación va PRIMERO para cualquier método: leer la lista también
   // revela direcciones internas de los servidores.
@@ -307,15 +342,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           "Los archivos de ese servidor dejarían de verse"
         );
       }
-      // Quien dependía de él se queda sin su dependencia: se limpia la columna
-      // para que no quede un id fantasma bloqueando el Drive para siempre.
-      if (hasDepends) {
-        await exec(
-          "UPDATE drive_nodes SET depends_on = TRIM(BOTH ',' FROM REPLACE(CONCAT(',', depends_on, ','), ?, ',')) WHERE depends_on <> ''",
-          [`,${id},`]
-        );
-      }
+      // Primero se quita el servidor: es lo que pidió el usuario y no puede
+      // depender de la limpieza de abajo.
       await exec("DELETE FROM drive_nodes WHERE id = ?", [id]);
+      // Quien dependía de él se queda sin su dependencia: se reescribe su
+      // lista (en JS, no con malabares de SQL sobre el CSV) para que no quede
+      // un id fantasma bloqueando el Drive para siempre. Es BEST-EFFORT: si
+      // esa fila ya no está o la columna no existe, el servidor igual se
+      // quitó — antes ese UPDATE tumbaba el borrado entero con un 500.
+      if (hasDepends) {
+        const dependents = nodes.filter(
+          (n) => n.id !== id && n.dependsOn.includes(id)
+        );
+        for (const dependent of dependents) {
+          try {
+            await exec("UPDATE drive_nodes SET depends_on = ? WHERE id = ?", [
+              dependsCsv(dependent.dependsOn.filter((x) => x !== id)),
+              dependent.id,
+            ]);
+          } catch (e) {
+            console.error(
+              "[admin/drive-nodes] no se pudo limpiar la dependencia",
+              dependent.id,
+              e
+            );
+          }
+        }
+      }
       await logActivity({
         userId: me.sub,
         module: "connection",
@@ -332,6 +385,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
   } catch (e) {
     console.error("[admin/drive-nodes]", e);
-    fail(res, 500, "Hubo un error", `No se pudo guardar el servidor. ${MIGRATION_HINT}`);
+    fail(
+      res,
+      500,
+      "Hubo un error",
+      // Solo se manda a ejecutar la migración cuando de verdad falta: si no,
+      // se enseña el error real de la base (código incluido) para poder
+      // arreglarlo sin adivinar.
+      `No se pudo ${verb} el servidor. ${
+        isSchemaError(e) ? MIGRATION_HINT : dbDetail(e)
+      }`
+    );
   }
 });
