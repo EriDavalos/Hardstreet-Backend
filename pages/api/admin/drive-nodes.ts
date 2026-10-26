@@ -10,7 +10,7 @@ import { logActivity } from "../../../lib/activity";
 //   GET    { nodes: [...] }          lista todos (encendidos y apagados)
 //   POST   { name, url, priority?, notes?, dependsOn? }   crea
 //   PUT    { id, name?, url?, enabled?, priority?, notes?, dependsOn? }  edita
-//   DELETE { id }                    quita
+//   DELETE { id }                    DESACTIVA (estado 0, no borra la fila)
 //
 // La tabla `drive_nodes` es la lista que usa el HUB para repartir carpetas y
 // subidas. Con una sola fila todo funciona como siempre.
@@ -183,7 +183,7 @@ function dbDetail(e: unknown): string {
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const body = (req.body || {}) as Record<string, unknown>;
   // Para que el aviso de error diga lo que de verdad se estaba haciendo.
-  const verb = req.method === "DELETE" ? "quitar" : "guardar";
+  const verb = req.method === "DELETE" ? "desactivar" : "guardar";
 
   // La comprobación va PRIMERO para cualquier método: leer la lista también
   // revela direcciones internas de los servidores.
@@ -328,58 +328,51 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return ok(res, "Servidor actualizado", { node: row });
     }
 
-    // ---------------- QUITAR ----------------
+    // ---------------- DESACTIVAR (estado 0) ----------------
+    //
+    // Antes esto BORRABA la fila. No es lo que se quiere: quitar un servidor
+    // del Drive es DEJARLO EN ESTADO 0 (`enabled = 0`), como apagarlo. La fila
+    // se queda con su nombre, dirección, prioridad, notas y dependencias, así
+    // que volver a encenderlo es un clic y no hay que registrarlo de nuevo.
+    //
+    // Efectos (los aplica el hub, no el panel): sus carpetas dejan de verse en
+    // el Drive, no se le guardan archivos nuevos y quien dependa de él queda
+    // en mantenimiento. El SERVICIO del servidor no se toca: sigue corriendo.
     if (req.method === "DELETE") {
       const id = asInt(body.id, 0);
-      if (!id) return fail(res, 400, "Falta el servidor a quitar");
+      if (!id) return fail(res, 400, "Falta el servidor a desactivar");
       const row = nodes.find((n) => n.id === id);
       if (!row) return fail(res, 404, "Ese servidor ya no existe");
+      // Ya estaba en 0: no es un error, simplemente no hay nada que hacer.
+      if (Number(row.enabled) !== 1) {
+        return ok(res, "Ese servidor ya estaba desactivado", {
+          id,
+          enabled: 0,
+          node: row,
+        });
+      }
+      // Nunca dejar el Drive sin ningún servidor encendido.
       if (nodes.filter((n) => n.id !== id && Number(n.enabled) === 1).length === 0) {
         return fail(
           res,
           409,
-          "Tiene que quedar al menos un servidor",
-          "Los archivos de ese servidor dejarían de verse"
+          "Tiene que quedar al menos un servidor encendido",
+          "Enciende otro antes de desactivar este: si no, el Drive se queda sin nada que mostrar"
         );
       }
-      // Primero se quita el servidor: es lo que pidió el usuario y no puede
-      // depender de la limpieza de abajo.
-      await exec("DELETE FROM drive_nodes WHERE id = ?", [id]);
-      // Quien dependía de él se queda sin su dependencia: se reescribe su
-      // lista (en JS, no con malabares de SQL sobre el CSV) para que no quede
-      // un id fantasma bloqueando el Drive para siempre. Es BEST-EFFORT: si
-      // esa fila ya no está o la columna no existe, el servidor igual se
-      // quitó — antes ese UPDATE tumbaba el borrado entero con un 500.
-      if (hasDepends) {
-        const dependents = nodes.filter(
-          (n) => n.id !== id && n.dependsOn.includes(id)
-        );
-        for (const dependent of dependents) {
-          try {
-            await exec("UPDATE drive_nodes SET depends_on = ? WHERE id = ?", [
-              dependsCsv(dependent.dependsOn.filter((x) => x !== id)),
-              dependent.id,
-            ]);
-          } catch (e) {
-            console.error(
-              "[admin/drive-nodes] no se pudo limpiar la dependencia",
-              dependent.id,
-              e
-            );
-          }
-        }
-      }
+      await exec("UPDATE drive_nodes SET enabled = 0 WHERE id = ?", [id]);
+      const updated = (await listNodes()).find((n) => n.id === id) || null;
       await logActivity({
         userId: me.sub,
         module: "connection",
         moduleName: "Conexión",
-        action: "delete",
+        action: "update",
         entity: "servidor del Drive",
-        description: `Servidor del Drive quitado: ${row.name}`,
-        details: { url: row.url },
+        description: `Servidor del Drive desactivado (estado 0): ${row.name}`,
+        details: { id, url: row.url, enabled: false },
         req,
       });
-      return ok(res, "Servidor quitado", { id });
+      return ok(res, "Servidor desactivado", { id, enabled: 0, node: updated });
     }
 
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
