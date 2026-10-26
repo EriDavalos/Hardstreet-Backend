@@ -13,9 +13,13 @@ import { q } from "../../../lib/db";
 // se exponen credenciales, solo nombres y URLs internas.
 //
 // `depends_on` (CSV de ids) dice de qué servidores depende cada uno: el hub
-// bloquea al dependiente cuando el otro no responde. La consulta tiene un
-// RESPALDO sin esa columna para que el hub siga funcionando aunque la
-// migración 2026-10-25_drive_nodos_dependencias.sql aún no esté aplicada.
+// bloquea al dependiente cuando el otro no responde (o está apagado). La
+// consulta tiene un RESPALDO sin esa columna para que el hub siga funcionando
+// aunque la migración 2026-10-25_drive_nodos_dependencias.sql no esté aplicada.
+//
+// `notes` viaja también: es la DESCRIPCIÓN que el panel enseña en la card de
+// cada servidor. Sin ella el hub la reenviaba vacía y, con el hub conectado,
+// la descripción desaparecía de la pantalla.
 // ==================================================================
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
@@ -33,7 +37,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     let nodes;
     try {
       nodes = await q(
-        `SELECT id, name, url, priority, depends_on
+        `SELECT id, name, url, priority, notes, depends_on
            FROM drive_nodes
           WHERE enabled = 1
           ORDER BY priority ASC, id ASC`
@@ -41,7 +45,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     } catch {
       // Base sin la migración de dependencias: se sirve la lista de siempre.
       nodes = await q(
-        `SELECT id, name, url, priority
+        `SELECT id, name, url, priority, notes
            FROM drive_nodes
           WHERE enabled = 1
           ORDER BY priority ASC, id ASC`
