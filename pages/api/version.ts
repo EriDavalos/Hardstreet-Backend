@@ -11,11 +11,19 @@ import { withCors } from "../../lib/cors";
 //   DRIVE_BASE
 // ==================================================================
 
-// El APK de actualización vive en Hardstreet-Backend-Drive/downloads
-// (ese proyecto se sube al servidor y lo publica en /downloads/<archivo>).
-// Por defecto se apunta ahí; DOWNLOAD_APK permite sobreescribirlo.
+// El APK de actualización vive en la carpeta `downloads/` de un servidor del
+// Drive, y lo publica el HUB en `/downloads/<archivo>`: él busca el nodo que
+// tenga el release (aunque no sea el principal) y lo reenvía.
+//
+// Por eso el enlace apunta al HUB y no al nodo de archivos (`:4000`): la app
+// solo tiene que poder llegar al hub, y el día que el APK esté en otro
+// servidor el enlace sigue sirviendo sin tocar nada. Se puede sobreescribir
+// con `RELEASES_BASE` (o el viejo `DRIVE_BASE`) y, archivo por archivo, con
+// `DOWNLOAD_APK` / `DOWNLOAD_WIN`.
 const DRIVE_BASE = (
-  process.env.DRIVE_BASE || "http://oriongo.ddns.net:4000"
+  process.env.RELEASES_BASE ||
+  process.env.DRIVE_BASE ||
+  "https://oriongo.ddns.net"
 ).replace(/\/+$/, "");
 
 const APP_RELEASE = {

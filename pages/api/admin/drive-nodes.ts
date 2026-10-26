@@ -7,10 +7,19 @@ import { logActivity } from "../../../lib/activity";
 
 // ==================================================================
 // SERVIDORES DEL DRIVE (Drive federado) -> /api/admin/drive-nodes
-//   GET    { nodes: [...] }          lista todos (encendidos y apagados)
+//   GET    { nodes: [...] }          lista los VIVOS (active = 1)
 //   POST   { name, url, priority?, notes?, dependsOn? }   crea
 //   PUT    { id, name?, url?, enabled?, priority?, notes?, dependsOn? }  edita
-//   DELETE { id }                    DESACTIVA (estado 0, no borra la fila)
+//   DELETE { id }                    ELIMINA (borrado lógico: active = 0)
+//
+// DOS CAMPOS DISTINTOS, a propósito:
+//   · `active`  = 1 vivo / 0 ELIMINADO. Un active = 0 no se sirve: para el
+//     panel y el hub ese servidor ya no existe (la fila se conserva).
+//   · `enabled` = 1 encendido / 0 APAGADO. Sigue en la lista (el panel lo
+//     enseña apagado) pero el hub no lo usa, y quien dependa de él queda en
+//     mantenimiento con su aviso en el Drive.
+// Antes `enabled` hacía las dos cosas y un servidor apagado desaparecía, así
+// que no había forma de avisar de los dependientes.
 //
 // La tabla `drive_nodes` es la lista que usa el HUB para repartir carpetas y
 // subidas. Con una sola fila todo funciona como siempre.
@@ -30,6 +39,7 @@ type NodeRow = {
   name: string;
   url: string;
   enabled: number;
+  active: number;
   priority: number;
   notes: string | null;
   depends_on: string | null;
@@ -78,30 +88,50 @@ const dependsCsv = (ids: number[]) => ids.join(",");
 /** ¿La tabla ya tiene la columna `depends_on`? (migración aplicada). */
 let hasDepends = true;
 
+/** ¿La tabla ya tiene la columna `active`? (migración 2026-10-26). */
+let hasActive = true;
+
 async function listNodes(): Promise<NodeOut[]> {
-  let rows: NodeRow[];
+  const base = "SELECT id, name, url, enabled, priority, notes";
+  // 1) Esquema completo (dependencias + borrado lógico).
   try {
-    rows = await q<NodeRow>(
-      `SELECT id, name, url, enabled, priority, notes, depends_on
+    const rows = await q<NodeRow>(
+      `${base}, active, depends_on
          FROM drive_nodes
         ORDER BY priority ASC, id ASC`
     );
     hasDepends = true;
+    hasActive = true;
+    return rows.map(({ depends_on, ...rest }) => ({
+      ...rest,
+      dependsOn: parseDepends(depends_on),
+    }));
   } catch {
-    // Base sin la migración: la pantalla sigue funcionando (sin dependencias)
-    // en vez de quedarse vacía justo cuando se despliega el backend.
-    hasDepends = false;
-    const plain = await q<Omit<NodeRow, "depends_on">>(
-      `SELECT id, name, url, enabled, priority, notes
+    // Se sigue abajo.
+  }
+  // 2) Sin dependencias (pero con borrado lógico).
+  try {
+    const rows = await q<NodeRow & { depends_on?: string }>(
+      `${base}, active
          FROM drive_nodes
         ORDER BY priority ASC, id ASC`
     );
-    rows = plain.map((r) => ({ ...r, depends_on: "" }));
+    hasDepends = false;
+    hasActive = true;
+    return rows.map((r) => ({ ...r, depends_on: "", dependsOn: [] }));
+  } catch {
+    // Se sigue abajo.
   }
-  return rows.map(({ depends_on, ...rest }) => ({
-    ...rest,
-    dependsOn: hasDepends ? parseDepends(depends_on) : [],
-  }));
+  // 3) Base sin `active` (migración pendiente): todo lo que hay está vivo.
+  //    No se rompe la pantalla justo cuando se despliega el backend.
+  hasDepends = false;
+  hasActive = false;
+  const plain = await q<Omit<NodeRow, "depends_on" | "active">>(
+    `${base}
+       FROM drive_nodes
+      ORDER BY priority ASC, id ASC`
+  );
+  return plain.map((r) => ({ ...r, active: 1, depends_on: "", dependsOn: [] }));
 }
 
 /**
@@ -146,6 +176,12 @@ const MIGRATION_HINT =
 
 const MIGRATION_MISSING =
   "Falta la columna de dependencias en la base de datos";
+
+const MIGRATION_HINT_ACTIVE =
+  "Ejecuta Hardstreet-DB/2026-10-26_drive_nodos_active.sql en la base del panel y vuelve a intentar";
+
+const MIGRATION_MISSING_ACTIVE =
+  "Falta la columna de borrado lógico (`active`) en la base de datos";
 
 type DbError = {
   code?: string;
@@ -197,7 +233,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     // ---------------- LEER ----------------
     if (req.method === "GET") {
-      const nodes = await listNodes();
+      // BORRADO LÓGICO: un `active = 0` no se sirve. La fila sigue en la base
+      // (para no perder el historial), pero para el panel ese servidor ya no
+      // existe: no se pinta, no se cuenta y no se ofrece como dependencia.
+      // Filtrar aquí —y no en la app— evita que se cuele por cualquier otra
+      // pantalla que lea la lista. Los APAGADOS (enabled = 0) sí se sirven:
+      // tienen que verse para poder encenderlos y para que el hub avise de
+      // los servidores que dependen de ellos.
+      const nodes = (await listNodes()).filter(
+        (n) => Number(n.active) === 1
+      );
       const missingIds = nodes.flatMap((n) =>
         n.dependsOn.filter((id) => !nodes.some((other) => other.id === id))
       );
@@ -210,7 +255,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
-    const nodes = await listNodes();
+    // `all` incluye las filas eliminadas (para poder restaurarlas por API y
+    // para no perder su historial); `nodes` es lo que existe para el panel.
+    const all = await listNodes();
+    const nodes = all.filter((n) => Number(n.active) === 1);
 
     // ---------------- CREAR / EDITAR ----------------
     if (req.method === "POST" || req.method === "PUT" || req.method === "PATCH") {
@@ -224,23 +272,37 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (nodes.length >= MAX_NODES) {
           return fail(res, 400, "Demasiados servidores", `El máximo es ${MAX_NODES}`);
         }
-        const repeated = await q<NodeRow>("SELECT id FROM drive_nodes WHERE url = ? LIMIT 1", [url]);
-        if (repeated.length) return fail(res, 409, "Ese servidor ya está registrado");
+        // Solo cuenta lo VIVO: la dirección de un servidor eliminado se puede
+        // volver a registrar sin tocar la base a mano.
+        if (nodes.some((n) => n.url === url)) {
+          return fail(res, 409, "Ese servidor ya está registrado");
+        }
         const depends = cleanDepends(body, 0, nodes);
         if (depends.kind === "invalid") return fail(res, 400, depends.reason);
         const ids = depends.kind === "ok" ? depends.ids : [];
         if (ids.length && !hasDepends) {
           return fail(res, 400, MIGRATION_MISSING, MIGRATION_HINT);
         }
-        const ins = hasDepends
-          ? await exec(
-              "INSERT INTO drive_nodes (name, url, enabled, priority, notes, depends_on) VALUES (?, ?, 1, ?, ?, ?)",
-              [name, url, priority, String(body.notes || "").slice(0, 255), dependsCsv(ids)]
-            )
-          : await exec(
-              "INSERT INTO drive_nodes (name, url, enabled, priority, notes) VALUES (?, ?, 1, ?, ?)",
-              [name, url, priority, String(body.notes || "").slice(0, 255)]
-            );
+        // Columnas según las migraciones aplicadas: en una base vieja la
+        // pantalla sigue funcionando (sin `active` ni dependencias).
+        const cols = ["name", "url", "enabled"];
+        const values: unknown[] = [name, url, 1];
+        if (hasActive) {
+          cols.push("active");
+          values.push(1);
+        }
+        cols.push("priority", "notes");
+        values.push(priority, String(body.notes || "").slice(0, 255));
+        if (hasDepends) {
+          cols.push("depends_on");
+          values.push(dependsCsv(ids));
+        }
+        const ins = await exec(
+          `INSERT INTO drive_nodes (${cols.join(", ")}) VALUES (${cols
+            .map(() => "?")
+            .join(", ")})`,
+          values
+        );
         const row = (await listNodes()).find((n) => n.id === ins.insertId) || null;
         await logActivity({
           userId: me.sub,
@@ -258,7 +320,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // PUT/PATCH: editar campos sueltos.
       const id = asInt(body.id, 0);
       if (!id) return fail(res, 400, "Falta el servidor a editar");
-      const current = nodes.find((n) => n.id === id);
+      // Se busca en TODAS las filas: una eliminada se puede volver a activar
+      // con `PUT { id, active: true }` (restaurar) sin tocarla a mano en la base.
+      const current = all.find((n) => n.id === id);
       if (!current) return fail(res, 404, "Ese servidor ya no existe");
 
       const fields: string[] = [];
@@ -278,11 +342,18 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fields.push("url = ?");
         params.push(url);
       }
+      // ENCENDIDO / APAGADO (enabled): el servidor sigue en la lista, pero el
+      // hub deja de usarlo y sus dependientes quedan en mantenimiento.
       if (body.enabled !== undefined) {
         const enabled = body.enabled === true || body.enabled === 1 || body.enabled === "1";
-        // Nunca dejar el Drive sin ningún servidor encendido.
+        // Nunca dejar el Drive sin ningún servidor VIVO y encendido.
         if (!enabled) {
-          const remaining = nodes.filter((n) => n.id !== id && Number(n.enabled) === 1);
+          const remaining = nodes.filter(
+            (n) =>
+              n.id !== id &&
+              Number(n.active) === 1 &&
+              Number(n.enabled) === 1
+          );
           if (!remaining.length) {
             return fail(
               res,
@@ -294,6 +365,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
         fields.push("enabled = ?");
         params.push(enabled ? 1 : 0);
+      }
+      // BORRADO LÓGICO (active): el servidor deja de existir para el panel y
+      // para el hub. La fila se conserva con sus datos.
+      if (body.active !== undefined) {
+        if (!hasActive) {
+          return fail(res, 400, MIGRATION_MISSING_ACTIVE, MIGRATION_HINT_ACTIVE);
+        }
+        const active =
+          body.active === true || body.active === 1 || body.active === "1";
+        if (!active) {
+          const remaining = nodes.filter(
+            (n) =>
+              n.id !== id &&
+              Number(n.active) === 1 &&
+              Number(n.enabled) === 1
+          );
+          if (!remaining.length) {
+            return fail(
+              res,
+              409,
+              "Tiene que quedar al menos un servidor encendido",
+              "Enciende o agrega otro antes de eliminar este"
+            );
+          }
+        }
+        fields.push("active = ?");
+        params.push(active ? 1 : 0);
       }
       if (body.priority !== undefined) {
         fields.push("priority = ?");
@@ -328,51 +426,59 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return ok(res, "Servidor actualizado", { node: row });
     }
 
-    // ---------------- DESACTIVAR (estado 0) ----------------
+    // ---------------- ELIMINAR (borrado lógico: active = 0) ----------------
     //
-    // Antes esto BORRABA la fila. No es lo que se quiere: quitar un servidor
-    // del Drive es DEJARLO EN ESTADO 0 (`enabled = 0`), como apagarlo. La fila
-    // se queda con su nombre, dirección, prioridad, notas y dependencias, así
-    // que volver a encenderlo es un clic y no hay que registrarlo de nuevo.
+    // Quitar un servidor NO borra la fila: se marca `active = 0` y desaparece
+    // del panel y del hub (sus dependientes ya no lo ven como disponible).
+    // La fila conserva nombre, dirección, prioridad, notas y dependencias.
     //
-    // Efectos (los aplica el hub, no el panel): sus carpetas dejan de verse en
-    // el Drive, no se le guardan archivos nuevos y quien dependa de él queda
-    // en mantenimiento. El SERVICIO del servidor no se toca: sigue corriendo.
+    // Ojo: esto es DISTINTO de apagarlo (`enabled = 0`), que sí se hace desde
+    // el panel con «Apagar en el Drive» y deja el servidor a la vista, con sus
+    // dependientes en mantenimiento y el aviso en el Drive.
     if (req.method === "DELETE") {
       const id = asInt(body.id, 0);
-      if (!id) return fail(res, 400, "Falta el servidor a desactivar");
-      const row = nodes.find((n) => n.id === id);
+      if (!id) return fail(res, 400, "Falta el servidor a eliminar");
+      const row = all.find((n) => n.id === id);
       if (!row) return fail(res, 404, "Ese servidor ya no existe");
-      // Ya estaba en 0: no es un error, simplemente no hay nada que hacer.
-      if (Number(row.enabled) !== 1) {
-        return ok(res, "Ese servidor ya estaba desactivado", {
+      if (Number(row.active) !== 1) {
+        return ok(res, "Ese servidor ya estaba eliminado", {
           id,
-          enabled: 0,
+          active: 0,
           node: row,
         });
       }
-      // Nunca dejar el Drive sin ningún servidor encendido.
-      if (nodes.filter((n) => n.id !== id && Number(n.enabled) === 1).length === 0) {
+      // Nunca dejar el Drive sin ningún servidor vivo y encendido.
+      const alive = nodes.filter(
+        (n) => n.id !== id && Number(n.active) === 1 && Number(n.enabled) === 1
+      );
+      if (!alive.length) {
         return fail(
           res,
           409,
           "Tiene que quedar al menos un servidor encendido",
-          "Enciende otro antes de desactivar este: si no, el Drive se queda sin nada que mostrar"
+          "Enciende o agrega otro antes de eliminar este: si no, el Drive se queda sin nada que mostrar"
         );
       }
-      await exec("UPDATE drive_nodes SET enabled = 0 WHERE id = ?", [id]);
+      if (!hasActive) {
+        return fail(res, 400, MIGRATION_MISSING_ACTIVE, MIGRATION_HINT_ACTIVE);
+      }
+      await exec("UPDATE drive_nodes SET active = 0 WHERE id = ?", [id]);
       const updated = (await listNodes()).find((n) => n.id === id) || null;
       await logActivity({
         userId: me.sub,
         module: "connection",
         moduleName: "Conexión",
-        action: "update",
+        action: "delete",
         entity: "servidor del Drive",
-        description: `Servidor del Drive desactivado (estado 0): ${row.name}`,
-        details: { id, url: row.url, enabled: false },
+        description: `Servidor del Drive eliminado (borrado lógico): ${row.name}`,
+        details: { id, url: row.url, active: false },
         req,
       });
-      return ok(res, "Servidor desactivado", { id, enabled: 0, node: updated });
+      return ok(res, "Servidor eliminado del panel", {
+        id,
+        active: 0,
+        node: updated,
+      });
     }
 
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
