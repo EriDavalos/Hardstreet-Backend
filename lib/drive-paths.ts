@@ -1,9 +1,10 @@
 // ==================================================================
 // HARD STREET BACKEND - Carpetas del Drive compartidas
 // ==================================================================
-// El estudio le comparte a cada cliente las carpetas del Drive que quiera,
-// por paquete comprado. El origen de verdad es la tabla
-// `purchased_packages_drive`; la columna vieja
+// El estudio le comparte a cada cliente las carpetas del Drive que quiera.
+// El origen de verdad es la tabla `users_drive` (antes
+// `purchased_packages_drive`: el Drive se le comparte AL CLIENTE, el paquete
+// solo dice desde cuál aparece); la columna vieja
 // `purchased_packages.drive_path` se conserva SINCRONIZADA con la primera
 // carpeta, así los clientes que todavía la lean no se quedan sin datos.
 //
@@ -13,6 +14,13 @@
 //     mientras ese paquete esté activo y solo desde él.
 //   * con `id_user` y SIN paquete -> carpeta de LA PERSONA. La ve en todos
 //     sus paquetes (se administra en el módulo Usuarios).
+//
+// `drive_path` es SOLO un respaldo para paquetes anteriores a la migración
+// (los que nunca tuvieron filas en `users_drive`). En cuanto un paquete tiene
+// filas ahí, manda la tabla: si todas están en `active = 0` es porque se dejó
+// de compartir, y el respaldo NO debe resucitar la carpeta (eso hacía que una
+// carpeta ya quitada siguiera apareciendo como "compartida" y bloqueara
+// compartir otra que se solapaba con ella).
 //
 // Las filas viejas, que nacieron al compartir la carpeta de un paquete CON el
 // cliente, traen las dos columnas. Se tratan como carpeta DEL PAQUETE (es lo
@@ -109,6 +117,46 @@ export function drivePathsOverlap(a: string, b: string): boolean {
   return x.startsWith(`${y}/`) || y.startsWith(`${x}/`);
 }
 
+/**
+ * Explica en palabras la relación entre una carpeta YA compartida y la que se
+ * quiere compartir (se solapan). Sirve para que el aviso diga qué pasa de
+ * verdad: misma carpeta, una contiene a la otra o está dentro de ella.
+ */
+export function overlapReason(shared: string, target: string): string {
+  const a = normalizeDrivePath(shared);
+  const b = normalizeDrivePath(target);
+  if (!a) return `«${b}» se solapa con una carpeta ya compartida`;
+  if (a === b) return `«${a}» ya está compartida`;
+  if (b.startsWith(`${a}/`)) {
+    return `«${a}» ya está compartida y CONTIENE a «${b}»`;
+  }
+  if (a.startsWith(`${b}/`)) {
+    return `«${a}» ya está compartida y está DENTRO de «${b}»`;
+  }
+  return `«${a}» ya está compartida y se solapa con «${b}»`;
+}
+
+/**
+ * Nombre REAL de la tabla de carpetas compartidas.
+ *
+ * Desde la migración 2026-10-27 se llama `users_drive`; si el backend arrancó
+ * antes de aplicarla (o la base todavía no la tiene) se sigue usando
+ * `purchased_packages_drive`, para no dejar el Drive de los clientes vacío
+ * por un rename pendiente. Se resuelve una vez y se recuerda; mientras no
+ * exista `users_drive` se vuelve a comprobar (se autocorrige al aplicarla).
+ */
+let driveTableName: string | null = null;
+export async function driveTable(): Promise<string> {
+  if (driveTableName) return driveTableName;
+  try {
+    await q("SELECT 1 FROM users_drive LIMIT 1");
+    driveTableName = "users_drive";
+    return driveTableName;
+  } catch {
+    return "purchased_packages_drive";
+  }
+}
+
 /** Acumula una carpeta normalizada sin repetirla. */
 function pushPath(out: string[], raw: unknown): void {
   const p = normalizeDrivePath(raw);
@@ -118,28 +166,33 @@ function pushPath(out: string[], raw: unknown): void {
 /**
  * Carpetas compartidas de UN paquete comprado (en su orden de alta).
  *
- * Lee la tabla nueva; si el paquete todavía no tiene filas ahí (migración sin
- * aplicar o carpeta guardada con la columna vieja) cae a `drive_path`.
+ * Lee la tabla `users_drive`; cae a la columna vieja `drive_path` SOLO si el
+ * paquete nunca tuvo filas ahí (datos anteriores a la migración), no cuando
+ * las que tiene están en `active = 0` (eso es "se dejó de compartir").
  * Nunca lanza: sin migración devuelve lo que se pueda.
  */
 export async function packageDrivePaths(
   purchasedPackageId: number
 ): Promise<string[]> {
   const out: string[] = [];
+  let hasRows = false;
   try {
     // Todas las filas atadas al paquete cuentan como SUYAS, incluida la fila
-    // vieja que además trae `id_user` (ver la cabecera del archivo).
-    const rows = await q<{ path: string }>(
-      `SELECT path FROM purchased_packages_drive
-        WHERE id_purchased_package = ? AND active = 1
+    // vieja que además trae `id_user` (ver la cabecera del archivo). Se traen
+    // también las inactivas: sirven para saber si la tabla ya es la fuente.
+    const rows = await q<{ path: string; active: number }>(
+      `SELECT path, active FROM ${await driveTable()}
+        WHERE id_purchased_package = ?
         ORDER BY id ASC`,
       [purchasedPackageId]
     );
-    for (const r of rows) pushPath(out, r.path);
-    if (out.length) return out;
+    hasRows = rows.length > 0;
+    for (const r of rows) if (Number(r.active) === 1) pushPath(out, r.path);
   } catch {
     // Tabla pendiente de migración: se usa la columna vieja.
+    hasRows = false;
   }
+  if (hasRows) return out;
   try {
     const rows = await q<{ drive_path: string }>(
       `SELECT drive_path FROM purchased_packages WHERE id = ? AND active = 1`,
@@ -161,26 +214,35 @@ export async function packageDrivePathsByIds(
   for (const id of ids) map.set(id, []);
   if (!ids.length) return map;
 
-  // Carpetas de la tabla nueva (solo las DEL PAQUETE: las del cliente se
-  // piden aparte con [userDrivePathsByIds]). Las filas viejas con `id_user`
-  // también son del paquete: ver la cabecera del archivo.
+  // Carpetas de la tabla (solo las DEL PAQUETE: las del cliente se piden
+  // aparte con [userDrivePathsByIds]). Las filas viejas con `id_user` también
+  // son del paquete: ver la cabecera del archivo. Se traen también las
+  // inactivas para distinguir "se dejó de compartir" de "nunca hubo filas".
+  const withRows = new Set<number>();
   try {
-    const rows = await q<{ id_purchased_package: number; path: string }>(
-      `SELECT id_purchased_package, path FROM purchased_packages_drive
-        WHERE active = 1 AND id_purchased_package IN (?)
+    const rows = await q<{
+      id_purchased_package: number;
+      path: string;
+      active: number;
+    }>(
+      `SELECT id_purchased_package, path, active FROM ${await driveTable()}
+        WHERE id_purchased_package IN (?)
         ORDER BY id ASC`,
       [ids]
     );
     for (const r of rows) {
-      pushPath(map.get(Number(r.id_purchased_package)) ?? [], r.path);
+      const id = Number(r.id_purchased_package);
+      withRows.add(id);
+      if (Number(r.active) === 1) pushPath(map.get(id) ?? [], r.path);
     }
   } catch {
     // Tabla pendiente de migración.
   }
 
-  // Paquetes SIN filas en la tabla nueva: se toma la columna vieja (así las
-  // carpetas compartidas antes de la migración no desaparecen).
-  const missing = ids.filter((id) => (map.get(id) ?? []).length === 0);
+  // Paquetes que NUNCA tuvieron filas en la tabla: se toma la columna vieja
+  // (así las carpetas compartidas antes de la migración no desaparecen). Un
+  // paquete con filas inactivas NO entra aquí: se le quitó la carpeta.
+  const missing = ids.filter((id) => !withRows.has(id));
   if (missing.length) {
     try {
       const rows = await q<{ id: number; drive_path: string }>(
@@ -242,7 +304,7 @@ export async function userDrivePaths(userId: number): Promise<string[]> {
   if (!userId) return out;
   try {
     const rows = await q<{ path: string }>(
-      `SELECT path FROM purchased_packages_drive
+      `SELECT path FROM ${await driveTable()}
         WHERE id_user = ? AND active = 1
           AND id_purchased_package IS NULL
         ORDER BY id ASC`,
@@ -265,7 +327,7 @@ export async function userDrivePathsByIds(
   if (!ids.length) return map;
   try {
     const rows = await q<{ id_user: number; path: string }>(
-      `SELECT id_user, path FROM purchased_packages_drive
+      `SELECT id_user, path FROM ${await driveTable()}
         WHERE active = 1 AND id_user IN (?)
           AND id_purchased_package IS NULL
         ORDER BY id ASC`,

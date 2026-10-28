@@ -4,9 +4,10 @@
 // Un usuario comparte UNA carpeta de SU Drive con OTROS usuarios (uno o
 // varios). Es independiente del Drive de los paquetes:
 //
-//   purchased_packages_drive  -> el estudio comparte al CLIENTE de un paquete
-//   user_drive_shares         -> cualquier usuario comparte SU carpeta
-//                                (colaborador <-> colaborador, etc.)
+//   users_drive         -> el estudio comparte al CLIENTE (desde uno de sus
+//                          paquetes, o directo a su usuario)
+//   user_drive_shares   -> cualquier usuario comparte SU carpeta
+//                          (colaborador <-> colaborador, etc.)
 //
 // Reglas que se aplican aquí (y que el panel replica antes de ofrecer algo):
 //   * nadie se comparte a sí mismo;

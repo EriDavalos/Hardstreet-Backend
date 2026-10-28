@@ -6,7 +6,9 @@ import { logActivity } from "../../../lib/activity";
 import { q, exec } from "../../../lib/db";
 import {
   drivePathsOverlap,
+  driveTable,
   normalizeDrivePath,
+  overlapReason,
   userDrivePaths,
 } from "../../../lib/drive-paths";
 
@@ -24,9 +26,9 @@ import {
 //   DELETE  ?userId=N&path=<ruta>
 //           Deja de compartir esa carpeta con el usuario.
 //
-// Las carpetas viven en `purchased_packages_drive` con `id_user` (la misma
-// tabla que lee /api/my/drive), así que el Drive del cliente no cambia de
-// fuente: solo se administran desde el módulo Usuarios.
+// Las carpetas viven en `users_drive` con `id_user` (la misma tabla que lee
+// /api/my/drive), así que el Drive del cliente no cambia de fuente: solo se
+// administran desde el módulo Usuarios.
 // Permiso: módulo "users" (ver para GET, editar para el resto).
 // ==================================================================
 
@@ -98,15 +100,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             res,
             409,
             "Esa carpeta ya está compartida",
-            `«${other}» ya se comparte con el usuario (o contiene a «${path}»). ` +
-              `Comparte solo una de las dos.`
+            `${overlapReason(other, path)}. Comparte solo una de las dos.`
           );
           return;
         }
       }
       try {
         await exec(
-          `INSERT INTO purchased_packages_drive (id_user, path) VALUES (?, ?)`,
+          `INSERT INTO ${await driveTable()} (id_user, path) VALUES (?, ?)`,
           [userId, path]
         );
       } catch {
@@ -144,7 +145,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
     const r = await exec(
-      `UPDATE purchased_packages_drive
+      `UPDATE ${await driveTable()}
           SET active = 0
         WHERE id_user = ? AND path = ? AND active = 1`,
       [userId, path]

@@ -27,7 +27,7 @@ import { sharesByTarget } from "../../../lib/user-shares";
 // `paths`; el Drive del cliente muestra cada una con su propio nombre.
 //
 // `paths` sale de las carpetas compartidas de los paquetes ACTIVOS del
-// usuario (tabla `purchased_packages_drive`, con la columna vieja
+// usuario (tabla `users_drive`, con la columna vieja
 // `purchased_packages.drive_path` como respaldo): un paquete puede compartir
 // VARIAS carpetas, así que aquí sale una entrada por carpeta. El drive del
 // cliente muestra SOLO esas carpetas; sin ellas no ve nada (aún no se le

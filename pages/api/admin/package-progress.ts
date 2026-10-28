@@ -7,6 +7,8 @@ import { logActivity } from "../../../lib/activity";
 import { q, exec, transaccion } from "../../../lib/db";
 import {
   drivePathsOverlap,
+  driveTable,
+  overlapReason,
   packageClientIds,
   packageDrivePaths,
   sharedDriveConflict,
@@ -225,8 +227,8 @@ async function syncLegacyDrivePath(
 
 /**
  * Deja EXACTAMENTE [paths] como las carpetas del Drive DEL PAQUETE (tabla
- * `purchased_packages_drive` + columna vieja). Un paquete comparte UNA sola
- * carpeta, así que solo se guarda la primera.
+ * `users_drive` + columna vieja). Un paquete comparte UNA sola carpeta, así
+ * que solo se guarda la primera.
  *
  * IMPORTANTE: las carpetas compartidas DIRECTAMENTE con el usuario
  * (`id_user` con valor) NO se tocan; se administran desde el módulo Usuarios.
@@ -244,19 +246,20 @@ async function setPackageDriveFolders(
   );
   if (!exists.length) return "missing";
   const single = paths.slice(0, 1);
+  const table = await driveTable();
   try {
     await transaccion(async (conn) => {
       // TODAS las filas del paquete (incluidas las viejas que además traen
       // `id_user`): son las carpetas de este paquete y se reemplazan.
       await conn.query(
-        `UPDATE purchased_packages_drive
+        `UPDATE ${table}
             SET active = 0
           WHERE id_purchased_package = ? AND active = 1`,
         [purchasedPackageId]
       );
       for (const p of single) {
         await conn.query(
-          `INSERT INTO purchased_packages_drive (id_purchased_package, path)
+          `INSERT INTO ${table} (id_purchased_package, path)
            VALUES (?, ?)`,
           [purchasedPackageId, p]
         );
@@ -1276,9 +1279,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           res,
           409,
           "Esa carpeta se solapa con una ya compartida",
-          `«${clash}» ya está compartida con el cliente y contiene a «${clean}» ` +
-            `(o está dentro de ella). Comparte solo una de las dos para no ` +
-            `duplicar el mismo contenido.`
+          `${overlapReason(clash, clean)}. Comparte solo una de las dos para ` +
+            `no duplicar el mismo contenido.`
         );
         return;
       }
@@ -1339,8 +1341,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           res,
           409,
           "Esa carpeta ya está compartida",
-          `«${own}» ya se comparte con el cliente (o contiene a «${clean}»). ` +
-            `Comparte solo una de las dos.`
+          `${overlapReason(own, clean)}. Comparte solo una de las dos.`
         );
         return;
       }
@@ -1350,19 +1351,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           res,
           409,
           "Esa carpeta se solapa con una ya compartida",
-          `«${clash}» ya está compartida con el cliente y contiene a ` +
-            `«${clean}» (o está dentro de ella). Comparte solo una.`
+          `${overlapReason(clash, clean)}. Comparte solo una.`
         );
         return;
       }
       try {
+        const table = await driveTable();
         await transaccion(async (conn) => {
           for (const cid of clientIds) {
             // SIN paquete: la carpeta es de la persona (se ve en todos sus
             // paquetes). Con `id_purchased_package` se leería como carpeta
             // DEL paquete y dejaría de verse en los demás.
             await conn.query(
-              `INSERT INTO purchased_packages_drive (id_user, path)
+              `INSERT INTO ${table} (id_user, path)
                VALUES (?, ?)`,
               [cid, clean]
             );
@@ -1403,11 +1404,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const clientIds = await packageClientIds(purchasedPackageId);
+      const table = await driveTable();
       try {
         let removed = 0;
         for (const cid of clientIds) {
           const r = await exec(
-            `UPDATE purchased_packages_drive
+            `UPDATE ${table}
                 SET active = 0
               WHERE id_user = ? AND path = ? AND active = 1
                 AND id_purchased_package IS NULL`,
