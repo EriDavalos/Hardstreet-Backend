@@ -15,10 +15,16 @@ import { sharesByTarget } from "../../../lib/user-shares";
 // Carpetas COMPARTIDAS con el usuario logueado  ->  /api/my/drive
 //
 //   GET  {
-//     isClient,   // true = su drive se limita a lo compartido
-//     role,       // nombre del rol (para diagnóstico)
+//     isClient,      // true = su drive se limita a lo compartido
+//     driveFullAccess,// true = su rol ve el Drive COMPLETO
+//     role,          // nombre del rol (para diagnóstico)
 //     paths: [ { packageId, packageName, path } ]
 //   }
+//
+// El alcance lo decide el ROL (`roles.drive_full_access`): el equipo ve el
+// Drive completo y las cuentas de cliente solo lo que se les comparte. Un
+// paquete comparte UNA carpeta, así que cada paquete aporta UNA entrada a
+// `paths`; el Drive del cliente muestra cada una con su propio nombre.
 //
 // `paths` sale de las carpetas compartidas de los paquetes ACTIVOS del
 // usuario (tabla `purchased_packages_drive`, con la columna vieja
@@ -46,6 +52,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   try {
     const roleId = await userRoleId(session.sub);
     const isAdmin = await userIsAdmin(roleId);
+
+    // Permiso del ROL: ¿ve el Drive completo o solo lo compartido? Si la
+    // migración 2026-10-27 todavía no se aplicó (columna ausente) se usa la
+    // regla anterior para no cambiarle el Drive a nadie sin querer.
+    let roleFullAccess: boolean | null = null;
+    try {
+      const rows = await q<{ drive_full_access: number }>(
+        `SELECT drive_full_access FROM roles WHERE id = ? LIMIT 1`,
+        [roleId]
+      );
+      roleFullAccess = Number(rows[0]?.drive_full_access) === 1;
+    } catch {
+      roleFullAccess = null;
+    }
 
     let rows: Row[];
     try {
@@ -108,10 +128,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     }
 
     const role = String(session.role || "");
+    // Sin la columna del rol: se conserva la regla anterior (el cliente y
+    // quien tenga paquetes comprados se limita; el Admin nunca).
+    const legacyClient =
+      role.toLowerCase() === "cliente" || rows.length > 0;
+    const isClient =
+      !isAdmin && (roleFullAccess === null ? legacyClient : !roleFullAccess);
     res.status(200).json({
-      // Solo el CLIENTE se limita (nunca el Admin). Un usuario con paquetes
-      // comprados es cliente aunque su rol se llame de otra forma.
-      isClient: !isAdmin && (role.toLowerCase() === "cliente" || rows.length > 0),
+      isClient,
+      driveFullAccess: isAdmin || roleFullAccess === true,
       role,
       packages: rows.length,
       paths,

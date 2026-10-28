@@ -38,13 +38,15 @@ import { notifyPackageUsers } from "../../../lib/notifications";
 //     quitar-movimiento   { movementId, source }
 //     completar-servicio  { serviceId, description? }
 //     reabrir-servicio    { serviceId }
-//     actualizar-servicio { serviceId, description }
+//     actualizar-servicio { serviceId, description?, statusId? }
+//       `description` = observaciones/avance; `statusId` = 1 Pendiente,
+//       2 En proceso, 3 Entregado (terminado, guarda la fecha de cierre).
 //     actualizar-servicio-url { serviceId, url }  (liga del Drive del servicio)
 //     actualizar-servicio-share { serviceId, folder, link } (carpeta y liga
 //       compartidas de UN servicio del paquete)
 //     agregar-directorio  { purchasedPackageId, path }
-//       Suma UNA carpeta del Drive a las compartidas con el cliente (el
-//       paquete puede compartir varias).
+//       Deja esa carpeta como LA carpeta del paquete (un paquete comparte
+//       UNA sola carpeta del Drive; si ya tenía otra, se reemplaza).
 //     quitar-directorio   { purchasedPackageId, path }
 //       Deja de compartir esa carpeta.
 //     agregar-directorio-cliente { purchasedPackageId, path }
@@ -222,8 +224,12 @@ async function syncLegacyDrivePath(
 }
 
 /**
- * Deja EXACTAMENTE [paths] como las carpetas del Drive compartidas con el
- * cliente de ese paquete (tabla `purchased_packages_drive` + columna vieja).
+ * Deja EXACTAMENTE [paths] como las carpetas del Drive DEL PAQUETE (tabla
+ * `purchased_packages_drive` + columna vieja). Un paquete comparte UNA sola
+ * carpeta, así que solo se guarda la primera.
+ *
+ * IMPORTANTE: las carpetas compartidas DIRECTAMENTE con el usuario
+ * (`id_user` con valor) NO se tocan; se administran desde el módulo Usuarios.
  *
  * Devuelve 'missing' si el paquete no existe y 'no-table' si la migración
  * todavía no se aplicó (se deja al menos la columna vieja al día).
@@ -237,15 +243,17 @@ async function setPackageDriveFolders(
     [purchasedPackageId]
   );
   if (!exists.length) return "missing";
+  const single = paths.slice(0, 1);
   try {
     await transaccion(async (conn) => {
       await conn.query(
         `UPDATE purchased_packages_drive
             SET active = 0
-          WHERE id_purchased_package = ? AND active = 1`,
+          WHERE id_purchased_package = ? AND active = 1
+            AND COALESCE(id_user, 0) = 0`,
         [purchasedPackageId]
       );
-      for (const p of paths) {
+      for (const p of single) {
         await conn.query(
           `INSERT INTO purchased_packages_drive (id_purchased_package, path)
            VALUES (?, ?)`,
@@ -254,10 +262,10 @@ async function setPackageDriveFolders(
       }
     });
   } catch {
-    await syncLegacyDrivePath(purchasedPackageId, paths);
+    await syncLegacyDrivePath(purchasedPackageId, single);
     return "no-table";
   }
-  await syncLegacyDrivePath(purchasedPackageId, paths);
+  await syncLegacyDrivePath(purchasedPackageId, single);
   return "ok";
 }
 
@@ -908,6 +916,30 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fields.push("`description` = ?");
         params.push(norm(b.description) || null);
       }
+      // El panel también puede CAMBIAR EL ESTADO del servicio (Pendiente,
+      // En proceso o Entregado) junto con sus observaciones. Al volver a un
+      // estado que no es «Entregado» se borra la fecha de cierre.
+      let statusChanged: number | null = null;
+      if (b.statusId !== undefined || b.status !== undefined) {
+        const wanted = Number(b.statusId ?? b.status ?? 0);
+        if (wanted !== 1 && wanted !== 2 && wanted !== 3) {
+          fail(
+            res,
+            400,
+            "Estado del servicio no válido",
+            "Usa 1 (Pendiente), 2 (En proceso) o 3 (Entregado)"
+          );
+          return;
+        }
+        statusChanged = wanted;
+        fields.push("`id_status` = ?");
+        params.push(wanted);
+        if (wanted === ST_DONE) {
+          fields.push("`finished_at` = NOW()");
+        } else {
+          fields.push("`finished_at` = NULL");
+        }
+      }
       if (actionName === "completar-servicio") {
         fields.push("`id_status` = ?", "`finished_at` = NOW()");
         params.push(ST_DONE);
@@ -926,7 +958,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(res, 404, "Servicio no encontrado", `No hay un servicio activo con id ${serviceId}`);
         return;
       }
-      const done = actionName === "completar-servicio";
+      const done =
+        actionName === "completar-servicio" || statusChanged === ST_DONE;
       let notified = 0;
       if (done) {
         // Aviso automático al cliente: su servicio terminó.
@@ -956,6 +989,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       const message = done
         ? "Servicio marcado como terminado exitosamente"
+        : statusChanged === ST_PROCESS
+        ? "Servicio marcado en proceso exitosamente"
         : "Servicio actualizado exitosamente";
       await logActivity({
         userId: me.sub,
@@ -968,7 +1003,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         details: { serviceId, done, ...b },
         req,
       });
-      ok(res, message, { item: { serviceId, done, notified } });
+      ok(res, message, {
+        item: { serviceId, done, statusId: statusChanged, notified },
+      });
       return;
     }
 
@@ -1201,11 +1238,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
-    // ---- Agregar UNA carpeta del Drive a las compartidas del paquete ----
-    // Un paquete puede compartir VARIAS carpetas. La ruta se normaliza (sin
-    // barras iniciales/finales y sin '..') y NO se permite que se solape con
-    // otra ya compartida a los mismos clientes: sería el mismo contenido dos
-    // veces.
+    // ---- Compartir LA carpeta del Drive de este paquete ----
+    // Cada paquete comparte UNA sola carpeta: si ya tenía otra, se
+    // REEMPLAZA (antes se acumulaban y el cliente veía lo mismo en todos sus
+    // paquetes). La ruta se normaliza y no se permite que se solape con otra
+    // carpeta compartida a los mismos clientes (sería el mismo contenido dos
+    // veces).
     if (actionName === "agregar-directorio") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
@@ -1217,20 +1255,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(res, 400, "Elige una carpeta del Drive", "La acción necesita la carpeta que se va a compartir");
         return;
       }
-      // ¿Ya está (o se solapa con otra) en ESTE paquete?
+      // ¿Ya es la carpeta de ESTE paquete?
       const current = await packageDrivePaths(purchasedPackageId);
-      const own = current.find((p) => drivePathsOverlap(clean, p));
-      if (own) {
+      if (current.length === 1 && current[0] === clean) {
         fail(
           res,
           409,
-          "Esa carpeta ya está compartida",
-          `«${own}» ya se comparte con el cliente en este paquete ` +
-            `(o contiene a «${clean}»). Comparte solo una de las dos.`
+          "Esa ya es la carpeta del paquete",
+          `«${clean}» ya se comparte con el cliente en este paquete.`
         );
         return;
       }
-      // Choque con otra carpeta compartida en OTRO paquete del cliente.
+      // Choque con otra carpeta compartida en OTRO paquete del cliente (o
+      // directamente con su usuario): dos carpetas solapadas en el Drive del
+      // cliente se comerían una a la otra.
       const clash = await sharedDriveConflict(purchasedPackageId, clean);
       if (clash) {
         fail(
@@ -1243,12 +1281,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
         return;
       }
-      const next = [...current, clean];
+      const next = [clean];
       const saved = await setPackageDriveFolders(purchasedPackageId, next);
       if (saved === "missing") {
         fail(res, 404, "Paquete comprado no encontrado", `No hay un paquete con id ${purchasedPackageId}`);
         return;
       }
+      const message = current.length
+        ? "Carpeta del paquete actualizada exitosamente"
+        : "Carpeta compartida con el cliente exitosamente";
       await logActivity({
         userId: me.sub,
         module: "clientes",
@@ -1256,11 +1297,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         action: "update",
         entity: "paquete-cliente",
         entityId: purchasedPackageId,
-        description: "Carpeta compartida con el cliente exitosamente",
+        description: message,
         details: { purchasedPackageId, drivePaths: next },
         req,
       });
-      ok(res, "Carpeta compartida con el cliente exitosamente", {
+      ok(res, message, {
         drivePath: next[0] ?? "",
         drivePaths: next,
         item: { purchasedPackageId, drivePaths: next },

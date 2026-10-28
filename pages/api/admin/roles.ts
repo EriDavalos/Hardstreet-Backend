@@ -62,6 +62,26 @@ async function savePermissions(
   }
 }
 
+/**
+ * Guarda el permiso de Drive del rol: `drive_full_access` (1 = ve el Drive
+ * completo; 0 = solo las carpetas compartidas).
+ *
+ * Si la migración 2026-10-27 todavía no se aplicó, la columna no existe y se
+ * ignora sin romper el CRUD del rol.
+ */
+async function saveDriveFullAccess(id: number, raw: unknown): Promise<void> {
+  if (raw === undefined || raw === null || raw === "") return;
+  const value = raw === true || Number(raw) === 1 ? 1 : 0;
+  try {
+    await exec(`UPDATE roles SET drive_full_access = ? WHERE id = ?`, [
+      value,
+      id,
+    ]);
+  } catch {
+    // Columna pendiente de migración.
+  }
+}
+
 /** Validaciones compartidas de nombre + formato de permisos. */
 async function validateRole(
   res: NextApiResponse,
@@ -147,13 +167,26 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             WHERE active = 1 ${hidden} AND ${scopeOrSystem.sql}`,
           scopeOrSystem.params
         );
-        const roles = await q<{ id: number; name: string | null }>(
-          `SELECT id, name FROM roles
-            WHERE active = 1 ${hidden} AND ${scopeOrSystem.sql}
-            ORDER BY id ASC
-            LIMIT ${p.limit} OFFSET ${p.offset}`,
-          scopeOrSystem.params
-        );
+        // `drive_full_access` decide si el rol ve el Drive completo o solo lo
+        // compartido. Sin la migración se responde false (como un cliente).
+        let roles: { id: number; name: string | null; drive_full_access?: number }[];
+        try {
+          roles = await q(
+            `SELECT id, name, drive_full_access FROM roles
+              WHERE active = 1 ${hidden} AND ${scopeOrSystem.sql}
+              ORDER BY id ASC
+              LIMIT ${p.limit} OFFSET ${p.offset}`,
+            scopeOrSystem.params
+          );
+        } catch {
+          roles = await q(
+            `SELECT id, name FROM roles
+              WHERE active = 1 ${hidden} AND ${scopeOrSystem.sql}
+              ORDER BY id ASC
+              LIMIT ${p.limit} OFFSET ${p.offset}`,
+            scopeOrSystem.params
+          );
+        }
         const ids = roles.map((r) => r.id);
         const perms = ids.length
           ? await q<{ id_role: number; id_modules: number; id_permission: number }>(
@@ -167,6 +200,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           roles: roles.map((r) => ({
             id: r.id,
             name: r.name,
+            driveFullAccess: Number(r.drive_full_access) === 1,
             permissions: perms
               .filter((p) => p.id_role === r.id)
               .map((p) => ({ moduleId: p.id_modules, permissionId: p.id_permission })),
@@ -196,7 +230,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (v.permissions?.length) {
           await transaccion((conn) => savePermissions(conn, r.insertId, v.permissions!));
         }
-        const item = { id: r.insertId, name: v.name };
+        await saveDriveFullAccess(r.insertId, b.driveFullAccess);
+        const item = {
+          id: r.insertId,
+          name: v.name,
+          driveFullAccess: b.driveFullAccess === true || Number(b.driveFullAccess) === 1,
+        };
         await logActivity({
           userId: me.sub,
           module: "rols",
@@ -247,7 +286,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (v.permissions !== undefined) {
           await transaccion((conn) => savePermissions(conn, id, v.permissions!));
         }
-        const item = { id, name: v.name };
+        await saveDriveFullAccess(id, b.driveFullAccess);
+        const item = {
+          id,
+          name: v.name,
+          driveFullAccess:
+            b.driveFullAccess === undefined
+              ? undefined
+              : b.driveFullAccess === true || Number(b.driveFullAccess) === 1,
+        };
         await logActivity({
           userId: me.sub,
           module: "rols",
