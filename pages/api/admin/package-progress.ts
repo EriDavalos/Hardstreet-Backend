@@ -8,9 +8,10 @@ import { q, exec, transaccion } from "../../../lib/db";
 import {
   drivePathsOverlap,
   driveTable,
-  overlapReason,
+  duplicateShareReason,
   packageClientIds,
   packageDrivePaths,
+  sameDrivePath,
   sharedDriveConflict,
   userDrivePaths,
   userSharedConflict,
@@ -1261,7 +1262,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       // ¿Ya es la carpeta de ESTE paquete?
       const current = await packageDrivePaths(purchasedPackageId);
-      if (current.length === 1 && current[0] === clean) {
+      if (current.length === 1 && sameDrivePath(current[0], clean)) {
         fail(
           res,
           409,
@@ -1270,17 +1271,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
         return;
       }
-      // Choque con otra carpeta compartida en OTRO paquete del cliente (o
-      // directamente con su usuario): dos carpetas solapadas en el Drive del
-      // cliente se comerían una a la otra.
+      // ¿El cliente ya tiene ESA MISMA carpeta en otro de sus paquetes (o
+      // compartida directamente con él)? Solo la misma carpeta estorba: las
+      // hermanas y las que están dentro de otra ya compartida son válidas.
       const clash = await sharedDriveConflict(purchasedPackageId, clean);
       if (clash) {
         fail(
           res,
           409,
-          "Esa carpeta se solapa con una ya compartida",
-          `${overlapReason(clash, clean)}. Comparte solo una de las dos para ` +
-            `no duplicar el mismo contenido.`
+          "Esa carpeta ya está compartida",
+          `${duplicateShareReason(clash)}: el cliente la vería dos veces en su Drive. ` +
+            `Elige otra carpeta, o deja de compartirla ahí primero.`
         );
         return;
       }
@@ -1333,15 +1334,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(res, 404, "El paquete no tiene cliente", "No hay a quién compartirle la carpeta");
         return;
       }
-      // Sin duplicar contenido: ni con lo ya compartido al cliente ni con lo
-      // compartido a sus paquetes.
+      // Solo estorba LA MISMA carpeta, ya sea la que el cliente tiene
+      // compartida directamente o la de alguno de sus paquetes.
       const own = await userSharedConflict(clientIds[0], clean);
       if (own) {
         fail(
           res,
           409,
           "Esa carpeta ya está compartida",
-          `${overlapReason(own, clean)}. Comparte solo una de las dos.`
+          `${duplicateShareReason(own)}: el cliente la vería dos veces en su Drive.`
         );
         return;
       }
@@ -1350,8 +1351,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(
           res,
           409,
-          "Esa carpeta se solapa con una ya compartida",
-          `${overlapReason(clash, clean)}. Comparte solo una.`
+          "Esa carpeta ya está compartida",
+          `${duplicateShareReason(clash)}: el cliente la vería dos veces en su Drive.`
         );
         return;
       }
@@ -1500,17 +1501,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const clean = cleanDrivePath(b.path);
-      // Choque con otra carpeta ya compartida a los mismos clientes.
+      // Rechazo solo si esa MISMA carpeta ya está compartida a estos clientes
+      // desde otro paquete (o directamente con ellos).
       if (clean) {
         const clash = await sharedDriveConflict(purchasedPackageId, clean);
         if (clash) {
           fail(
             res,
             409,
-            "Esa carpeta se solapa con una ya compartida",
-            `«${clash}» ya está compartida con el cliente y contiene a «${clean}» ` +
-              `(o está dentro de ella). Comparte solo una de las dos para no ` +
-              `duplicar el mismo contenido.`
+            "Esa carpeta ya está compartida",
+            `${duplicateShareReason(clash)}: el cliente la vería dos veces en su Drive.`
           );
           return;
         }

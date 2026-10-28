@@ -33,11 +33,14 @@
 //
 //   * una ruta se normaliza: separador '/', sin barras al principio/final y
 //     sin '.' ni '..';
-//   * dos carpetas se SOLAPAN si son la misma o si una contiene a la otra.
+//   * lo ÚNICO que no se puede repetir es LA MISMA carpeta para el mismo
+//     cliente (se vería dos veces en su Drive).
 //
-// Compartir dos carpetas solapadas al MISMO cliente es un error: vería el
-// mismo contenido dos veces (y el drive del cliente solo toma el primer nivel
-// de cada ruta, así que la de dentro quedaría absorbida por la de fuera).
+// Dos carpetas DISTINTAS se pueden compartir aunque una esté dentro de otra o
+// compartan padre: `Comercial/RegalandoSonrisas/PrimerServicio` y
+// `Comercial/RegalandoSonrisas/SegundoServicio` son hermanas y no chocan. Antes
+// se bloqueaba cualquier anidamiento y un padre compartido dejaba inservibles
+// todas sus subcarpetas; con un paquete por carpeta eso es justo lo normal.
 // ==================================================================
 
 import { q } from "./db";
@@ -108,6 +111,19 @@ export function pathsOverlap(a: string, b: string): boolean {
   return drivePathsOverlap(a, b);
 }
 
+/**
+ * ¿[a] y [b] son LA MISMA carpeta? (sin distinguir mayúsculas: el Drive vive
+ * en Windows y `Fiesta`/`fiesta` es la misma carpeta).
+ *
+ * Es la única condición que impide compartir: dos rutas distintas, aunque una
+ * contenga a la otra, son carpetas distintas y el cliente las ve por separado.
+ */
+export function sameDrivePath(a: string, b: string): boolean {
+  const x = normalizeDrivePath(a).toLowerCase();
+  const y = normalizeDrivePath(b).toLowerCase();
+  return x !== "" && x === y;
+}
+
 /** ¿[a] y [b] son la misma carpeta o una está dentro de la otra? */
 export function drivePathsOverlap(a: string, b: string): boolean {
   const x = normalizeDrivePath(a);
@@ -118,22 +134,13 @@ export function drivePathsOverlap(a: string, b: string): boolean {
 }
 
 /**
- * Explica en palabras la relación entre una carpeta YA compartida y la que se
- * quiere compartir (se solapan). Sirve para que el aviso diga qué pasa de
- * verdad: misma carpeta, una contiene a la otra o está dentro de ella.
+ * Aviso de que esa carpeta ya se le comparte al cliente (es la misma). Es el
+ * único motivo por el que se rechaza compartir una carpeta.
  */
-export function overlapReason(shared: string, target: string): string {
+export function duplicateShareReason(shared: string): string {
   const a = normalizeDrivePath(shared);
-  const b = normalizeDrivePath(target);
-  if (!a) return `«${b}» se solapa con una carpeta ya compartida`;
-  if (a === b) return `«${a}» ya está compartida`;
-  if (b.startsWith(`${a}/`)) {
-    return `«${a}» ya está compartida y CONTIENE a «${b}»`;
-  }
-  if (a.startsWith(`${b}/`)) {
-    return `«${a}» ya está compartida y está DENTRO de «${b}»`;
-  }
-  return `«${a}» ya está compartida y se solapa con «${b}»`;
+  if (!a) return "Esa carpeta ya está compartida con el cliente";
+  return `«${a}» ya está compartida con este cliente`;
 }
 
 /**
@@ -341,8 +348,9 @@ export async function userDrivePathsByIds(
 }
 
 /**
- * ¿Una carpeta COMPARTIDA DIRECTAMENTE con el cliente [userId] se solapa con
- * [path]? Devuelve esa carpeta o null.
+ * ¿El cliente [userId] ya tiene compartida ESA MISMA carpeta (directamente)?
+ * Devuelve la carpeta o null. Las demás no cuentan: una subcarpeta de algo ya
+ * compartido es otra carpeta y se puede compartir.
  */
 export async function userSharedConflict(
   userId: number,
@@ -351,15 +359,18 @@ export async function userSharedConflict(
   const target = normalizeDrivePath(path);
   if (!target || !userId) return null;
   for (const other of await userDrivePaths(userId)) {
-    if (drivePathsOverlap(target, other)) return other;
+    if (sameDrivePath(target, other)) return other;
   }
   return null;
 }
 
 /**
  * ¿Algún cliente de la compra [purchasedPackageId] ya tiene compartida, en
- * OTRO de sus paquetes (o directamente con su usuario), una carpeta que se
- * solapa con [path]?
+ * OTRO de sus paquetes (o directamente con su usuario), ESA MISMA carpeta?
+ *
+ * Solo la misma carpeta cuenta: compartirle a otro paquete una carpeta hermana
+ * (o una que esté dentro de otra ya compartida) es legítimo y da una carpeta
+ * por paquete en su Drive.
  *
  * Devuelve esa carpeta (para poder decirle al usuario cuál es) o null.
  */
@@ -371,7 +382,7 @@ export async function sharedDriveConflict(
   if (!target) return null;
   for (const sib of await siblingPackagePaths(purchasedPackageId)) {
     for (const other of sib.paths) {
-      if (drivePathsOverlap(target, other)) return other;
+      if (sameDrivePath(target, other)) return other;
     }
   }
   // Y las compartidas DIRECTO al cliente de ese paquete.

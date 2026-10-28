@@ -5,10 +5,10 @@ import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { q, exec } from "../../../lib/db";
 import {
-  drivePathsOverlap,
   driveTable,
+  duplicateShareReason,
   normalizeDrivePath,
-  overlapReason,
+  sameDrivePath,
   userDrivePaths,
 } from "../../../lib/drive-paths";
 
@@ -92,15 +92,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(res, 404, "Usuario no encontrado", `No hay un usuario activo con id ${userId}`);
         return;
       }
-      // Sin duplicar contenido: la carpeta nueva no puede ser (ni contener, ni
-      // estar dentro de) una que ya se le comparte.
+      // Solo se rechaza LA MISMA carpeta (el cliente la vería dos veces).
+      // Una subcarpeta de algo ya compartido es otra carpeta y se permite.
       for (const other of await userDrivePaths(userId)) {
-        if (drivePathsOverlap(path, other)) {
+        if (sameDrivePath(path, other)) {
           fail(
             res,
             409,
             "Esa carpeta ya está compartida",
-            `${overlapReason(other, path)}. Comparte solo una de las dos.`
+            `${duplicateShareReason(other)}: el cliente la vería dos veces en su Drive.`
           );
           return;
         }
