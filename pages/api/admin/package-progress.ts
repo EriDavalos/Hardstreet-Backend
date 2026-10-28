@@ -51,8 +51,8 @@ import { notifyPackageUsers } from "../../../lib/notifications";
 //       Deja de compartir esa carpeta.
 //     agregar-directorio-cliente { purchasedPackageId, path }
 //       Suma UNA carpeta compartida DIRECTAMENTE con el CLIENTE (no con el
-//       paquete): aparece en TODOS sus paquetes. Requiere la migración
-//       2026-10-17 (columna `id_user` en purchased_packages_drive).
+//       paquete): aparece en TODOS sus paquetes. La fila se guarda con
+//       `id_user` y SIN paquete (si no, se leería como carpeta del paquete).
 //     quitar-directorio-cliente { purchasedPackageId, path }
 //       Deja de compartir esa carpeta del cliente.
 //     compartir-directorio { purchasedPackageId, path }
@@ -246,11 +246,12 @@ async function setPackageDriveFolders(
   const single = paths.slice(0, 1);
   try {
     await transaccion(async (conn) => {
+      // TODAS las filas del paquete (incluidas las viejas que además traen
+      // `id_user`): son las carpetas de este paquete y se reemplazan.
       await conn.query(
         `UPDATE purchased_packages_drive
             SET active = 0
-          WHERE id_purchased_package = ? AND active = 1
-            AND COALESCE(id_user, 0) = 0`,
+          WHERE id_purchased_package = ? AND active = 1`,
         [purchasedPackageId]
       );
       for (const p of single) {
@@ -1311,9 +1312,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
     // ---- Compartir UNA carpeta DIRECTAMENTE con el CLIENTE ----
     // En vez de atarla a un solo paquete, la carpeta se comparte con el
-    // usuario: aparece en TODOS sus paquetes. La fila guarda también el
-    // paquete desde el que se compartió (para saber de dónde salió), pero NO
-    // cuenta como carpeta PROPIA de ese paquete.
+    // usuario: aparece en TODOS sus paquetes. La fila NO guarda el paquete
+    // (`id_purchased_package` NULL): con paquete se leería como carpeta de
+    // ESE paquete y dejaría de aparecer en los demás.
     if (actionName === "agregar-directorio-cliente") {
       const purchasedPackageId = Number(b.purchasedPackageId || 0);
       if (!purchasedPackageId) {
@@ -1357,11 +1358,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       try {
         await transaccion(async (conn) => {
           for (const cid of clientIds) {
+            // SIN paquete: la carpeta es de la persona (se ve en todos sus
+            // paquetes). Con `id_purchased_package` se leería como carpeta
+            // DEL paquete y dejaría de verse en los demás.
             await conn.query(
-              `INSERT INTO purchased_packages_drive
-                 (id_purchased_package, id_user, path)
-               VALUES (?, ?, ?)`,
-              [purchasedPackageId, cid, clean]
+              `INSERT INTO purchased_packages_drive (id_user, path)
+               VALUES (?, ?)`,
+              [cid, clean]
             );
           }
         });
@@ -1406,7 +1409,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           const r = await exec(
             `UPDATE purchased_packages_drive
                 SET active = 0
-              WHERE id_user = ? AND path = ? AND active = 1`,
+              WHERE id_user = ? AND path = ? AND active = 1
+                AND id_purchased_package IS NULL`,
             [cid, clean]
           );
           removed += Number(r.affectedRows || 0);

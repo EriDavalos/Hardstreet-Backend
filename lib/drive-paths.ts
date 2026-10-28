@@ -3,9 +3,22 @@
 // ==================================================================
 // El estudio le comparte a cada cliente las carpetas del Drive que quiera,
 // por paquete comprado. El origen de verdad es la tabla
-// `purchased_packages_drive` (VARIAS carpetas por paquete); la columna vieja
+// `purchased_packages_drive`; la columna vieja
 // `purchased_packages.drive_path` se conserva SINCRONIZADA con la primera
 // carpeta, así los clientes que todavía la lean no se quedan sin datos.
+//
+// Alcance de cada fila (es lo que decide QUIÉN la ve):
+//
+//   * con `id_purchased_package`  -> carpeta DEL PAQUETE. El cliente la ve
+//     mientras ese paquete esté activo y solo desde él.
+//   * con `id_user` y SIN paquete -> carpeta de LA PERSONA. La ve en todos
+//     sus paquetes (se administra en el módulo Usuarios).
+//
+// Las filas viejas, que nacieron al compartir la carpeta de un paquete CON el
+// cliente, traen las dos columnas. Se tratan como carpeta DEL PAQUETE (es lo
+// que eran en realidad): si no, esa carpeta no salía en la pestaña Drive del
+// paquete ("sin carpeta") y al mismo tiempo bloqueaba compartirla como si ya
+// estuviera compartida con el cliente.
 //
 // Estas reglas son las MISMAS que aplica el panel (app Flutter,
 // lib/drive_base.dart):
@@ -114,13 +127,11 @@ export async function packageDrivePaths(
 ): Promise<string[]> {
   const out: string[] = [];
   try {
-    // OJO: `COALESCE(id_user, 0) = 0` deja fuera las carpetas compartidas
-    // DIRECTAMENTE con el cliente (esas salen en [userDrivePaths]): si no, la
-    // carpeta del cliente se leería también como carpeta del paquete.
+    // Todas las filas atadas al paquete cuentan como SUYAS, incluida la fila
+    // vieja que además trae `id_user` (ver la cabecera del archivo).
     const rows = await q<{ path: string }>(
       `SELECT path FROM purchased_packages_drive
         WHERE id_purchased_package = ? AND active = 1
-          AND COALESCE(id_user, 0) = 0
         ORDER BY id ASC`,
       [purchasedPackageId]
     );
@@ -151,12 +162,12 @@ export async function packageDrivePathsByIds(
   if (!ids.length) return map;
 
   // Carpetas de la tabla nueva (solo las DEL PAQUETE: las del cliente se
-  // piden aparte con [userDrivePathsByIds]).
+  // piden aparte con [userDrivePathsByIds]). Las filas viejas con `id_user`
+  // también son del paquete: ver la cabecera del archivo.
   try {
     const rows = await q<{ id_purchased_package: number; path: string }>(
       `SELECT id_purchased_package, path FROM purchased_packages_drive
         WHERE active = 1 AND id_purchased_package IN (?)
-          AND COALESCE(id_user, 0) = 0
         ORDER BY id ASC`,
       [ids]
     );
@@ -219,6 +230,11 @@ async function siblingPackagePaths(
  * Carpetas compartidas DIRECTAMENTE con un CLIENTE (con `id_user`), sin
  * importar el paquete: el cliente las ve en TODOS sus paquetes.
  *
+ * Solo las filas SIN paquete: las que traen `id_purchased_package` son
+ * carpetas de ese paquete (aunque sean viejas y también traigan `id_user`), y
+ * se leen con [packageDrivePaths]. Mezclarlas hacía que una carpeta de
+ * paquete saliera como "compartida con el cliente" sin salir en el paquete.
+ *
  * Devuelve [] si la migración (columna `id_user`) todavía no se aplicó.
  */
 export async function userDrivePaths(userId: number): Promise<string[]> {
@@ -228,6 +244,7 @@ export async function userDrivePaths(userId: number): Promise<string[]> {
     const rows = await q<{ path: string }>(
       `SELECT path FROM purchased_packages_drive
         WHERE id_user = ? AND active = 1
+          AND id_purchased_package IS NULL
         ORDER BY id ASC`,
       [userId]
     );
@@ -250,6 +267,7 @@ export async function userDrivePathsByIds(
     const rows = await q<{ id_user: number; path: string }>(
       `SELECT id_user, path FROM purchased_packages_drive
         WHERE active = 1 AND id_user IN (?)
+          AND id_purchased_package IS NULL
         ORDER BY id ASC`,
       [ids]
     );
