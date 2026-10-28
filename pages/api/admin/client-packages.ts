@@ -4,7 +4,12 @@ import { requirePermission } from "../../../lib/permissions";
 import { q, exec, transaccion } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
-import { packageDrivePathsByIds } from "../../../lib/drive-paths";
+import {
+  packageDrivePaths,
+  packageDrivePathsByIds,
+  shareFolderWithUsers,
+  unshareFolderFromUsers,
+} from "../../../lib/drive-paths";
 
 // ==================================================================
 // Paquetes de un cliente (solo rol Admin)  ->  /api/admin/client-packages
@@ -159,6 +164,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           fail(res, 400, "usersPackageId inválido", "Indica qué paquete del cliente quieres quitar");
           return;
         }
+        // La carpeta del paquete se le retira al cliente: su Drive solo muestra
+        // los paquetes que tiene activos.
+        const link = await q(
+          `SELECT id_purchased_package FROM users_packages WHERE id = ? AND id_user = ?`,
+          [linkId, userId]
+        );
         const r = await exec(
           `UPDATE users_packages SET active = 0 WHERE id = ? AND id_user = ?`,
           [linkId, userId]
@@ -166,6 +177,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         if (!r.affectedRows) {
           fail(res, 404, "Paquete no encontrado para este cliente", `El vínculo ${linkId} no existe o ya estaba inactivo`);
           return;
+        }
+        if (link.length) {
+          const paths = await packageDrivePaths(
+            Number(link[0].id_purchased_package)
+          );
+          if (paths.length) {
+            await unshareFolderFromUsers([userId], paths[0]);
+          }
         }
         await logActivity({
           userId: me.sub,
@@ -212,6 +231,15 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           `INSERT INTO users_packages (id_user, id_purchased_package) VALUES (?, ?)`,
           [userId, ppId]
         );
+        // Si el paquete YA tenía compartida su carpeta, el cliente la ve desde
+        // ahora: `users_drive` es su Drive y el paquete debe estar ahí. Si la
+        // migración todavía no se aplicó, la asignación no falla.
+        try {
+          const folders = await packageDrivePaths(ppId);
+          if (folders.length) await shareFolderWithUsers([userId], folders[0]);
+        } catch {
+          // Sin tabla de carpetas: se sincroniza al volver a compartirla.
+        }
         await logActivity({
           userId: me.sub,
           module: "clientes",

@@ -3,12 +3,15 @@ import { withCors } from "../../../lib/cors";
 import { requireAnyOfPermissions } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
-import { q, exec } from "../../../lib/db";
+import { q } from "../../../lib/db";
 import {
-  driveTable,
+  clearPackageFolderForUsers,
   duplicateShareReason,
   normalizeDrivePath,
+  packageFoldersOfUser,
   sameDrivePath,
+  shareFolderWithUsers,
+  unshareFolderFromUsers,
   userDrivePaths,
 } from "../../../lib/drive-paths";
 
@@ -16,7 +19,12 @@ import {
 // CARPETAS DEL DRIVE COMPARTIDAS CON UN USUARIO -> /api/admin/user-drive
 //
 //   GET     ?userId=N
-//           { userId, userName, paths: ["XV/ReynaCoot", ...] }
+//           { userId, userName, paths: [...],
+//             items: [{ path, packageId, packageName }] }
+//           TODAS las carpetas que ve el usuario: las que se le compartieron
+//           directo y las de sus paquetes (al compartir la carpeta de un
+//           paquete se copia aquí, porque el Drive es del usuario). Las que
+//           vienen de un paquete traen su nombre en `packageName`.
 //
 //   POST    { userId, path }
 //           Comparte UNA carpeta del Drive con el usuario. A diferencia del
@@ -24,10 +32,11 @@ import {
 //           VARIAS: es su Drive personal y las ve en todos sus paquetes.
 //
 //   DELETE  ?userId=N&path=<ruta>
-//           Deja de compartir esa carpeta con el usuario.
+//           Deja de compartir esa carpeta con el usuario (si era la de algún
+//           paquete suyo, el paquete también queda sin carpeta).
 //
-// Las carpetas viven en `users_drive` con `id_user` (la misma tabla que lee
-// /api/my/drive), así que el Drive del cliente no cambia de fuente: solo se
+// Las carpetas viven en `users_drive` (id_user, path): es la misma tabla que
+// lee /api/my/drive, así que el Drive del cliente no cambia de fuente. Se
 // administran desde el módulo Usuarios y desde el módulo Clientes (un cliente
 // es un usuario de tipo cliente y también tiene su Drive personal).
 // Permiso: módulo Usuarios o Clientes (ver para GET, editar para el resto).
@@ -71,10 +80,22 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const userName =
         `${rows[0].name || ""} ${rows[0].lastname || ""}`.trim() ||
         `Usuario #${userId}`;
+      // Todas sus carpetas, con el paquete del que vienen (vacío = compartida
+      // directamente con la persona).
+      const folders = await userDrivePaths(userId);
+      const packagesOfUser = await packageFoldersOfUser(userId);
       res.status(200).json({
         userId,
         userName,
-        paths: await userDrivePaths(userId),
+        paths: folders,
+        items: folders.map((path) => {
+          const pkg = packagesOfUser.get(path);
+          return {
+            path,
+            packageId: pkg?.id ?? 0,
+            packageName: pkg?.name || "",
+          };
+        }),
       });
       return;
     }
@@ -114,16 +135,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         }
       }
       try {
-        await exec(
-          `INSERT INTO ${await driveTable()} (id_user, path) VALUES (?, ?)`,
-          [userId, path]
-        );
+        await shareFolderWithUsers([userId], path);
       } catch {
         fail(
           res,
           409,
           "No se pudo compartir la carpeta",
-          "Falta aplicar la migración de carpetas del cliente (id_user)"
+          "Falta aplicar la migración 2026-10-28 (carpetas del Drive por usuario)"
         );
         return;
       }
@@ -152,13 +170,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       fail(res, 400, "Faltan datos", "Indica el usuario y la carpeta");
       return;
     }
-    const r = await exec(
-      `UPDATE ${await driveTable()}
-          SET active = 0
-        WHERE id_user = ? AND path = ? AND active = 1`,
-      [userId, path]
-    );
-    if (!r.affectedRows) {
+    const removed = await unshareFolderFromUsers([userId], path);
+    // Si era la carpeta de alguno de sus paquetes, el paquete también queda
+    // sin ella: el cliente ya no la ve y no puede seguir "compartida" ahí.
+    const cleared = await clearPackageFolderForUsers([userId], path);
+    if (!removed && !cleared) {
       fail(res, 404, "Carpeta no compartida", `«${path}» no está compartida con el usuario`);
       return;
     }

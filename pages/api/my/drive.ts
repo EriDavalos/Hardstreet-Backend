@@ -5,7 +5,7 @@ import { q } from "../../../lib/db";
 import { userIsAdmin, userRoleId } from "../../../lib/permissions";
 import {
   normalizeDrivePath,
-  packageDrivePathsByIds,
+  packageFoldersOfUser,
   userDrivePaths,
   isLocalPath,
 } from "../../../lib/drive-paths";
@@ -26,12 +26,13 @@ import { sharesByTarget } from "../../../lib/user-shares";
 // paquete comparte UNA carpeta, así que cada paquete aporta UNA entrada a
 // `paths`; el Drive del cliente muestra cada una con su propio nombre.
 //
-// `paths` sale de las carpetas compartidas de los paquetes ACTIVOS del
-// usuario (tabla `users_drive`, con la columna vieja
-// `purchased_packages.drive_path` como respaldo): un paquete puede compartir
-// VARIAS carpetas, así que aquí sale una entrada por carpeta. El drive del
-// cliente muestra SOLO esas carpetas; sin ellas no ve nada (aún no se le
-// comparte nada).
+// `paths` sale de `users_drive`, la única fuente de acceso: ahí están las
+// carpetas compartidas de sus paquetes ACTIVOS (al compartir una carpeta en un
+// paquete se copia al usuario) y las compartidas directamente con él. Un
+// paquete comparte UNA carpeta, así que cada paquete aporta UNA entrada a
+// `paths`; las que no son de ningún paquete salen como "Compartido contigo".
+// El drive del cliente muestra SOLO esas carpetas; sin ellas no ve nada (aún
+// no se le comparte nada).
 //
 // El rol ADMIN nunca se limita: ve el drive completo. Si las migraciones
 // todavía no se aplicaron, la consulta cae a un modo sin carpetas en vez de
@@ -82,29 +83,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       rows = [];
     }
 
-    // Las carpetas de cada paquete (tabla nueva + respaldo de la columna vieja).
-    const folders = await packageDrivePathsByIds(
-      rows.map((r) => Number(r.package_id || 0))
-    );
-
-    const paths = rows.flatMap((r) => {
-      const packageId = Number(r.package_id || 0);
-      const packageName = String(r.name || "");
-      return (folders.get(packageId) ?? [])
-        .map((p) => normalizeDrivePath(p))
-        .filter((p) => p !== "")
-        .map((path) => ({ packageId, packageName, path }));
-    });
-
-    // Carpetas compartidas DIRECTAMENTE con el usuario (no con un paquete en
-    // particular): las ve en todos sus paquetes. Van marcadas con
-    // packageId = 0 para que el cliente sepa que no son de un paquete.
-    for (const path of await userDrivePaths(Number(session.sub))) {
-      const clean = normalizeDrivePath(path);
-      if (clean === "") continue;
-      if (paths.some((p) => p.path === clean)) continue;
-      paths.push({ packageId: 0, packageName: "Compartido contigo", path: clean });
-    }
+    // Las carpetas de sus paquetes se etiquetan con el nombre del paquete; las
+    // compartidas directamente con la persona van sin paquete (id 0).
+    const packagesOfUser = await packageFoldersOfUser(Number(session.sub));
+    const paths = (await userDrivePaths(Number(session.sub)))
+      .map((p) => normalizeDrivePath(p))
+      .filter((p) => p !== "")
+      .map((path) => {
+        const pkg = packagesOfUser.get(path);
+        return {
+          packageId: pkg?.id ?? 0,
+          packageName: pkg?.name || "Compartido contigo",
+          path,
+        };
+      });
 
     // Carpetas que OTROS USUARIOS me compartieron desde "Archivos
     // compartidos" (user_drive_shares): también se ven en mi Drive, junto a

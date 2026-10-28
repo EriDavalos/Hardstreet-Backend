@@ -6,12 +6,14 @@ import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { q, exec, transaccion } from "../../../lib/db";
 import {
-  drivePathsOverlap,
-  driveTable,
+  USERS_DRIVE,
+  clearPackageFolderForUsers,
   duplicateShareReason,
   packageClientIds,
   packageDrivePaths,
+  packageFoldersOfUser,
   sameDrivePath,
+  shareFolderWithUsers,
   sharedDriveConflict,
   userDrivePaths,
   userSharedConflict,
@@ -49,13 +51,15 @@ import { notifyPackageUsers } from "../../../lib/notifications";
 //       compartidas de UN servicio del paquete)
 //     agregar-directorio  { purchasedPackageId, path }
 //       Deja esa carpeta como LA carpeta del paquete (un paquete comparte
-//       UNA sola carpeta del Drive; si ya tenía otra, se reemplaza).
+//       UNA sola carpeta del Drive; si ya tenía otra, se reemplaza) y la
+//       comparte con sus clientes en `users_drive`, que es la tabla que lee
+//       el Drive del cliente.
 //     quitar-directorio   { purchasedPackageId, path }
 //       Deja de compartir esa carpeta.
 //     agregar-directorio-cliente { purchasedPackageId, path }
-//       Suma UNA carpeta compartida DIRECTAMENTE con el CLIENTE (no con el
-//       paquete): aparece en TODOS sus paquetes. La fila se guarda con
-//       `id_user` y SIN paquete (si no, se leería como carpeta del paquete).
+//       Suma UNA carpeta compartida DIRECTAMENTE con el CLIENTE (no con un
+//       paquete en particular): aparece en TODOS sus paquetes. Se guarda en
+//       `users_drive` igual que la del paquete (la tabla es del usuario).
 //     quitar-directorio-cliente { purchasedPackageId, path }
 //       Deja de compartir esa carpeta del cliente.
 //     compartir-directorio { purchasedPackageId, path }
@@ -211,66 +215,69 @@ function cleanDrivePath(raw: unknown): string {
     .join("/");
 }
 
-/** Sincroniza la columna vieja `drive_path` con la PRIMERA carpeta. */
-async function syncLegacyDrivePath(
-  purchasedPackageId: number,
-  paths: string[]
-): Promise<void> {
-  try {
-    await exec(
-      `UPDATE purchased_packages SET drive_path = ? WHERE id = ?`,
-      [paths[0] ?? null, purchasedPackageId]
-    );
-  } catch {
-    // Migración pendiente de la columna vieja: la tabla nueva ya tiene todo.
-  }
-}
-
 /**
- * Deja EXACTAMENTE [paths] como las carpetas del Drive DEL PAQUETE (tabla
- * `users_drive` + columna vieja). Un paquete comparte UNA sola carpeta, así
- * que solo se guarda la primera.
+ * Deja EXACTAMENTE [paths] como la carpeta del Drive del paquete.
  *
- * IMPORTANTE: las carpetas compartidas DIRECTAMENTE con el usuario
- * (`id_user` con valor) NO se tocan; se administran desde el módulo Usuarios.
+ * Se guarda en `purchased_packages.drive_path` (un paquete comparte UNA sola
+ * carpeta: se toma la primera) y se copia a `users_drive` de TODOS los
+ * clientes del paquete. El Drive se le comparte al CLIENTE, así que si la
+ * carpeta no está en su `users_drive` no la ve; y al cambiarla, la anterior
+ * se le retira.
  *
- * Devuelve 'missing' si el paquete no existe y 'no-table' si la migración
- * todavía no se aplicó (se deja al menos la columna vieja al día).
+ * Las carpetas que el cliente tenga compartidas DIRECTAMENTE con él no se
+ * tocan (solo se retira la que era la carpeta anterior de ESTE paquete).
+ *
+ * Devuelve 'missing' si el paquete no existe.
  */
 async function setPackageDriveFolders(
   purchasedPackageId: number,
   paths: string[]
-): Promise<"ok" | "missing" | "no-table"> {
+): Promise<"ok" | "missing"> {
   const exists = await q(
     `SELECT id FROM purchased_packages WHERE id = ? AND active = 1`,
     [purchasedPackageId]
   );
   if (!exists.length) return "missing";
-  const single = paths.slice(0, 1);
-  const table = await driveTable();
-  try {
-    await transaccion(async (conn) => {
-      // TODAS las filas del paquete (incluidas las viejas que además traen
-      // `id_user`): son las carpetas de este paquete y se reemplazan.
+  const single = paths.slice(0, 1).filter((p) => p !== "");
+  const previous = await packageDrivePaths(purchasedPackageId);
+  const clientIds = await packageClientIds(purchasedPackageId);
+  await transaccion(async (conn) => {
+    await conn.query(
+      `UPDATE purchased_packages SET drive_path = ? WHERE id = ?`,
+      [single[0] ?? null, purchasedPackageId]
+    );
+    for (const old of previous) {
+      if (single.some((p) => sameDrivePath(p, old))) continue;
+      if (!clientIds.length) continue;
       await conn.query(
-        `UPDATE ${table}
-            SET active = 0
-          WHERE id_purchased_package = ? AND active = 1`,
-        [purchasedPackageId]
+        `UPDATE ${USERS_DRIVE} SET active = 0
+          WHERE id_user IN (?) AND path = ? AND active = 1`,
+        [clientIds, old]
       );
-      for (const p of single) {
-        await conn.query(
-          `INSERT INTO ${table} (id_purchased_package, path)
-           VALUES (?, ?)`,
-          [purchasedPackageId, p]
+    }
+    for (const p of single) {
+      for (const cid of clientIds) {
+        const [rows]: any[] = await conn.query(
+          `SELECT id, active FROM ${USERS_DRIVE}
+            WHERE id_user = ? AND path = ?
+            ORDER BY active DESC, id DESC LIMIT 1`,
+          [cid, p]
         );
+        const row = (rows as any[])[0];
+        if (!row) {
+          await conn.query(
+            `INSERT INTO ${USERS_DRIVE} (id_user, path) VALUES (?, ?)`,
+            [cid, p]
+          );
+        } else if (Number(row.active) !== 1) {
+          await conn.query(
+            `UPDATE ${USERS_DRIVE} SET active = 1 WHERE id = ?`,
+            [Number(row.id)]
+          );
+        }
       }
-    });
-  } catch {
-    await syncLegacyDrivePath(purchasedPackageId, single);
-    return "no-table";
-  }
-  await syncLegacyDrivePath(purchasedPackageId, single);
+    }
+  });
   return "ok";
 }
 
@@ -432,12 +439,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
       // Carpetas compartidas de ESTE paquete (puede tener varias).
       const sharedPaths = await packageDrivePaths(purchasedPackageId);
-      // Carpetas compartidas DIRECTAMENTE con el CLIENTE: se ven en TODOS sus
-      // paquetes (vacío si la migración 2026-10-17 todavía no se aplicó).
+      // Carpetas del CLIENTE que NO son la de uno de sus paquetes: las
+      // compartidas directamente con él (su Drive personal). Desde la
+      // migración 2026-10-28 `users_drive` también trae las de los paquetes,
+      // así que se descartan las que ya se listan por paquete.
       const clientIds = await packageClientIds(purchasedPackageId);
       const clientPaths: string[] = [];
       for (const cid of clientIds) {
+        const ownFolders = await packageFoldersOfUser(cid);
         for (const p of await userDrivePaths(cid)) {
+          if (ownFolders.has(p)) continue;
           if (!clientPaths.includes(p)) clientPaths.push(p);
         }
       }
@@ -1357,25 +1368,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       try {
-        const table = await driveTable();
-        await transaccion(async (conn) => {
-          for (const cid of clientIds) {
-            // SIN paquete: la carpeta es de la persona (se ve en todos sus
-            // paquetes). Con `id_purchased_package` se leería como carpeta
-            // DEL paquete y dejaría de verse en los demás.
-            await conn.query(
-              `INSERT INTO ${table} (id_user, path)
-               VALUES (?, ?)`,
-              [cid, clean]
-            );
-          }
-        });
+        // La misma tabla que usa el paquete: `users_drive` es del CLIENTE.
+        await shareFolderWithUsers(clientIds, clean);
       } catch {
         fail(
           res,
           409,
           "No se pudo compartir con el cliente",
-          "Falta aplicar la migración 2026-10-17 (carpetas del cliente)"
+          "Falta aplicar la migración 2026-10-28 (carpetas del Drive por usuario)"
         );
         return;
       }
@@ -1405,30 +1405,29 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const clientIds = await packageClientIds(purchasedPackageId);
-      const table = await driveTable();
+      let removed = 0;
       try {
-        let removed = 0;
-        for (const cid of clientIds) {
-          const r = await exec(
-            `UPDATE ${table}
-                SET active = 0
-              WHERE id_user = ? AND path = ? AND active = 1
-                AND id_purchased_package IS NULL`,
-            [cid, clean]
-          );
-          removed += Number(r.affectedRows || 0);
-        }
-        if (!removed) {
-          fail(res, 404, "Carpeta no compartida", `«${clean}» no está compartida con el cliente`);
-          return;
-        }
+        const r = await exec(
+          `UPDATE ${USERS_DRIVE}
+              SET active = 0
+            WHERE id_user IN (?) AND path = ? AND active = 1`,
+          [clientIds, clean]
+        );
+        removed = Number(r.affectedRows || 0);
+        // Si algún paquete del cliente la tenía como SU carpeta, también se
+        // limpia: no puede seguir compartida en el paquete y no en el cliente.
+        await clearPackageFolderForUsers(clientIds, clean);
       } catch {
         fail(
           res,
           409,
           "No se pudo quitar la carpeta",
-          "Falta aplicar la migración 2026-10-17 (carpetas del cliente)"
+          "Falta aplicar la migración 2026-10-28 (carpetas del Drive por usuario)"
         );
+        return;
+      }
+      if (!removed) {
+        fail(res, 404, "Carpeta no compartida", `«${clean}» no está compartida con el cliente`);
         return;
       }
       await logActivity({
@@ -1502,8 +1501,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       const clean = cleanDrivePath(b.path);
       // Rechazo solo si esa MISMA carpeta ya está compartida a estos clientes
-      // desde otro paquete (o directamente con ellos).
-      if (clean) {
+      // desde otro paquete (o directamente con ellos). Repetir la carpeta que
+      // este paquete ya tiene no es un choque.
+      const alreadyOwn = (await packageDrivePaths(purchasedPackageId)).some(
+        (p) => sameDrivePath(p, clean)
+      );
+      if (clean && !alreadyOwn) {
         const clash = await sharedDriveConflict(purchasedPackageId, clean);
         if (clash) {
           fail(
