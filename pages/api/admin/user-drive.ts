@@ -1,6 +1,6 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 import { withCors } from "../../../lib/cors";
-import { requirePermission } from "../../../lib/permissions";
+import { requireAnyOfPermissions } from "../../../lib/permissions";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { q, exec } from "../../../lib/db";
@@ -28,8 +28,9 @@ import {
 //
 // Las carpetas viven en `users_drive` con `id_user` (la misma tabla que lee
 // /api/my/drive), así que el Drive del cliente no cambia de fuente: solo se
-// administran desde el módulo Usuarios.
-// Permiso: módulo "users" (ver para GET, editar para el resto).
+// administran desde el módulo Usuarios y desde el módulo Clientes (un cliente
+// es un usuario de tipo cliente y también tiene su Drive personal).
+// Permiso: módulo Usuarios o Clientes (ver para GET, editar para el resto).
 // ==================================================================
 
 function cleanPath(raw: unknown): string {
@@ -42,7 +43,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     return;
   }
   const action = req.method === "GET" ? "read" : "update";
-  const me = await requirePermission(req, res, "users", action);
+  // Se administra desde Usuarios y desde Clientes: basta con cualquiera de los
+  // dos módulos (con sus nombres en inglés o español, como están en la base).
+  const me = await requireAnyOfPermissions(req, res, [
+    { module: "users", action },
+    { module: "usuarios", action },
+    { module: "clients", action },
+    { module: "clientes", action },
+  ]);
   if (!me) return;
 
   try {
