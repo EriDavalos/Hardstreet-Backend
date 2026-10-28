@@ -11,9 +11,10 @@ import { requestScope } from "../../../lib/company-scope";
 //
 //   GET                 -> { notes: [{ id, title, preview, color, pinned,
 //                                      updated, hasDrawing }] }
-//   GET   ?id=N         -> { item: { id, title, blocks, drawing, color,
-//                                    pinned, created, updated } }
-//   POST  { id?, title, blocks, drawing, color, pinned }
+//   GET   ?id=N         -> { item: { id, title, blocks, visibility,
+//                                    ownerId, ownerName, color, pinned,
+//                                    created, updated } }
+//   POST  { id?, title, blocks, visibility, color, pinned }
 //                       -> crea (sin `id`) o actualiza la nota
 //   DELETE ?id=N        -> baja lógica (la fila queda como historial)
 //
@@ -26,7 +27,9 @@ import { requestScope } from "../../../lib/company-scope";
 //                  (0..1), así el dibujo se ve igual en cualquier pantalla.
 //   * `preview` -> primeras líneas del texto, para la tarjeta del listado.
 //
-// Las notas son PERSONALES: cada usuario ve y edita SOLO las suyas.
+// VISIBILIDAD: cada nota es «personal» (solo su autor) o «empresa» (la lee
+// todo el equipo de la empresa). Solo el AUTOR edita o elimina la suya; las
+// de la empresa que no son tuyas se abren en solo lectura.
 // Permiso: módulo "notes" (Ver para leer; Crear/Editar/Eliminar para el resto).
 // Sin la migración 2026-10-29 aplicada, el listado devuelve [] en vez de
 // romper el módulo.
@@ -46,9 +49,11 @@ const MAX_POINTS = 4000;
 const MAX_JSON = 600_000;
 
 type NoteBlock = {
-  type: "text" | "checklist";
+  type: "text" | "checklist" | "drawing";
   text: string;
   items: { text: string; done: boolean }[];
+  /** Solo en los bloques "drawing": el dibujo insertado en la nota. */
+  strokes?: NoteStroke[];
 };
 
 type NoteStroke = {
@@ -89,9 +94,16 @@ function parseBlocks(raw: unknown): NoteBlock[] {
   const out: NoteBlock[] = [];
   for (const item of list.slice(0, MAX_BLOCKS)) {
     const b = (item ?? {}) as Record<string, unknown>;
-    const type = String(b.type ?? "text").toLowerCase() === "checklist"
-      ? "checklist"
-      : "text";
+    const rawType = String(b.type ?? "text").toLowerCase();
+    // DIBUJO insertado en la nota: sus trazos viven EN el bloque.
+    if (rawType === "drawing") {
+      const strokes = parseDrawing(
+        Array.isArray(b.strokes) ? b.strokes : b.drawing
+      );
+      out.push({ type: "drawing", text: "", items: [], strokes });
+      continue;
+    }
+    const type = rawType === "checklist" ? "checklist" : "text";
     if (type === "text") {
       out.push({ type, text: text(b.text, MAX_TEXT), items: [] });
       continue;
@@ -146,6 +158,16 @@ function parseDrawing(raw: unknown): NoteStroke[] {
 }
 
 /** Primeras líneas del texto: lo que se ve en la tarjeta del listado. */
+/** Todos los trazos de la nota (los bloques de dibujo), en orden. */
+function strokesOf(blocks: NoteBlock[]): NoteStroke[] {
+  const out: NoteStroke[] = [];
+  for (const b of blocks) {
+    if (b.type !== "drawing") continue;
+    for (const s of b.strokes ?? []) out.push(s);
+  }
+  return out;
+}
+
 function buildPreview(blocks: NoteBlock[]): string {
   const parts: string[] = [];
   for (const b of blocks) {
@@ -182,7 +204,11 @@ function noteOf(r: Row) {
     id: Number(r.id),
     title: String(r.title || ""),
     blocks: parseBlocks(r.content),
+    // Compatibilidad: el dibujo también viaja aparte (clientes viejos).
     strokes: parseDrawing(r.drawing),
+    visibility: String(r.visibility || "private"),
+    ownerId: Number(r.id_user || 0),
+    ownerName: String(r.owner_name || ""),
     color: String(r.color || "").toUpperCase(),
     pinned: Number(r.pinned) === 1,
     created: iso(r.created),
@@ -196,11 +222,37 @@ async function ownedNote(
   userId: number
 ): Promise<Row | null> {
   const rows = await q<Row>(
-    `SELECT id, title, content, drawing, color, pinned, created, updated
-       FROM notes
-      WHERE id = ? AND id_user = ? AND active = 1
+    `SELECT n.id, n.title, n.content, n.drawing, n.color, n.pinned,
+            n.visibility, n.id_user, n.created, n.updated,
+            CONCAT_WS(' ', u.name, u.lastname) AS owner_name
+       FROM notes n
+       LEFT JOIN users u ON u.id = n.id_user
+      WHERE n.id = ? AND n.id_user = ? AND n.active = 1
       LIMIT 1`,
     [id, userId]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * Nota que el usuario PUEDE ABRIR: la suya o una compartida con la empresa.
+ * Si es de otro, viene marcada para abrirse en solo lectura.
+ */
+async function visibleNote(
+  id: number,
+  userId: number,
+  companyId: number
+): Promise<Row | null> {
+  const rows = await q<Row>(
+    `SELECT n.id, n.title, n.content, n.drawing, n.color, n.pinned,
+            n.visibility, n.id_user, n.created, n.updated,
+            CONCAT_WS(' ', u.name, u.lastname) AS owner_name
+       FROM notes n
+       LEFT JOIN users u ON u.id = n.id_user
+      WHERE n.id = ? AND n.active = 1
+        AND (n.id_user = ? OR (n.visibility = 'company' AND n.id_company = ?))
+      LIMIT 1`,
+    [id, userId, companyId]
   );
   return rows[0] ?? null;
 }
@@ -217,9 +269,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (!me) return;
 
     const id = Number(req.query.id || 0);
+    // Empresa con la que se trabaja: con ella se ven las notas compartidas
+    // con la empresa (las personales solo las ve su autor).
+    const scope = await requestScope(req, me);
+    const companyId = scope.companyId ?? scope.writeCompanyId;
     try {
       if (id) {
-        const row = await ownedNote(id, me.sub);
+        const row = await visibleNote(id, me.sub, companyId);
         if (!row) {
           fail(res, 404, "Nota no encontrada", `No hay una nota ${id} tuya`);
           return;
@@ -228,20 +284,24 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const rows = await q<Row>(
-        `SELECT id, title, preview, color, pinned,
-                DATE_FORMAT(COALESCE(updated, created), '%Y-%m-%dT%H:%i:%s') AS updated,
+        `SELECT n.id, n.title, n.preview, n.color, n.pinned, n.visibility,
+                n.id_user, u.name AS owner_name, u.lastname AS owner_lastname,
+                DATE_FORMAT(COALESCE(n.updated, n.created), '%Y-%m-%dT%H:%i:%s') AS updated,
                 -- 'hasDrawing': solo si hay TRAZOS (una nota guardada sin
                 -- dibujo queda como {"strokes":[]} y no debe marcarse).
                 CASE
-                  WHEN drawing IS NULL
-                       OR drawing = ''
-                       OR drawing = '{"strokes":[]}'
+                  WHEN n.drawing IS NULL
+                       OR n.drawing = ''
+                       OR n.drawing = '{"strokes":[]}'
                   THEN 0 ELSE 1
                 END AS has_drawing
-           FROM notes
-          WHERE active = 1 AND id_user = ?
-          ORDER BY pinned DESC, COALESCE(updated, created) DESC, id DESC`,
-        [me.sub]
+           FROM notes n
+           LEFT JOIN users u ON u.id = n.id_user
+          WHERE n.active = 1
+            AND (n.id_user = ?
+                 OR (n.visibility = 'company' AND n.id_company = ?))
+          ORDER BY n.pinned DESC, COALESCE(n.updated, n.created) DESC, n.id DESC`,
+        [me.sub, companyId]
       );
       ok(res, "Notas", {
         notes: rows.map((r) => ({
@@ -252,6 +312,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           pinned: Number(r.pinned) === 1,
           updated: iso(r.updated),
           hasDrawing: Number(r.has_drawing) === 1,
+          visibility: String(r.visibility || "private"),
+          mine: Number(r.id_user) === me.sub,
+          ownerId: Number(r.id_user || 0),
+          ownerName: String(
+            [r.owner_name, r.owner_lastname].filter(Boolean).join(" ")
+          ).trim(),
         })),
       });
     } catch (e) {
@@ -315,7 +381,21 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
 
   const title = line(body.title, MAX_TITLE);
   const blocks = parseBlocks(body.blocks);
-  const strokes = parseDrawing(body.drawing);
+  // El dibujo vive en su BLOQUE dentro de la nota; también se guarda en la
+  // columna `drawing` para que el listado marque «tiene dibujo» sin abrir el
+  // contenido (y para que un cliente viejo siga viéndolo).
+  const legacyStrokes = parseDrawing(body.drawing);
+  if (!blocks.some((b) => b.type === "drawing") && legacyStrokes.length) {
+    blocks.push({
+      type: "drawing",
+      text: "",
+      items: [],
+      strokes: legacyStrokes,
+    });
+  }
+  const strokes = strokesOf(blocks);
+  // PERSONAL (solo el autor) o EMPRESA (todo el equipo de la empresa).
+  const visibility = body.visibility === "company" ? "company" : "private";
   const color = parseColor(body.color);
   const pinned = body.pinned === true || Number(body.pinned) === 1;
   const content = JSON.stringify({ blocks });
@@ -350,9 +430,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       await exec(
         `UPDATE notes
             SET title = ?, preview = ?, content = ?, drawing = ?, color = ?,
-                pinned = ?, updated = NOW()
+                pinned = ?, visibility = ?, updated = NOW()
           WHERE id = ? AND id_user = ? AND active = 1`,
-        [title || null, preview || null, content, drawing, color || null, pinned ? 1 : 0, id, me.sub]
+        [
+          title || null,
+          preview || null,
+          content,
+          drawing,
+          color || null,
+          pinned ? 1 : 0,
+          visibility,
+          id,
+          me.sub,
+        ]
       );
       await logActivity({
         userId: me.sub,
@@ -375,8 +465,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const scope = await requestScope(req, me);
     const r = await exec(
       `INSERT INTO notes
-         (id_user, id_company, title, preview, content, drawing, color, pinned, active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+         (id_user, id_company, title, preview, content, drawing, color, pinned,
+          visibility, active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
       [
         me.sub,
         scope.writeCompanyId,
@@ -386,6 +477,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         drawing,
         color || null,
         pinned ? 1 : 0,
+        visibility,
       ]
     );
     await logActivity({
@@ -409,7 +501,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       res,
       409,
       "No se pudo guardar la nota",
-      "Falta aplicar la migración 2026-10-29 (módulo Notas)"
+      "Falta aplicar la migración del módulo Notas (2026-10-29 y su visibilidad)"
     );
   }
 });
