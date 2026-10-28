@@ -19,8 +19,11 @@ import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-s
 //     payees    pagos agrupados por colaborador/empleado (total histórico)
 //     payments  cada pago individual, con su destinatario y su paquete
 //
-//     DINERO ACTUAL = abonos + abono externo - gastos - inversión - ahorro
-//                     - pagos. Los pagos a colaboradores/empleados SÍ salen.
+//     DINERO ACTUAL = abonos + abono externo - gastos e inversión de los
+//                     PAQUETES - ahorro apartado - pagos. Los pagos a
+//                     colaboradores/empleados SÍ salen, y los movimientos
+//                     GENERALES (gasto/inversión) se pagan con el AHORRO:
+//                     bajan lo apartado, no el dinero actual.
 //     months    últimos 6 meses: ganancias vs. gastos/inversiones/ahorro
 //     movements movimientos INDIVIDUALES (con paquete y cliente) para que el
 //               módulo pueda desglosar cada fila de su tabla; los abonos
@@ -291,23 +294,37 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         pagos: round2(general.pagos),
         neto: round2(generalNeto),
       };
+      // PAQUETES vs. GENERAL. Un gasto o una inversión de un PAQUETE ya baja
+      // el dinero de ESE paquete (y no toca el ahorro). Los movimientos
+      // GENERALES se pagan con el AHORRO: bajan lo apartado y NO bajan el
+      // dinero actual del negocio.
+      const pkgGastos = totals.gastos;
+      const pkgInversiones = totals.inversiones;
+      // Lo apartado en el ahorro (paquetes + general): eso SÍ sale del dinero
+      // actual, porque está guardado.
+      const apartado = totals.ahorro + general.ahorro;
+      // El ahorro no puede quedar en negativo: si los movimientos generales
+      // superan lo apartado, lo que falte se descuenta del dinero actual.
+      const pozo = apartado - generalGastado;
+      const sinCubrir = Math.max(0, -pozo);
+
       // El negocio entero suma paquetes + movimientos generales.
-      totals.gastos += general.gasto;
-      totals.inversiones += general.inversion;
-      totals.ahorro += general.ahorro;
+      totals.gastos = pkgGastos + general.gasto;
+      totals.inversiones = pkgInversiones + general.inversion;
+      totals.ahorro = Math.max(0, pozo);
       totals.abonoExterno += general.abonoExterno;
       totals.pagos += general.pagos;
-      // DINERO ACTUAL (lo que se tiene hoy): abonado + abono externo -
-      // gastos - inversión - ahorro - pagos. Es la MISMA fórmula de cada
-      // paquete, así el total cuadra con la tabla.
+      // DINERO ACTUAL (lo que se tiene hoy): abonado + abono externo - gastos
+      // e inversión de los PAQUETES - lo apartado en el ahorro - pagos - lo
+      // que el ahorro no alcanzó a cubrir.
       totals.gananciaEstimada = round2(
         totals.ganancias +
           totals.abonoExterno -
-          totals.inversiones -
-          totals.ahorro
+          pkgInversiones -
+          apartado
       );
       totals.gananciaReal = round2(
-        totals.gananciaEstimada - totals.gastos - totals.pagos
+        totals.gananciaEstimada - pkgGastos - totals.pagos - sinCubrir
       );
       totals.disponible = totals.gananciaReal;
 

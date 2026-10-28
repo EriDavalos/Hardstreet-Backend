@@ -48,12 +48,31 @@ const MAX_POINTS = 4000;
 /** Tope de cada JSON guardado (el cliente ya manda los trazos comprimidos). */
 const MAX_JSON = 600_000;
 
+type NoteTextFormat = {
+  start: number;
+  end: number;
+  bold: boolean;
+  italic: boolean;
+  underline: boolean;
+  fontFamily: string;
+  fontSize: number;
+};
+
+type NoteItem = {
+  text: string;
+  done: boolean;
+  formats: NoteTextFormat[];
+};
+
 type NoteBlock = {
   type: "text" | "checklist" | "drawing";
   text: string;
-  items: { text: string; done: boolean }[];
-  /** Solo en los bloques "drawing": el dibujo insertado en la nota. */
+  items: NoteItem[];
+  formats?: NoteTextFormat[];
+  /** Solo en los bloques drawing. */
   strokes?: NoteStroke[];
+  pageColor?: string;
+  aspectRatio?: number;
 };
 
 type NoteStroke = {
@@ -83,7 +102,32 @@ function jsonOf(raw: unknown): unknown {
   }
 }
 
-/** Bloques válidos (texto y listas de actividades). */
+/** Estilos de texto válidos, acotados al texto que realmente existe. */
+function parseTextFormats(raw: unknown, length: number): NoteTextFormat[] {
+  if (!Array.isArray(raw)) return [];
+  const families = new Set(["", "Roboto", "serif", "monospace"]);
+  const out: NoteTextFormat[] = [];
+  for (const item of raw.slice(0, 500)) {
+    const f = (item ?? {}) as Record<string, unknown>;
+    const start = Math.max(0, Math.min(length, Math.floor(Number(f.start) || 0)));
+    const end = Math.max(start, Math.min(length, Math.floor(Number(f.end) || 0)));
+    if (start === end) continue;
+    const fontSize = Number(f.fontSize) || 0;
+    const family = String(f.fontFamily ?? "");
+    out.push({
+      start,
+      end,
+      bold: f.bold === true,
+      italic: f.italic === true,
+      underline: f.underline === true,
+      fontFamily: families.has(family) ? family : "",
+      fontSize: fontSize === 0 ? 0 : Math.max(8, Math.min(72, fontSize)),
+    });
+  }
+  return out;
+}
+
+/** Bloques válidos (texto, listas, formato de texto y dibujo). */
 function parseBlocks(raw: unknown): NoteBlock[] {
   const data = jsonOf(raw);
   const list = Array.isArray(data)
@@ -100,20 +144,35 @@ function parseBlocks(raw: unknown): NoteBlock[] {
       const strokes = parseDrawing(
         Array.isArray(b.strokes) ? b.strokes : b.drawing
       );
-      out.push({ type: "drawing", text: "", items: [], strokes });
+      out.push({
+        type: "drawing",
+        text: "",
+        items: [],
+        strokes,
+        pageColor: parseColor(b.pageColor) || "#FDFDFB",
+        aspectRatio: Math.max(.35, Math.min(2.5, Number(b.aspectRatio) || .72)),
+      });
       continue;
     }
     const type = rawType === "checklist" ? "checklist" : "text";
     if (type === "text") {
-      out.push({ type, text: text(b.text, MAX_TEXT), items: [] });
+      const value = text(b.text, MAX_TEXT);
+      out.push({
+        type,
+        text: value,
+        items: [],
+        formats: parseTextFormats(b.formats, value.length),
+      });
       continue;
     }
     const rawItems = Array.isArray(b.items) ? b.items : [];
     const items = rawItems.slice(0, MAX_ITEMS).map((it) => {
       const r = (it ?? {}) as Record<string, unknown>;
+      const value = line(r.text, MAX_ITEM_TEXT);
       return {
-        text: line(r.text, MAX_ITEM_TEXT),
+        text: value,
         done: r.done === true || Number(r.done) === 1,
+        formats: parseTextFormats(r.formats, value.length),
       };
     });
     out.push({ type, text: "", items });
@@ -200,9 +259,12 @@ type Row = Record<string, any>;
 
 /** Nota completa tal como la consume el editor. */
 function noteOf(r: Row) {
+  const title = String(r.title || "");
+  const content = jsonOf(r.content) as Record<string, unknown> | null;
   return {
     id: Number(r.id),
-    title: String(r.title || ""),
+    title,
+    titleFormats: parseTextFormats(content?.titleFormats, title.length),
     blocks: parseBlocks(r.content),
     // Compatibilidad: el dibujo también viaja aparte (clientes viejos).
     strokes: parseDrawing(r.drawing),
@@ -398,7 +460,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const visibility = body.visibility === "company" ? "company" : "private";
   const color = parseColor(body.color);
   const pinned = body.pinned === true || Number(body.pinned) === 1;
-  const content = JSON.stringify({ blocks });
+  const titleFormats = parseTextFormats(body.titleFormats, title.length);
+  const content = JSON.stringify({ blocks, titleFormats });
   const drawing = JSON.stringify({ strokes });
   if (content.length > MAX_JSON || drawing.length > MAX_JSON) {
     fail(
