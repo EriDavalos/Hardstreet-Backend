@@ -7,30 +7,32 @@ import { q, exec } from "../../../lib/db";
 import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
 
 // ==================================================================
-// FINANZAS · ESTIMACIÓN DE COSTOS POR PAQUETE DEL CATÁLOGO
+// FINANZAS · ESTIMACIÓN DE INVERSIÓN POR PAQUETE DEL CATÁLOGO
 //
 //   GET    /api/admin/finance-estimates
 //          { packages: [ { id, name, subtitle, categoryName, currency,
-//                          price, inversion, gasto, costo, utilidad, margen,
-//                          movements: [ { id, kind, amount, description,
+//                          price, inversion, utilidad, margen,
+//                          movements: [ { id, amount, description,
 //                                         created } ] } ],
-//            totals: { ingreso, inversion, gasto, costo, utilidad },
-//            estimatesAvailable, moveKinds }
+//            totals: { ingreso, inversion, utilidad },
+//            estimatesAvailable }
 //
-//   POST   { idPackage, kind, amount, description? }
-//          Registra un movimiento ESTIMADO del paquete del catálogo.
+//   POST   { idPackage, amount, description? }
+//          Agrega UNA INVERSIÓN estimada del paquete del catálogo.
 //
-//   PUT    { movementId, kind?, amount?, description? }
-//          Edita un movimiento estimado.
+//   PUT    { movementId, amount?, description? }
+//          Edita una inversión estimada.
 //
 //   DELETE ?id=N
-//          Quita (baja lógica) un movimiento estimado.
+//          Quita (baja lógica) una inversión estimada.
 //
-// ES DINERO FICTICIO DE PLANEACIÓN: se estima, para CADA paquete del
-// CATÁLOGO (no por cliente), cuánto se va a invertir y gastar, con sus
-// movimientos uno por uno — igual que el administrador del paquete del
-// cliente, pero sin dinero real.
+// ES DINERO FICTICIO DE PLANEACIÓN: cada paquete del CATÁLOGO (no por
+// cliente) se DESGLOSA en varias INVERSIONES, una por una — igual que el
+// administrador del paquete del cliente, pero sin dinero real.
 //
+//   * TODO lo que se captura es INVERSIÓN: es lo que se DESCUENTA del monto
+//     del paquete.
+//   * Ganancia estimada = precio del paquete − (suma de inversiones).
 //   * NO escribe en purchased_packages_movements.
 //   * NO entra en el dinero actual, el ahorro, los gastos ni el Dashboard:
 //     solo se lee en la pestaña "Estimación" de Finanzas.
@@ -39,21 +41,10 @@ import { requestScope, scopeFilterOn } from "../../../lib/company-scope";
 // Permiso: módulo "Finanzas" (ver para GET, editar para el resto).
 // ==================================================================
 
-/** Tipos de un movimiento ESTIMADO (los dos lados del costo). */
-const ESTIMATE_KINDS = ["inversion", "gasto"] as const;
-type EstimateKind = (typeof ESTIMATE_KINDS)[number];
-
 type Row = Record<string, any>;
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 const round2 = (n: number) => Math.round(n * 100) / 100;
-
-function asKind(raw: unknown): EstimateKind | null {
-  const k = norm(raw).toLowerCase().replace(/-/g, "_");
-  return (ESTIMATE_KINDS as readonly string[]).includes(k)
-    ? (k as EstimateKind)
-    : null;
-}
 
 function asAmount(raw: unknown): number | null {
   const n = Number(raw);
@@ -61,10 +52,10 @@ function asAmount(raw: unknown): number | null {
   return round2(n);
 }
 
-/** Los movimientos estimados de UN paquete (los más recientes primero). */
+/** Las inversiones estimadas de UN paquete (las más recientes primero). */
 async function movementsOf(idPackage: number): Promise<Row[]> {
   return q<Row>(
-    `SELECT id, kind, amount, description,
+    `SELECT id, amount, description,
             DATE_FORMAT(created, '%Y-%m-%dT%H:%i:%s') AS created
        FROM package_estimates
       WHERE id_package = ? AND active = 1
@@ -90,17 +81,12 @@ async function catalogPackage(
   return rows[0] ?? null;
 }
 
-/** Paquete + sus movimientos estimados, con los totales ya calculados. */
+/** Paquete + sus inversiones estimadas, con los totales ya calculados. */
 function estimateOf(pkg: Row, movements: Row[]) {
   const price = Number(pkg.price || 0);
-  const inversion = movements
-    .filter((m) => m.kind === "inversion")
-    .reduce((sum, m) => sum + Number(m.amount || 0), 0);
-  const gasto = movements
-    .filter((m) => m.kind === "gasto")
-    .reduce((sum, m) => sum + Number(m.amount || 0), 0);
-  const costo = round2(inversion + gasto);
-  const utilidad = round2(price - costo);
+  // La INVERSIÓN es lo que se descuenta del monto del paquete.
+  const inversion = movements.reduce((sum, m) => sum + Number(m.amount || 0), 0);
+  const utilidad = round2(price - inversion);
   return {
     id: Number(pkg.id),
     name: String(pkg.name || ""),
@@ -109,14 +95,11 @@ function estimateOf(pkg: Row, movements: Row[]) {
     currency: String(pkg.currency || "MXN"),
     price: round2(price),
     inversion: round2(inversion),
-    gasto: round2(gasto),
-    costo,
     utilidad,
     // % de lo que se cobra que se queda como ganancia (null si es gratis).
     margen: price > 0 ? round2((utilidad / price) * 100) : null,
     movements: movements.map((m) => ({
       id: Number(m.id),
-      kind: String(m.kind || "gasto"),
       amount: round2(Number(m.amount || 0)),
       description: String(m.description || ""),
       created: m.created || "",
@@ -160,12 +143,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         pkgScope.params
       );
 
-      // Movimientos estimados de todos los paquetes en UNA consulta.
+      // Inversiones estimadas de todos los paquetes en UNA consulta.
       let estimatesAvailable = true;
       const byPackage = new Map<number, Row[]>();
       try {
         const rows = await q<Row>(
-          `SELECT e.id, e.id_package, e.kind, e.amount, e.description,
+          `SELECT e.id, e.id_package, e.amount, e.description,
                   DATE_FORMAT(e.created, '%Y-%m-%dT%H:%i:%s') AS created
              FROM package_estimates e
             WHERE e.active = 1 AND ${estScope.sql}
@@ -179,20 +162,20 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           byPackage.set(key, list);
         }
       } catch {
-        // Sin la tabla todavía: se listan los paquetes con costo en cero.
+        // Sin la tabla todavía: se listan los paquetes con inversión en cero.
         estimatesAvailable = false;
       }
 
-      const out = packages.map((p) => estimateOf(p, byPackage.get(Number(p.id)) ?? []));
+      const out = packages.map((p) =>
+        estimateOf(p, byPackage.get(Number(p.id)) ?? [])
+      );
       const totals = out.reduce(
         (acc, e) => ({
           ingreso: round2(acc.ingreso + e.price),
           inversion: round2(acc.inversion + e.inversion),
-          gasto: round2(acc.gasto + e.gasto),
-          costo: round2(acc.costo + e.costo),
           utilidad: round2(acc.utilidad + e.utilidad),
         }),
-        { ingreso: 0, inversion: 0, gasto: 0, costo: 0, utilidad: 0 }
+        { ingreso: 0, inversion: 0, utilidad: 0 }
       );
 
       res.setHeader("Cache-Control", "no-store");
@@ -201,7 +184,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         packages: out,
         totals,
         estimatesAvailable,
-        moveKinds: ESTIMATE_KINDS,
       });
       return;
     }
@@ -210,7 +192,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     if (req.method === "DELETE") {
       const movementId = Number(req.query.id || 0);
       if (!movementId) {
-        fail(res, 400, "Indica el movimiento estimado", "Falta el id");
+        fail(res, 400, "Indica la inversión estimada", "Falta el id");
         return;
       }
       const rows = await q<Row>(
@@ -219,7 +201,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         [movementId, companyId]
       );
       if (!rows.length) {
-        fail(res, 404, "Movimiento estimado no encontrado", `No hay un registro con id ${movementId}`);
+        fail(res, 404, "Inversión estimada no encontrada", `No hay un registro con id ${movementId}`);
         return;
       }
       await exec(`UPDATE package_estimates SET active = 0 WHERE id = ?`, [movementId]);
@@ -231,11 +213,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         action: "delete",
         entity: "estimacion",
         entityId: movementId,
-        description: "Movimiento estimado eliminado",
+        description: "Inversión estimada eliminada",
         details: { id: movementId },
         req,
       });
-      ok(res, "Movimiento estimado eliminado", { estimate, item: estimate });
+      ok(res, "Inversión estimada eliminada", { estimate, item: estimate });
       return;
     }
 
@@ -253,10 +235,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         fail(res, 404, "Paquete no encontrado", `No hay un paquete activo con id ${idPackage}`);
         return;
       }
-      const kind = asKind(body.kind) ?? "inversion";
       const amount = asAmount(body.amount);
       if (amount === null) {
-        fail(res, 400, "El monto debe ser mayor a 0", "Escribe un monto válido");
+        fail(res, 400, "La inversión debe ser mayor a 0", "Escribe un monto válido");
         return;
       }
       const description = norm(body.description);
@@ -264,16 +245,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       try {
         r = await exec(
           `INSERT INTO package_estimates
-             (id_package, kind, amount, description, id_company)
-           VALUES (?, ?, ?, ?, ?)`,
-          [idPackage, kind, amount, description || null, companyId]
+             (id_package, amount, description, id_company)
+           VALUES (?, ?, ?, ?)`,
+          [idPackage, amount, description || null, companyId]
         );
       } catch (e) {
         console.error("[finance-estimates:create]", e);
         fail(
           res,
           409,
-          "No se pudo guardar el movimiento estimado",
+          "No se pudo guardar la inversión estimada",
           "Falta crear la tabla package_estimates (ver el SQL del módulo Finanzas)"
         );
         return;
@@ -286,42 +267,41 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         action: "create",
         entity: "estimacion",
         entityId: r.insertId,
-        description: "Movimiento estimado registrado",
-        details: { idPackage, kind, amount, description },
+        description: "Inversión estimada registrada",
+        details: { idPackage, amount, description },
         req,
       });
-      created(res, "Movimiento estimado registrado", {
+      created(res, "Inversión estimada registrada", {
         estimate,
-        item: { id: r.insertId, idPackage, kind, amount, description },
+        item: { id: r.insertId, idPackage, amount, description },
       });
       return;
     }
 
     // ================================ PUT ================================
-    // Edita un movimiento estimado (monto, tipo o concepto).
+    // Edita una inversión estimada (monto o concepto).
     const movementId = Number(body.movementId || 0);
     if (!movementId) {
-      fail(res, 400, "Indica el movimiento estimado", "Falta el movimiento");
+      fail(res, 400, "Indica la inversión estimada", "Falta el movimiento");
       return;
     }
     const rows = await q<Row>(
-      `SELECT id, id_package, kind, amount, description
+      `SELECT id, id_package, amount, description
          FROM package_estimates
         WHERE id = ? AND id_company = ? AND active = 1 LIMIT 1`,
       [movementId, companyId]
     );
     if (!rows.length) {
-      fail(res, 404, "Movimiento estimado no encontrado", `No hay un registro con id ${movementId}`);
+      fail(res, 404, "Inversión estimada no encontrada", `No hay un registro con id ${movementId}`);
       return;
     }
     const current = rows[0];
-    const kind = asKind(body.kind) ?? (String(current.kind) as EstimateKind);
     const amount =
       body.amount === undefined || body.amount === null || body.amount === ""
         ? round2(Number(current.amount || 0))
         : asAmount(body.amount);
     if (amount === null) {
-      fail(res, 400, "El monto debe ser mayor a 0", "Escribe un monto válido");
+      fail(res, 400, "La inversión debe ser mayor a 0", "Escribe un monto válido");
       return;
     }
     const description =
@@ -330,9 +310,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         : norm(body.description);
     await exec(
       `UPDATE package_estimates
-          SET kind = ?, amount = ?, description = ?
+          SET amount = ?, description = ?
         WHERE id = ? AND id_company = ?`,
-      [kind, amount, description || null, movementId, companyId]
+      [amount, description || null, movementId, companyId]
     );
     const estimate = await loadEstimate(Number(current.id_package), companyId);
     await logActivity({
@@ -342,11 +322,11 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       action: "update",
       entity: "estimacion",
       entityId: movementId,
-      description: "Movimiento estimado actualizado",
-      details: { id: movementId, kind, amount, description },
+      description: "Inversión estimada actualizada",
+      details: { id: movementId, amount, description },
       req,
     });
-    ok(res, "Movimiento estimado actualizado", { estimate, item: estimate });
+    ok(res, "Inversión estimada actualizada", { estimate, item: estimate });
   } catch (e) {
     console.error("[admin/finance-estimates]", e);
     fail(res, 500, "Hubo un error", "No se pudo leer o guardar la estimación");
