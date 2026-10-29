@@ -31,9 +31,17 @@ import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-s
 //
 //   POST  { purchasedPackageId?, kind?, amount, description? }
 //     Registra un movimiento de tipo gasto | inversion | ahorro |
-//     abono_externo (por defecto 'ahorro'). El porcentaje se calcula en la
-//     app a partir del `disponible` que ya devuelve este mismo GET, para no
-//     tener dos fórmulas distintas.
+//     abono_externo | retiro_ahorro (por defecto 'ahorro'). El porcentaje se
+//     calcula en la app a partir del `disponible` que ya devuelve este mismo
+//     GET, para no tener dos fórmulas distintas.
+//
+//     `retiro_ahorro` = SACAR dinero del ahorro: baja SOLO lo apartado y no
+//     toca el dinero actual (el dinero ya había salido del negocio).
+//
+//   PUT   { purchasedPackageId, inversion?, gasto?, note? }
+//     Guarda la ESTIMACIÓN de un paquete (planeación: dinero FICTICIO). No
+//     crea movimientos ni afecta ninguna cuenta; solo alimenta la pestaña
+//     "Estimación". Tabla: purchased_packages_estimates.
 //
 //     SIN `purchasedPackageId` el movimiento es GENERAL (del negocio, sin
 //     paquete): el módulo Finanzas ya no obliga a elegir un paquete. Esos
@@ -49,8 +57,19 @@ import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-s
 // que el módulo funciona aunque la migración del módulo aún no se aplique.
 // ==================================================================
 
-/** Tipos de movimiento que participan en las cuentas. */
-const MOVE_KINDS = ["gasto", "inversion", "ahorro", "abono_externo"] as const;
+/**
+ * Tipos de movimiento que participan en las cuentas.
+ *
+ * `retiro_ahorro` = SACAR dinero del ahorro. Baja SOLO lo apartado: no
+ * devuelve dinero al negocio, así que no toca el dinero actual.
+ */
+const MOVE_KINDS = [
+  "gasto",
+  "inversion",
+  "ahorro",
+  "abono_externo",
+  "retiro_ahorro",
+] as const;
 
 type Row = Record<string, any>;
 
@@ -94,7 +113,7 @@ function windowStart(count: number): string {
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const action = req.method === "GET" ? "read" : "update";
-  if (req.method !== "GET" && req.method !== "POST") {
+  if (req.method !== "GET" && req.method !== "POST" && req.method !== "PUT") {
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
@@ -159,10 +178,33 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         movementsAvailable = false;
       }
 
+      // ---- ESTIMACIONES (dinero FICTICIO de planeación) ----
+      // Viven en su propia tabla y NO tocan ninguna cuenta: sirven para
+      // estimar cuánto se va a invertir/gastar en cada paquete y cuánto
+      // quedaría de ganancia. Si la migración no está aplicada, el resto del
+      // módulo funciona igual (la pestaña sale vacía).
+      let estimatesAvailable = true;
+      const estimateByPackage = new Map<number, Row>();
+      try {
+        const rows = await q<Row>(
+          `SELECT id_purchased_package, inversion, gasto, note
+             FROM purchased_packages_estimates
+            WHERE active = 1 AND ${movScope.sql}`,
+          movScope.params
+        );
+        for (const r of rows) {
+          estimateByPackage.set(Number(r.id_purchased_package || 0), r);
+        }
+      } catch {
+        estimatesAvailable = false;
+      }
+
       const emptyByKind = () => ({
         gasto: 0,
         inversion: 0,
         ahorro: 0,
+        // Retiros del ahorro: bajan lo apartado, no el dinero actual.
+        retiros: 0,
         abonoExterno: 0,
         // Los PAGOS a colaboradores/empleados salen del dinero: se
         // descuentan del paquete y del dinero actual (y se pueden desglosar
@@ -181,6 +223,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const bucket = id ? byKind.get(id) ?? emptyByKind() : general;
         if (kind === "inversion") bucket.inversion += total;
         else if (kind === "ahorro") bucket.ahorro += total;
+        else if (kind === "retiro_ahorro") bucket.retiros += total;
         else if (kind === "abono_externo") bucket.abonoExterno += total;
         else if (kind === "pago") bucket.pagos += total;
         else bucket.gasto += total;
@@ -192,6 +235,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         inversiones: 0,
         salidas: 0,
         ahorro: 0,
+        ahorroApartado: 0,
+        retiros: 0,
         abonoExterno: 0,
         pagos: 0,
         neto: 0,
@@ -202,7 +247,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         ganancias: 0,
         porCobrar: 0,
         disponible: 0,
+        // Ahorro que QUEDA apartado (lo apartado menos los retiros).
         ahorro: 0,
+        // Retiros del ahorro: no son una salida del dinero actual.
+        retiros: 0,
         inversiones: 0,
         gastos: 0,
         abonoExterno: 0,
@@ -227,9 +275,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // DINERO ACTUAL = abonado + abono externo - gastos - inversión -
         // ahorro - pagos. Los PAGOS a colaboradores/empleados SÍ salen del
         // dinero (antes se trataban como un "gasto invisible").
+        //
+        // Ojo: aquí se resta lo APARTADO COMPLETO (`k.ahorro`); los retiros
+        // NO devuelven dinero al negocio, así que no suman al disponible.
         const disponible = round2(
           paid + k.abonoExterno - gastado - k.ahorro - k.pagos
         );
+        // Ahorro que QUEDA en el paquete: lo apartado menos lo retirado.
+        const ahorroNeto = Math.max(0, round2(k.ahorro - k.retiros));
         const porCobrar = Math.max(0, round2(price - paid));
 
         return {
@@ -243,7 +296,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           gastos: round2(k.gasto),
           inversiones: round2(k.inversion),
           abonoExterno: round2(k.abonoExterno),
-          ahorro: round2(k.ahorro),
+          // Ahorro que queda y lo apartado en bruto (para explicar la resta).
+          ahorro: ahorroNeto,
+          ahorroApartado: round2(k.ahorro),
+          retiros: round2(k.retiros),
           pagos: round2(k.pagos),
           // Ganancia estimada/real del paquete (mismo criterio que el total).
           gananciaEstimada: round2(
@@ -253,6 +309,42 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           disponible,
         };
       });
+
+      // ---- LISTA COMPLETA PARA ESTIMAR (TODOS los paquetes) ----
+      // Aquí sí entran los paquetes gratis sin movimientos: la estimación es
+      // planeación y no depende de que ya haya dinero registrado.
+      const estimatePackages = packagesOut.map((p) => {
+        const e = estimateByPackage.get(p.id);
+        const inversion = round2(Number(e?.inversion || 0));
+        const gasto = round2(Number(e?.gasto || 0));
+        const costo = round2(inversion + gasto);
+        const utilidad = round2(p.price - costo);
+        return {
+          id: p.id,
+          name: p.name,
+          clientName: p.clientName,
+          currency: p.currency,
+          price: p.price,
+          inversion,
+          gasto,
+          costo,
+          utilidad,
+          // % de lo que se cobra que se queda como ganancia.
+          margen: p.price > 0 ? round2((utilidad / p.price) * 100) : null,
+          note: String(e?.note || ""),
+          saved: Boolean(e),
+        };
+      });
+      const estimateTotals = estimatePackages.reduce(
+        (acc, e) => ({
+          ingreso: round2(acc.ingreso + e.price),
+          inversion: round2(acc.inversion + e.inversion),
+          gasto: round2(acc.gasto + e.gasto),
+          costo: round2(acc.costo + e.costo),
+          utilidad: round2(acc.utilidad + e.utilidad),
+        }),
+        { ingreso: 0, inversion: 0, gasto: 0, costo: 0, utilidad: 0 }
+      );
 
       // PAQUETES GRATIS: no salen en Finanzas salvo que tengan ALGO
       // registrado (un abono, un gasto, una inversión, ahorro, abono externo
@@ -265,6 +357,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           p.gastos > 0 ||
           p.inversiones > 0 ||
           p.ahorro > 0 ||
+          // Un paquete cuyo ahorro se retiró del todo sigue teniendo historia.
+          p.ahorroApartado > 0 ||
+          p.retiros > 0 ||
           p.abonoExterno > 0 ||
           p.pagos > 0
       );
@@ -272,7 +367,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         totals.facturado += p.price;
         totals.ganancias += p.paid;
         totals.porCobrar += p.balance;
-        totals.ahorro += p.ahorro;
+        // El ahorro que se suma a los totales es el APARTADO (bruto): los
+        // retiros se restan al final, del pozo, para no inflar el disponible.
+        totals.ahorro += p.ahorroApartado;
+        totals.retiros += p.retiros;
         totals.inversiones += p.inversiones;
         totals.gastos += p.gastos;
         totals.abonoExterno += p.abonoExterno;
@@ -289,7 +387,10 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         gastos: round2(general.gasto),
         inversiones: round2(general.inversion),
         salidas: round2(generalGastado),
-        ahorro: round2(general.ahorro),
+        // Lo que QUEDA del ahorro del negocio tras sus retiros.
+        ahorro: round2(Math.max(0, general.ahorro - general.retiros)),
+        ahorroApartado: round2(general.ahorro),
+        retiros: round2(general.retiros),
         abonoExterno: round2(general.abonoExterno),
         pagos: round2(general.pagos),
         neto: round2(generalNeto),
@@ -307,11 +408,16 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       // superan lo apartado, lo que falte se descuenta del dinero actual.
       const pozo = apartado - generalGastado;
       const sinCubrir = Math.max(0, -pozo);
+      // RETIROS: sacar dinero del ahorro (paquetes + general). Bajan SOLO lo
+      // apartado; el disponible no se mueve (el dinero ya había salido del
+      // negocio al apartarlo, y un retiro tampoco lo devuelve).
+      const retiros = totals.retiros + general.retiros;
 
       // El negocio entero suma paquetes + movimientos generales.
       totals.gastos = pkgGastos + general.gasto;
       totals.inversiones = pkgInversiones + general.inversion;
-      totals.ahorro = Math.max(0, pozo);
+      totals.ahorro = Math.max(0, round2(pozo - retiros));
+      totals.retiros = round2(retiros);
       totals.abonoExterno += general.abonoExterno;
       totals.pagos += general.pagos;
       // DINERO ACTUAL (lo que se tiene hoy): abonado + abono externo - gastos
@@ -380,8 +486,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           if (kind === "inversion") bucket.inversiones = total;
           else if (kind === "ahorro") bucket.ahorro = total;
           else if (kind === "abono_externo") bucket.abonoExterno = total;
-          // Los pagos NO son salida: no entran en las barras de gastos.
-          else if (kind === "pago") continue;
+          // Los pagos NO son salida: no entran en las barras de gastos. Los
+          // RETIROS del ahorro tampoco: bajan lo apartado, no el dinero.
+          else if (kind === "pago" || kind === "retiro_ahorro") continue;
           else bucket.gastos = total;
         }
       } catch {
@@ -540,6 +647,12 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // negocio). La pestaña "Por paquete" lo muestra como "General".
         general: generalOut,
         packages: packagesVisible,
+        // ESTIMACIÓN (planeación, dinero ficticio): todos los paquetes, con
+        // lo que se estima invertir/gastar y lo que quedaría de ganancia. NO
+        // participa en ninguna de las cuentas de arriba.
+        estimates: estimatePackages,
+        estimateTotals,
+        estimatesAvailable,
         months: [...series.values()],
         movements: movementRows.map((m) => {
           const meta = nameById.get(Number(m.package_id)) || {
@@ -590,8 +703,92 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       return;
     }
 
+    // ================================ PUT ================================
+    // Guarda la ESTIMACIÓN de un paquete (planeación: dinero FICTICIO).
+    //   { purchasedPackageId, inversion?, gasto?, note? }
+    // No registra movimientos ni toca ninguna cuenta: vive en su propia tabla
+    // y solo alimenta la pestaña "Estimación".
+    if (req.method === "PUT") {
+      const body = (req.body || {}) as Record<string, unknown>;
+      const packageId = Number(body.purchasedPackageId || 0);
+      if (!packageId) {
+        fail(
+          res,
+          400,
+          "Indica el paquete",
+          "La estimación necesita el paquete del cliente"
+        );
+        return;
+      }
+      const rows = await q<Row>(
+        `SELECT id FROM purchased_packages
+          WHERE id = ? AND active = 1 AND id_company = ?`,
+        [packageId, companyId]
+      );
+      if (!rows.length) {
+        fail(
+          res,
+          404,
+          "Paquete comprado no encontrado",
+          `No hay un paquete con id ${packageId}`
+        );
+        return;
+      }
+      // Cantidades de planeación: nunca negativas.
+      const money = (v: unknown) => {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? round2(n) : 0;
+      };
+      const inversion = money(body.inversion);
+      const gasto = money(body.gasto);
+      const note = norm(body.note);
+      try {
+        await exec(
+          `INSERT INTO purchased_packages_estimates
+             (id_purchased_package, inversion, gasto, note, id_company)
+           VALUES (?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE
+             inversion = VALUES(inversion),
+             gasto = VALUES(gasto),
+             note = VALUES(note),
+             active = 1`,
+          [packageId, inversion, gasto, note || null, companyId]
+        );
+      } catch (e) {
+        console.error("[admin/finance:estimacion]", e);
+        fail(
+          res,
+          409,
+          "No se guardó la estimación",
+          "Falta crear la tabla purchased_packages_estimates (ver el SQL del módulo Finanzas)"
+        );
+        return;
+      }
+      const estimate = {
+        id: packageId,
+        inversion,
+        gasto,
+        costo: round2(inversion + gasto),
+        note,
+      };
+      await logActivity({
+        userId: me.sub,
+        module: "finance",
+        moduleName: "Finanzas",
+        action: "update",
+        entity: "estimacion",
+        entityId: packageId,
+        description: "Estimación del paquete guardada",
+        details: estimate,
+        req,
+      });
+      ok(res, "Estimación guardada", { estimate, item: estimate });
+      return;
+    }
+
     // ================================ POST ===============================
-    // Registra un movimiento (gasto | inversion | ahorro | abono_externo).
+    // Registra un movimiento (gasto | inversion | ahorro | abono_externo |
+    // retiro_ahorro).
     // Sin `kind` se asume AHORRO: es el caso que ya usaba el módulo.
     // Sin `purchasedPackageId` el movimiento es GENERAL (del negocio).
     const b = (req.body || {}) as Record<string, unknown>;

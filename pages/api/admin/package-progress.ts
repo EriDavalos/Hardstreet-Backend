@@ -578,7 +578,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             invertido,
             gastado,
             pagos,
-            ahorrado: sumBy(movements, (m) => m.kind === "ahorro"),
+            // Ahorro que QUEDA: lo apartado menos los retiros. El retiro
+            // baja solo el ahorro (el disponible lo resta completo abajo,
+            // porque ese dinero ya había salido del paquete al apartarse).
+            ahorrado: Math.max(
+              0,
+              round2(
+                sumBy(movements, (m) => m.kind === "ahorro") -
+                  sumBy(movements, (m) => m.kind === "retiro_ahorro")
+              )
+            ),
+            retirado: sumBy(movements, (m) => m.kind === "retiro_ahorro"),
             abonoExterno: sumBy(movements, (m) => m.kind === "abono_externo"),
             // DISPONIBLE = abonado + abono externo - gastado (gasto +
             // inversión) - ahorro - pagos. El AHORRO se aparta, el ABONO
