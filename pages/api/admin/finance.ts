@@ -38,10 +38,8 @@ import { requestScope, scopeFilter, scopeFilterOn } from "../../../lib/company-s
 //     `retiro_ahorro` = SACAR dinero del ahorro: baja SOLO lo apartado y no
 //     toca el dinero actual (el dinero ya había salido del negocio).
 //
-//   PUT   { purchasedPackageId, inversion?, gasto?, note? }
-//     Guarda la ESTIMACIÓN de un paquete (planeación: dinero FICTICIO). No
-//     crea movimientos ni afecta ninguna cuenta; solo alimenta la pestaña
-//     "Estimación". Tabla: purchased_packages_estimates.
+// La pestaña "Estimación" NO vive aquí: es planeación por paquete del
+// CATÁLOGO, en /api/admin/finance-estimates.
 //
 //     SIN `purchasedPackageId` el movimiento es GENERAL (del negocio, sin
 //     paquete): el módulo Finanzas ya no obliga a elegir un paquete. Esos
@@ -113,7 +111,7 @@ function windowStart(count: number): string {
 
 export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
   const action = req.method === "GET" ? "read" : "update";
-  if (req.method !== "GET" && req.method !== "POST" && req.method !== "PUT") {
+  if (req.method !== "GET" && req.method !== "POST") {
     fail(res, 405, "Método no permitido", `${req.method} no está soportado aquí`);
     return;
   }
@@ -176,27 +174,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       } catch {
         // Migración de movimientos pendiente: el resto del módulo sigue.
         movementsAvailable = false;
-      }
-
-      // ---- ESTIMACIONES (dinero FICTICIO de planeación) ----
-      // Viven en su propia tabla y NO tocan ninguna cuenta: sirven para
-      // estimar cuánto se va a invertir/gastar en cada paquete y cuánto
-      // quedaría de ganancia. Si la migración no está aplicada, el resto del
-      // módulo funciona igual (la pestaña sale vacía).
-      let estimatesAvailable = true;
-      const estimateByPackage = new Map<number, Row>();
-      try {
-        const rows = await q<Row>(
-          `SELECT id_purchased_package, inversion, gasto, note
-             FROM purchased_packages_estimates
-            WHERE active = 1 AND ${movScope.sql}`,
-          movScope.params
-        );
-        for (const r of rows) {
-          estimateByPackage.set(Number(r.id_purchased_package || 0), r);
-        }
-      } catch {
-        estimatesAvailable = false;
       }
 
       const emptyByKind = () => ({
@@ -309,42 +286,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           disponible,
         };
       });
-
-      // ---- LISTA COMPLETA PARA ESTIMAR (TODOS los paquetes) ----
-      // Aquí sí entran los paquetes gratis sin movimientos: la estimación es
-      // planeación y no depende de que ya haya dinero registrado.
-      const estimatePackages = packagesOut.map((p) => {
-        const e = estimateByPackage.get(p.id);
-        const inversion = round2(Number(e?.inversion || 0));
-        const gasto = round2(Number(e?.gasto || 0));
-        const costo = round2(inversion + gasto);
-        const utilidad = round2(p.price - costo);
-        return {
-          id: p.id,
-          name: p.name,
-          clientName: p.clientName,
-          currency: p.currency,
-          price: p.price,
-          inversion,
-          gasto,
-          costo,
-          utilidad,
-          // % de lo que se cobra que se queda como ganancia.
-          margen: p.price > 0 ? round2((utilidad / p.price) * 100) : null,
-          note: String(e?.note || ""),
-          saved: Boolean(e),
-        };
-      });
-      const estimateTotals = estimatePackages.reduce(
-        (acc, e) => ({
-          ingreso: round2(acc.ingreso + e.price),
-          inversion: round2(acc.inversion + e.inversion),
-          gasto: round2(acc.gasto + e.gasto),
-          costo: round2(acc.costo + e.costo),
-          utilidad: round2(acc.utilidad + e.utilidad),
-        }),
-        { ingreso: 0, inversion: 0, gasto: 0, costo: 0, utilidad: 0 }
-      );
 
       // PAQUETES GRATIS: no salen en Finanzas salvo que tengan ALGO
       // registrado (un abono, un gasto, una inversión, ahorro, abono externo
@@ -647,12 +588,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         // negocio). La pestaña "Por paquete" lo muestra como "General".
         general: generalOut,
         packages: packagesVisible,
-        // ESTIMACIÓN (planeación, dinero ficticio): todos los paquetes, con
-        // lo que se estima invertir/gastar y lo que quedaría de ganancia. NO
-        // participa en ninguna de las cuentas de arriba.
-        estimates: estimatePackages,
-        estimateTotals,
-        estimatesAvailable,
         months: [...series.values()],
         movements: movementRows.map((m) => {
           const meta = nameById.get(Number(m.package_id)) || {
@@ -700,89 +635,6 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         movementsAvailable,
         moveKinds: MOVE_KINDS,
       });
-      return;
-    }
-
-    // ================================ PUT ================================
-    // Guarda la ESTIMACIÓN de un paquete (planeación: dinero FICTICIO).
-    //   { purchasedPackageId, inversion?, gasto?, note? }
-    // No registra movimientos ni toca ninguna cuenta: vive en su propia tabla
-    // y solo alimenta la pestaña "Estimación".
-    if (req.method === "PUT") {
-      const body = (req.body || {}) as Record<string, unknown>;
-      const packageId = Number(body.purchasedPackageId || 0);
-      if (!packageId) {
-        fail(
-          res,
-          400,
-          "Indica el paquete",
-          "La estimación necesita el paquete del cliente"
-        );
-        return;
-      }
-      const rows = await q<Row>(
-        `SELECT id FROM purchased_packages
-          WHERE id = ? AND active = 1 AND id_company = ?`,
-        [packageId, companyId]
-      );
-      if (!rows.length) {
-        fail(
-          res,
-          404,
-          "Paquete comprado no encontrado",
-          `No hay un paquete con id ${packageId}`
-        );
-        return;
-      }
-      // Cantidades de planeación: nunca negativas.
-      const money = (v: unknown) => {
-        const n = Number(v);
-        return Number.isFinite(n) && n > 0 ? round2(n) : 0;
-      };
-      const inversion = money(body.inversion);
-      const gasto = money(body.gasto);
-      const note = norm(body.note);
-      try {
-        await exec(
-          `INSERT INTO purchased_packages_estimates
-             (id_purchased_package, inversion, gasto, note, id_company)
-           VALUES (?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE
-             inversion = VALUES(inversion),
-             gasto = VALUES(gasto),
-             note = VALUES(note),
-             active = 1`,
-          [packageId, inversion, gasto, note || null, companyId]
-        );
-      } catch (e) {
-        console.error("[admin/finance:estimacion]", e);
-        fail(
-          res,
-          409,
-          "No se guardó la estimación",
-          "Falta crear la tabla purchased_packages_estimates (ver el SQL del módulo Finanzas)"
-        );
-        return;
-      }
-      const estimate = {
-        id: packageId,
-        inversion,
-        gasto,
-        costo: round2(inversion + gasto),
-        note,
-      };
-      await logActivity({
-        userId: me.sub,
-        module: "finance",
-        moduleName: "Finanzas",
-        action: "update",
-        entity: "estimacion",
-        entityId: packageId,
-        description: "Estimación del paquete guardada",
-        details: estimate,
-        req,
-      });
-      ok(res, "Estimación guardada", { estimate, item: estimate });
       return;
     }
 
