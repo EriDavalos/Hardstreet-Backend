@@ -12,6 +12,12 @@ import { logActivity } from "../../../lib/activity";
 //   PUT    { id, name?, url?, enabled?, priority?, notes?, dependsOn? }  edita
 //   DELETE { id }                    ELIMINA (borrado lógico: active = 0)
 //
+// LAS DEPENDENCIAS SON MUTUAS: guardar `dependsOn` en un servidor escribe el
+// enlace en el otro extremo, y quitarlo lo quita de allá. Un enlace viejo de un
+// solo lado se completa al leer la lista, y al eliminar un servidor se limpia
+// del otro extremo (si no, quedaría bloqueado para siempre sin casilla que
+// desmarcar).
+//
 // DOS CAMPOS DISTINTOS, a propósito:
 //   · `active`  = 1 vivo / 0 ELIMINADO. Un active = 0 no se sirve: para el
 //     panel y el hub ese servidor ya no existe (la fila se conserva).
@@ -170,6 +176,76 @@ function cleanDepends(
   return { kind: "ok", ids };
 }
 
+/**
+ * Completa los enlaces que quedaron de UN SOLO LADO.
+ *
+ * Antes de que la dependencia fuera mutua se podía guardar `A → B` sin que B
+ * supiera nada. Esos datos siguen en la base, así que la primera lectura del
+ * panel los empareja (añade A a la lista de B) para que la regla valga también
+ * para lo ya guardado: el hub y el diagrama ven el mismo enlace desde ese
+ * momento. No quita nada, solo completa, y es idempotente: con los datos ya
+ * simétricos no escribe ni una fila.
+ */
+async function normalizeDepends(nodes: NodeOut[]): Promise<void> {
+  const known = new Set(nodes.map((n) => n.id));
+  const want = new Map<number, Set<number>>();
+  const addPair = (a: number, b: number) => {
+    if (!want.has(a)) want.set(a, new Set());
+    want.get(a)!.add(b);
+  };
+  for (const node of nodes) {
+    for (const dep of node.dependsOn) {
+      if (dep === node.id || !known.has(dep)) continue;
+      addPair(node.id, dep);
+      addPair(dep, node.id);
+    }
+  }
+  for (const node of nodes) {
+    const targets = want.get(node.id);
+    if (!targets) continue;
+    const missing = [...targets].filter((id) => !node.dependsOn.includes(id));
+    if (!missing.length) continue;
+    node.dependsOn = [...node.dependsOn, ...missing].sort((a, b) => a - b);
+    await exec("UPDATE drive_nodes SET depends_on = ? WHERE id = ?", [
+      dependsCsv(node.dependsOn),
+      node.id,
+    ]);
+  }
+}
+
+/**
+ * HACE MUTUA la dependencia al guardar.
+ *
+ * La regla del panel es que depender de un servidor es un ENLACE entre los
+ * dos: si A dice depender de B, B también depende de A. Antes se podía guardar
+ * `A → B` y nada más, así que el diagrama enseñaba una relación de un solo lado
+ * —que además bloqueaba a A sin que B supiera que estaban unidos— y mirando a B
+ * no había forma de saber con quién estaba enlazado.
+ *
+ * Aquí se escribe el otro extremo: se añade el id a quien ahora lo declara y
+ * se quita de quien ya no. Así la base nunca queda con un enlace a medias,
+ * venga el guardado del panel o de otra herramienta.
+ */
+async function mirrorDepends(
+  id: number,
+  ids: number[],
+  all: NodeOut[]
+): Promise<void> {
+  for (const other of all) {
+    if (other.id === id || Number(other.active) !== 1) continue;
+    const has = other.dependsOn.includes(id);
+    const wants = ids.includes(other.id);
+    if (wants === has) continue;
+    const next = wants
+      ? [...other.dependsOn, id]
+      : other.dependsOn.filter((dep) => dep !== id);
+    await exec("UPDATE drive_nodes SET depends_on = ? WHERE id = ?", [
+      dependsCsv(next),
+      other.id,
+    ]);
+  }
+}
+
 /** QUÉ revisar si falta la migración (antes solo decía "hubo un error"). */
 const MIGRATION_HINT =
   "Ejecuta Hardstreet-DB/2026-10-25_drive_nodos_dependencias.sql en la base del panel y vuelve a intentar";
@@ -243,6 +319,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const nodes = (await listNodes()).filter(
         (n) => Number(n.active) === 1
       );
+      // Los enlaces viejos de un solo lado se completan aquí (una sola vez).
+      if (hasDepends) await normalizeDepends(nodes);
       const missingIds = nodes.flatMap((n) =>
         n.dependsOn.filter((id) => !nodes.some((other) => other.id === id))
       );
@@ -303,6 +381,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
             .join(", ")})`,
           values
         );
+        // El enlace es mutuo: el otro extremo se entera en el mismo guardado.
+        await mirrorDepends(ins.insertId, ids, nodes);
         const row = (await listNodes()).find((n) => n.id === ins.insertId) || null;
         await logActivity({
           userId: me.sub,
@@ -412,6 +492,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       }
       if (!fields.length) return fail(res, 400, "Nada que guardar");
       await exec(`UPDATE drive_nodes SET ${fields.join(", ")} WHERE id = ?`, [...params, id]);
+      // DEPENDENCIA MUTUA: lo que se marcó aquí se marca también en el otro
+      // servidor, y lo que se desmarcó se quita de allá.
+      if (depends.kind === "ok") await mirrorDepends(id, depends.ids, nodes);
       const row = (await listNodes()).find((n) => n.id === id) || null;
       await logActivity({
         userId: me.sub,
@@ -463,6 +546,19 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return fail(res, 400, MIGRATION_MISSING_ACTIVE, MIGRATION_HINT_ACTIVE);
       }
       await exec("UPDATE drive_nodes SET active = 0 WHERE id = ?", [id]);
+      // El enlace era MUTUO: al eliminar un servidor, el otro extremo no puede
+      // quedarse apuntando a uno que ya no existe. Sin esto quedaría bloqueado
+      // para siempre y sin arreglo desde el panel (el modal solo ofrece
+      // servidores vivos: no habría casilla que desmarcar).
+      if (hasDepends) {
+        for (const other of nodes) {
+          if (other.id === id || !other.dependsOn.includes(id)) continue;
+          await exec("UPDATE drive_nodes SET depends_on = ? WHERE id = ?", [
+            dependsCsv(other.dependsOn.filter((dep) => dep !== id)),
+            other.id,
+          ]);
+        }
+      }
       const updated = (await listNodes()).find((n) => n.id === id) || null;
       await logActivity({
         userId: me.sub,
