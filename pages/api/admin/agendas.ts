@@ -20,7 +20,8 @@ import {
 //           lista agendas (fecha/hora + servicio + cliente/paquete + lugar)
 //   POST    { purchasedPackageId, serviceId?, eventDate, description?,
 //             location?, lat?, lng? }
-//   PUT     { id, serviceId?, eventDate?, description?, location?, lat?, lng? }
+//   PUT     { id, serviceId?, eventDate?, description?, location?, lat?, lng?,
+//             purchasedPackageId?, userId? }   (el paquete también se cambia)
 //   DELETE  ?id=N  baja lógica (active = 0)
 //
 // Tabla `schedules` (migración 2026-10-11: antes `agendas`).
@@ -623,6 +624,60 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           newLocations && newLocations.length ? newLocations[0] : placeOf(b);
         const extraFields: string[] = [];
         const extraParams: unknown[] = [];
+
+        // PAQUETE del cliente: al EDITAR también se puede asignar, cambiar o
+        // quitar (antes el PUT no lo tocaba, así que una agenda creada sin
+        // paquete se quedaba así para siempre). Con paquete, el cliente sale
+        // del paquete; sin paquete, queda el cliente de la agenda (`id_user`).
+        if (
+          b.purchasedPackageId !== undefined ||
+          b.id_purchased_package !== undefined
+        ) {
+          const pkgId =
+            Number(b.purchasedPackageId ?? b.id_purchased_package ?? 0) || 0;
+          if (pkgId) {
+            const pkg = await q(
+              `SELECT id FROM purchased_packages
+                WHERE id = ? AND active = 1 AND id_company = ?`,
+              [pkgId, companyId]
+            );
+            if (!pkg.length) {
+              fail(
+                res,
+                404,
+                "Paquete comprado no encontrado",
+                `No hay un paquete activo con id ${pkgId}`
+              );
+              return;
+            }
+            fields.push("`id_purchased_package` = ?");
+            params.push(pkgId);
+            // El cliente lo da el paquete: se suelta el de la agenda suelta.
+            // Va en los extras para que una BD sin la migración de `id_user`
+            // pueda guardar el paquete igual.
+            extraFields.push("`id_user` = NULL");
+          } else {
+            // Quitar el paquete: la agenda queda SOLO del cliente.
+            const clientUserId =
+              Number(b.userId ?? b.clientId ?? b.id_user ?? 0) || 0;
+            if (
+              !clientUserId ||
+              !(await clientExists(clientUserId, companyId))
+            ) {
+              fail(
+                res,
+                400,
+                "Indica el cliente",
+                "Para quitar el paquete, el evento tiene que quedar a nombre de un cliente"
+              );
+              return;
+            }
+            fields.push("`id_purchased_package` = ?");
+            params.push(null);
+            fields.push("`id_user` = ?");
+            params.push(clientUserId);
+          }
+        }
         if (newLocations) {
           extraFields.push("`location` = ?", "`lat` = ?", "`lng` = ?");
           extraParams.push(place.location || null, place.lat, place.lng);
