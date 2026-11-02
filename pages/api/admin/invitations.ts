@@ -196,6 +196,7 @@ function parseDesign(raw: unknown) {
 
   return {
     bgMedia: url(src.bgMedia),
+    detailsMedia: url(src.detailsMedia),
     bgColor: parseColor(src.bgColor),
     effect: EFFECTS.has(String(src.effect ?? "").trim())
       ? String(src.effect).trim()
