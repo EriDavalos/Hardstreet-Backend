@@ -5,7 +5,9 @@ import { q } from "../../../lib/db";
 // INVITACIÓN PÚBLICA -> GET /api/invitations/public?slug=...
 //
 // Lo que ve el CLIENTE al abrir la liga /i/<slug> (el rewrite de
-// next.config.ts manda esa ruta aquí). Devuelve el HTML que el panel
+// next.config.ts manda esa ruta aquí). También acepta `?invitation=<slug>`:
+// es el parámetro de la WEB del estudio (vercel.json del sitio reescribe
+// `/?invitation=abc123` a esta ruta conservando el query). Devuelve el HTML que el panel
 // generó y guardó al guardar la invitación: no se re-renderiza nada en el
 // servidor, así que la página es EXACTAMENTE la que se previsualizó.
 //
@@ -72,7 +74,7 @@ export default async function handler(
     return;
   }
 
-  const slug = String(req.query.slug ?? "").trim();
+  const slug = String(req.query.slug ?? req.query.invitation ?? "").trim();
   if (!UUID_SAFE.test(slug)) {
     sendHtml(
       res,

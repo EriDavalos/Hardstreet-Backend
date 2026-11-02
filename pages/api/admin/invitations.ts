@@ -37,6 +37,8 @@ const MODULE_NAME = "Invitaciones";
 
 /** Plantillas conocidas (las mismas claves que usa el panel). */
 const TEMPLATES = new Set([
+  "sobre-xv",
+  "boda-marfil",
   "xv-elegancia",
   "xv-rosa",
   "boda-clasica",
@@ -50,6 +52,28 @@ const FONTS = new Set(["clasica", "moderna", "romantica"]);
 
 const MAX_HTML = 300_000;
 const MAX_PHOTOS = 6;
+
+/** Las secciones que el panel puede prender o apagar. */
+const SECTION_KEYS = new Set([
+  "cover",
+  "countdown",
+  "families",
+  "details",
+  "hashtag",
+  "itinerary",
+  "footer",
+  "music",
+]);
+
+/** Los efectos de ambiente que el panel puede elegir. */
+const EFFECTS = new Set([
+  "petalos",
+  "burbujas",
+  "destellos",
+  "corazones",
+  "confeti",
+  "ninguno",
+]);
 
 type Row = Record<string, unknown>;
 
@@ -93,6 +117,134 @@ function parsePhotos(raw: unknown): string[] {
   return out;
 }
 
+/**
+ * El DISEÑO extendido (fondo, secciones y contenido) tal como lo entiende la
+ * app. Se guarda como JSON en la columna `design`.
+ */
+function parseDesign(raw: unknown) {
+  let src: Record<string, unknown> = {};
+  if (typeof raw === "string" && raw.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object") {
+        src = parsed as Record<string, unknown>;
+      }
+    } catch {
+      src = {};
+    }
+  } else if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    src = raw as Record<string, unknown>;
+  }
+
+  const url = (v: unknown): string => {
+    const s = String(v ?? "").trim();
+    return /^https?:\/\//i.test(s) && s.length <= 1000 ? s : "";
+  };
+
+  const sections = Array.isArray(src.sections)
+    ? Array.from(
+        new Set(
+          src.sections
+            .map((s) => String(s ?? "").trim())
+            .filter((s) => SECTION_KEYS.has(s))
+        )
+      ).slice(0, 20)
+    : [];
+
+  const families = Array.isArray(src.families)
+    ? src.families
+        .map((f) => {
+          const item = (f ?? {}) as Record<string, unknown>;
+          const names = Array.isArray(item.names)
+            ? item.names
+                .map((n) => line(n, 80))
+                .filter(Boolean)
+                .slice(0, 6)
+            : [];
+          return { title: line(item.title, 80), names };
+        })
+        .filter((f) => f.title || f.names.length)
+        .slice(0, 8)
+    : [];
+
+  const details = Array.isArray(src.details)
+    ? src.details
+        .map((d) => {
+          const item = (d ?? {}) as Record<string, unknown>;
+          return {
+            title: line(item.title, 120),
+            time: line(item.time, 40),
+            place: line(item.place, 160),
+            mapUrl: url(item.mapUrl),
+            note: line(item.note, 240),
+            icon: line(item.icon, 8) || "✦",
+          };
+        })
+        .filter((d) => d.title || d.time || d.place || d.note)
+        .slice(0, 8)
+    : [];
+
+  const itinerary = Array.isArray(src.itinerary)
+    ? src.itinerary
+        .map((s) => {
+          const item = (s ?? {}) as Record<string, unknown>;
+          return { time: line(item.time, 40), title: line(item.title, 120) };
+        })
+        .filter((s) => s.time || s.title)
+        .slice(0, 16)
+    : [];
+
+  return {
+    bgMedia: url(src.bgMedia),
+    bgColor: parseColor(src.bgColor),
+    effect: EFFECTS.has(String(src.effect ?? "").trim())
+      ? String(src.effect).trim()
+      : "",
+    sections,
+    eventAt: line(src.eventAt, 40),
+    quote: text(src.quote, 1200),
+    verticalTitle: line(src.verticalTitle, 80),
+    arcTitle: line(src.arcTitle, 80),
+    envelopeText: line(src.envelopeText, 120),
+    familiesTitle: line(src.familiesTitle, 120),
+    detailsTitle: line(src.detailsTitle, 120),
+    detailsIntro: line(src.detailsIntro, 240),
+    itineraryTitle: line(src.itineraryTitle, 120),
+    hashtagIntro: line(src.hashtagIntro, 160),
+    footerMessage: text(src.footerMessage, 400),
+    families,
+    details,
+    itinerary,
+    hashtag: line(src.hashtag, 60),
+    musicUrl: url(src.musicUrl),
+  };
+}
+
+/**
+ * ¿La tabla ya tiene la columna `design`?
+ *
+ * Cuando existe se recuerda para siempre (una consulta por proceso). Cuando
+ * todavía NO existe se vuelve a mirar cada minuto: así, si se aplica la
+ * migración con el backend ya desplegado, el diseño empieza a guardarse sin
+ * tener que reiniciar nada.
+ */
+let designColumn: boolean | null = null;
+let designCheckedAt = 0;
+async function hasDesignColumn(): Promise<boolean> {
+  if (designColumn === true) return true;
+  if (designColumn === false && Date.now() - designCheckedAt < 60_000) {
+    return false;
+  }
+  designCheckedAt = Date.now();
+  try {
+    const rows = await q<Row>("SHOW COLUMNS FROM `invitations` LIKE 'design'");
+    designColumn = rows.length > 0;
+  } catch {
+    designColumn = false;
+  }
+  return designColumn;
+}
+
 /** Fecha ISO corta para la app (o null si no hay). */
 function iso(v: unknown): string | null {
   if (!v) return null;
@@ -124,6 +276,7 @@ function itemOf(r: Row) {
     accent: String(r.accent ?? "").toUpperCase(),
     font: String(r.font ?? ""),
     photos: parsePhotos(r.photos),
+    design: parseDesign(r.design),
     slug: String(r.slug ?? ""),
     published: Number(r.published) === 1,
     created: iso(r.created),
@@ -143,7 +296,8 @@ async function visibleInvitation(
   companyId: number | null
 ): Promise<Row | null> {
   const params: unknown[] = [id];
-  let sql = `SELECT ${SELECT_COLS}, i.html
+  const design = (await hasDesignColumn()) ? ", i.design" : "";
+  let sql = `SELECT ${SELECT_COLS}${design}, i.html
                FROM invitations i
               WHERE i.id = ? AND i.active = 1`;
   if (companyId != null) {
@@ -219,7 +373,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         return;
       }
       const params: unknown[] = [];
-      let sql = `SELECT ${SELECT_COLS}
+      const design = (await hasDesignColumn()) ? ", i.design" : "";
+      let sql = `SELECT ${SELECT_COLS}${design}
                    FROM invitations i
                   WHERE i.active = 1`;
       if (scope.companyId != null) {
@@ -358,6 +513,9 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       if (body.photos !== undefined) {
         set("photos", JSON.stringify(parsePhotos(body.photos)));
       }
+      if (body.design !== undefined && (await hasDesignColumn())) {
+        set("design", JSON.stringify(parseDesign(body.design)));
+      }
       if (body.html !== undefined) {
         const html = text(body.html, MAX_HTML);
         if (html.trim().length < 50) {
@@ -460,12 +618,17 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
     const published =
       body.published === true || Number(body.published) === 1;
 
+    const withDesign = await hasDesignColumn();
     const r = await exec(
       `INSERT INTO invitations
          (id_company, id_user, title, template, occasion, headline, subheadline,
           date_text, time_text, place_name, place_address, message, dress_code,
-          rsvp_phone, accent, font, photos, html, published, active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`,
+          rsvp_phone, accent, font, photos, html, published, active${
+            withDesign ? ", design" : ""
+          })
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1${
+         withDesign ? ", ?" : ""
+       })`,
       [
         scope.writeCompanyId,
         me.sub,
@@ -488,6 +651,7 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         JSON.stringify(parsePhotos(body.photos)),
         html,
         published ? 1 : 0,
+        ...(withDesign ? [JSON.stringify(parseDesign(body.design))] : []),
       ]
     );
     const slug = published ? await ensureSlug(r.insertId, "") : "";

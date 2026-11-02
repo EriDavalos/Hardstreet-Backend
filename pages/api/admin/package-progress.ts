@@ -9,6 +9,7 @@ import {
   USERS_DRIVE,
   clearPackageFolderForUsers,
   duplicateShareReason,
+  normalizeDrivePath,
   packageClientIds,
   packageDrivePaths,
   packageFoldersOfUser,
@@ -1150,6 +1151,35 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           "La tabla purchased_packages_services_shares no existe todavía"
         );
         return;
+      }
+
+      // La carpeta del servicio tiene que estar EN el Drive del cliente.
+      //
+      // Lo normal es que viva dentro de la carpeta de su paquete (ya
+      // compartida), pero un servicio puede apuntar a una carpeta que el
+      // cliente todavía no tiene —por ejemplo, un paquete sin carpeta propia—.
+      // Sin acceso, «Abrir carpeta» no podía entrar: el Drive se quedaba en la
+      // raíz y el cliente veía OTRA carpeta, como si el botón llevara al
+      // servicio equivocado. Aquí se le comparte, salvo que ya esté dentro de
+      // una de sus carpetas (si no, la vería dos veces).
+      const serviceFolder = normalizeDrivePath(folder);
+      if (serviceFolder) {
+        try {
+          const packageId = Number(service[0].id_purchased_package) || 0;
+          for (const clientId of await packageClientIds(packageId)) {
+            const roots = await userDrivePaths(clientId);
+            const already = roots.some((root) => {
+              const r = root.toLowerCase();
+              const f = serviceFolder.toLowerCase();
+              return r === f || f.startsWith(`${r}/`);
+            });
+            if (!already) {
+              await shareFolderWithUsers([clientId], serviceFolder);
+            }
+          }
+        } catch {
+          // Sin la tabla de carpetas por usuario: se guarda igual.
+        }
       }
       await logActivity({
         userId: me.sub,
