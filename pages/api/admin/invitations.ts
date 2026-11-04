@@ -50,19 +50,33 @@ const TEMPLATES = new Set([
 /** Familias tipográficas que ofrece el diseñador. */
 const FONTS = new Set(["clasica", "moderna", "romantica"]);
 
-const MAX_HTML = 300_000;
+// El HTML de Carta lleva sus PNG incrustados para que la liga sea
+// autocontenida; por eso el margen es mayor que el de un documento vacío.
+const MAX_HTML = 2_000_000;
 const MAX_PHOTOS = 6;
 
 /** Las secciones que el panel puede prender o apagar. */
 const SECTION_KEYS = new Set([
   "cover",
   "countdown",
+  "quote",
+  "photos",
+  "families",
+  "details",
+  "hashtag",
+  "itinerary",
+  "rsvp",
+  "footer",
+  "music",
+]);
+
+/** Las secciones móviles del panel de capas, de arriba a abajo. */
+const FLOW_SECTION_KEYS = new Set([
   "families",
   "details",
   "hashtag",
   "itinerary",
   "footer",
-  "music",
 ]);
 
 /** Los efectos de ambiente que el panel puede elegir. */
@@ -74,6 +88,19 @@ const EFFECTS = new Set([
   "confeti",
   "ninguno",
 ]);
+
+/** Las portadas que el panel puede combinar con las plantillas. */
+const COVER_STYLES = new Set([
+  "rosa",
+  "carta",
+  "xv",
+  "noche",
+  "cortina",
+  "clasica",
+]);
+
+/** Los fondos de boda de la portada Carta. */
+const COVER_BACKDROPS = new Set(["marfil", "jardin", "seda"]);
 
 type Row = Record<string, unknown>;
 
@@ -151,6 +178,16 @@ function parseDesign(raw: unknown) {
       ).slice(0, 20)
     : [];
 
+  const sectionOrder = Array.isArray(src.sectionOrder)
+    ? Array.from(
+        new Set(
+          src.sectionOrder
+            .map((s) => String(s ?? "").trim())
+            .filter((s) => FLOW_SECTION_KEYS.has(s))
+        )
+      ).slice(0, FLOW_SECTION_KEYS.size)
+    : [];
+
   const families = Array.isArray(src.families)
     ? src.families
         .map((f) => {
@@ -201,7 +238,15 @@ function parseDesign(raw: unknown) {
     effect: EFFECTS.has(String(src.effect ?? "").trim())
       ? String(src.effect).trim()
       : "",
+    coverStyle: COVER_STYLES.has(String(src.coverStyle ?? "").trim())
+      ? String(src.coverStyle).trim()
+      : "",
+    coverBackdrop: COVER_BACKDROPS.has(String(src.coverBackdrop ?? "").trim())
+      ? String(src.coverBackdrop).trim()
+      : "",
     sections,
+    sectionVersion: Number(src.sectionVersion) || 0,
+    sectionOrder,
     eventAt: line(src.eventAt, 40),
     quote: text(src.quote, 1200),
     verticalTitle: line(src.verticalTitle, 80),
