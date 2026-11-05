@@ -55,6 +55,17 @@ const FONTS = new Set(["clasica", "moderna", "romantica"]);
 const MAX_HTML = 2_000_000;
 const MAX_PHOTOS = 6;
 
+// El documento de Carta lleva las imágenes incrustadas y supera el límite
+// de 1 MB que Next aplica por defecto a los API routes. El tope real del
+// contenido sigue siendo MAX_HTML.
+export const config = {
+  api: {
+    bodyParser: {
+      sizeLimit: "3mb",
+    },
+  },
+};
+
 /** Las secciones que el panel puede prender o apagar. */
 const SECTION_KEYS = new Set([
   "cover",
