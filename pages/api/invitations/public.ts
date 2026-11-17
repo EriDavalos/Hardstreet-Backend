@@ -51,6 +51,37 @@ function notice(title: string, message: string): string {
 </html>`;
 }
 
+/**
+ * La galería «Recuerdos» necesita saber a qué API hablar y con qué liga.
+ * El HTML se guarda ANTES de tener slug (lo asigna la API al publicar), así
+ * que el slug se inyecta aquí, en cada visita, y nunca dentro del documento
+ * guardado. La base de la API se toma del propio dominio que sirve la
+ * página; PUBLIC_API_BASE permite fijarla a mano si el sitio vive en otro
+ * host.
+ */
+function withRuntime(
+  html: string,
+  req: NextApiRequest,
+  slug: string
+): string {
+  const host = String(req.headers["x-forwarded-host"] || req.headers.host || "")
+    .split(",")[0]
+    .trim();
+  const proto = String(req.headers["x-forwarded-proto"] || "https")
+    .split(",")[0]
+    .trim();
+  const configured = String(process.env.PUBLIC_API_BASE || "")
+    .trim()
+    .replace(/\/+$/, "");
+  const apiBase = configured || (host ? `${proto}://${host}` : "");
+  const boot =
+    `<script>window.__HS_INV_SLUG__=${JSON.stringify(slug)};` +
+    `window.__HS_INV_API__=${JSON.stringify(apiBase)};</script>`;
+  return html.includes("</head>")
+    ? html.replace("</head>", `${boot}</head>`)
+    : `${boot}${html}`;
+}
+
 function sendHtml(res: NextApiResponse, status: number, html: string) {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.setHeader("Cache-Control", "no-store, max-age=0");
@@ -117,7 +148,7 @@ export default async function handler(
       return;
     }
 
-    sendHtml(res, 200, html);
+    sendHtml(res, 200, withRuntime(html, req, slug));
   } catch (e) {
     console.error("[invitaciones/public]", e);
     sendHtml(

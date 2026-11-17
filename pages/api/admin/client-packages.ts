@@ -4,6 +4,7 @@ import { requirePermission } from "../../../lib/permissions";
 import { q, exec, transaccion } from "../../../lib/db";
 import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
+import { hasSortOrderColumn, serviceOrderBy } from "../../../lib/package-services";
 import {
   packageDrivePaths,
   packageDrivePathsByIds,
@@ -281,6 +282,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
       const price = b.price !== undefined && b.price !== null && b.price !== "" ? Number(b.price) : Number(p.price || 0);
       const paid = b.paid !== undefined && b.paid !== null && b.paid !== "" ? Number(b.paid) : 0;
 
+      // El orden del catálogo se copia a la compra: el cliente lo ve igual.
+      const orderedServices = await hasSortOrderColumn();
       const result = await transaccion(async (conn) => {
         const [ppRes]: any[] = await conn.query(
           `INSERT INTO purchased_packages
@@ -289,9 +292,13 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           [p.name, p.subtitle, p.description, price, p.currency || "MXN", paid, p.id, p.id_package_category, p.id_tier]
         );
         const ppId = Number(ppRes.insertId);
-        // Copia los servicios del paquete a la compra (como el seed).
+        // Copia los servicios del paquete a la compra (como el seed) en el
+        // MISMO orden que el catálogo.
         const [svcRows]: any[] = await conn.query(
-          `SELECT id_service FROM packages_services WHERE id_package = ? AND active = 1`,
+          `SELECT ps.id_service
+             FROM packages_services ps
+            WHERE ps.id_package = ? AND ps.active = 1
+            ORDER BY ${serviceOrderBy(orderedServices)}`,
           [p.id]
         );
         for (const s of svcRows) {

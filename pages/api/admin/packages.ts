@@ -7,6 +7,7 @@ import { ok, created, fail } from "../../../lib/api-response";
 import { logActivity } from "../../../lib/activity";
 import { readPaging, pageMeta } from "../../../lib/pagination";
 import { requestScope, scopeFilter } from "../../../lib/company-scope";
+import { hasSortOrderColumn, serviceOrderBy } from "../../../lib/package-services";
 
 // ==================================================================
 // Catálogo de PAQUETES (solo con permiso sobre el módulo "paquetes")
@@ -22,7 +23,8 @@ import { requestScope, scopeFilter } from "../../../lib/company-scope";
 //   DELETE         baja lógica (?id=N) — active = 0
 //
 // Los "servicios incluidos" se administran con packages_services:
-// serviceIds reemplaza el set completo (baja lógica de los quitados).
+// serviceIds reemplaza el set completo, EN SU ORDEN (baja lógica de los
+// quitados). El orden se guarda en packages_services.sort_order.
 // ==================================================================
 
 const norm = (v: unknown) => (typeof v === "string" ? v.trim() : "");
@@ -70,17 +72,19 @@ async function resolveServiceIds(
   return ids;
 }
 
-/** Los servicios que incluye el paquete (y la baja lógica de los que se quitan). */
+/** Los servicios que incluye el paquete, EN EL ORDEN recibido. */
 async function replaceServices(
   conn: import("mysql2/promise").PoolConnection,
   packageId: number,
   ids: number[]
 ) {
+  const ordered = await hasSortOrderColumn();
   await conn.query(
     `UPDATE packages_services SET active = 0 WHERE id_package = ?`,
     [packageId]
   );
-  for (const id of ids) {
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i];
     const [rows]: any[] = await conn.query(
       `SELECT id FROM packages_services
         WHERE id_package = ? AND id_service = ? LIMIT 1`,
@@ -88,13 +92,17 @@ async function replaceServices(
     );
     if ((rows as any[]).length) {
       await conn.query(
-        `UPDATE packages_services SET active = 1 WHERE id = ?`,
-        [(rows as any[])[0].id]
+        ordered
+          ? `UPDATE packages_services SET active = 1, sort_order = ? WHERE id = ?`
+          : `UPDATE packages_services SET active = 1 WHERE id = ?`,
+        ordered ? [i, (rows as any[])[0].id] : [(rows as any[])[0].id]
       );
     } else {
       await conn.query(
-        `INSERT INTO packages_services (id_package, id_service) VALUES (?, ?)`,
-        [packageId, id]
+        ordered
+          ? `INSERT INTO packages_services (id_package, id_service, sort_order) VALUES (?, ?, ?)`
+          : `INSERT INTO packages_services (id_package, id_service) VALUES (?, ?)`,
+        ordered ? [packageId, id, i] : [packageId, id]
       );
     }
   }
@@ -133,12 +141,13 @@ async function packageModel(id: number) {
   );
   if (!rows.length) return { id };
   const p = rows[0];
+  const ordered = await hasSortOrderColumn();
   const svcRows = await q<{ id: number; name: string | null }>(
     `SELECT s.id, s.name
        FROM packages_services ps
        JOIN services s ON s.id = ps.id_service AND s.active = 1
       WHERE ps.active = 1 AND ps.id_package = ?
-      ORDER BY ps.id ASC`,
+      ORDER BY ${serviceOrderBy(ordered)}`,
     [id]
   );
   return {
@@ -234,13 +243,14 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         );
         // Solo los servicios de los paquetes de ESTA página.
         const pageIds = rows.map((r) => r.id);
+        const ordered = await hasSortOrderColumn();
         const svcRows = pageIds.length
           ? await q<{ id_package: number; id: number; name: string | null }>(
               `SELECT ps.id_package, s.id, s.name
                  FROM packages_services ps
                  JOIN services s ON s.id = ps.id_service AND s.active = 1
                 WHERE ps.active = 1 AND ps.id_package IN (?)
-                ORDER BY ps.id ASC`,
+                ORDER BY ${serviceOrderBy(ordered)}`,
               [pageIds]
             )
           : [];
@@ -346,6 +356,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
           values
         );
         if (serviceIds && serviceIds.length) {
+          // Fuera de la transacción: la migración perezosa no debe bloquearla.
+          await hasSortOrderColumn();
           await transaccion((conn) =>
             replaceServices(conn, r.insertId, serviceIds)
           );
@@ -452,6 +464,8 @@ export default withCors(async (req: NextApiRequest, res: NextApiResponse) => {
         const serviceIds = await resolveServiceIds(res, b.serviceIds, companyId);
         if (serviceIds === null) return;
         if (serviceIds !== undefined) {
+          // Fuera de la transacción: la migración perezosa no debe bloquearla.
+          await hasSortOrderColumn();
           await transaccion((conn) => replaceServices(conn, id, serviceIds));
         }
         const item = await packageModel(id);

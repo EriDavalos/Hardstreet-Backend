@@ -2,6 +2,7 @@
 // HARD STREET BACKEND - Consultas de datos
 // ==================================================================
 import { q } from "./db";
+import { hasSortOrderColumn, serviceOrderBy } from "./package-services";
 import { serviceSharesByIds } from "./service-shares";
 import {
   mapPackage, mapPurchasedPackage, mapPurchasedPackageService,
@@ -110,12 +111,13 @@ async function selectPackages(
   if (rows.length === 0) return [];
 
   const ids = rows.map((r) => r.id);
+  const orderedServices = await hasSortOrderColumn();
   const svcRows = await q<{ id_package: number; id: number; name: string | null; description: string | null; icon: string | null }>(
     `SELECT ps.id_package, s.id, s.name, s.description, s.icon
        FROM packages_services ps
        JOIN services s ON s.id = ps.id_service AND s.active = 1
       WHERE ps.active = 1 AND ps.id_package IN (?)
-      ORDER BY ps.id ASC`,
+      ORDER BY ${serviceOrderBy(orderedServices)}`,
     [ids]
   );
 
@@ -238,13 +240,14 @@ export async function getPurchasedPackagesByUser(userId: number): Promise<Purcha
       )
     : [];
 
+  const orderedServices = await hasSortOrderColumn();
   const baseSvcRows = pkgIds.length
     ? await q<{ id_package: number; id: number; name: string | null; description: string | null; icon: string | null }>(
         `SELECT ps.id_package, s.id, s.name, s.description, s.icon
            FROM packages_services ps
            JOIN services s ON s.id = ps.id_service AND s.active = 1
           WHERE ps.active = 1 AND ps.id_package IN (?)
-          ORDER BY ps.id ASC`,
+          ORDER BY ${serviceOrderBy(orderedServices)}`,
         [pkgIds]
       )
     : [];
